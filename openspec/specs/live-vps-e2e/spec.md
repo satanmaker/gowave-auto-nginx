@@ -243,7 +243,7 @@ unambiguously pinned or verified, preflight SHALL terminate before installation.
 After running `gowave-auto.sh install` on the Master VPS, the runner SHALL verify: exit code 0; Panel binary
 version matches configuration; required systemd services are active; Panel and Node listeners are on correct
 ports; NGINX listens on port 443; TLS certificates exist with correct SAN and valid chain; a local mTLS health
-check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
+check succeeds; the Panel's own update helper is armed; and `gowave-auto.sh health` returns `HEALTHY`.
 
 #### Scenario: Panel service active and API ready
 
@@ -268,9 +268,12 @@ check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
 #### Scenario: Master services active and listeners correct
 
 - **GIVEN** `gowave-auto.sh install` completed with exit code 0
-- **WHEN** the runner checks systemd service status and port listeners on Master
+- **WHEN** the runner checks systemd service status, port listeners and the in-panel update helper on Master
 - **THEN** `gowave.service`, `gowave-node.service`, `nginx.service`, and `fail2ban.service` are all active;
-  Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`
+  Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`; both
+  `gowave-update.service` and `gowave-update.path` exist, the path unit is enabled and active over a
+  `/run/gowave` directory of mode `0700` owned by `gowave`, and no
+  `gowave.service.d/90-unprivileged.conf` exists before the first in-panel update
 
 #### Scenario: TLS certificate valid and shortUuid retrievable
 
@@ -683,14 +686,15 @@ execute guaranteed cleanup and post-case baseline verification.
 | **NEG-11**  | Backup Restore   | Corrupted archive header / invalid tar format | Preflight check rejects before mutating live files |
 | **NEG-12**  | Backup Restore   | SQLite DB file in archive corrupted | SQLite integrity check fails before replacing live DB |
 | **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal does NOT enter `COMMITTED` |
-| **NEG-14**  | Worker Deploy    | Duplicate `node add` when the worker name is already in `state.json` | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
+| **NEG-14**  | Worker Deploy    | `node add` claims a name `state.json` already holds for another address | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
 | **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized |
 
-#### Scenario: Duplicate Worker registration is rejected without mutation (NEG-14)
+#### Scenario: A registered Worker name claimed for another address is rejected without mutation (NEG-14)
 
-- **GIVEN** `worker-1` is already present in Master `state.json` and all associated API objects exist
-- **WHEN** `gowave-auto.sh node add worker-1` is invoked again with the same parameters
-- **THEN** the command exits nonzero with the existing-name rejection before constructing `GoWaveClient` or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile, hosts, and inbounds remain unchanged
+- **GIVEN** `worker-1` is registered in Master `state.json` for one address, and all associated API objects exist
+- **WHEN** `gowave-auto.sh node add worker-1` is invoked with the same name and a different address
+- **THEN** the command exits nonzero with the existing-name rejection naming the address the record holds, before constructing `GoWaveClient` or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile, hosts, and inbounds remain unchanged
+- **AND** the same name at the address the record already holds is the same node answering again — the retry the wizard re-enters — so it is accepted and keeps that node's uuid
 
 #### Scenario: Partial SSH deployment leaves no false COMMITTED journal state (NEG-13)
 

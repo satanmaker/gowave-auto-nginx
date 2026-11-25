@@ -22,12 +22,40 @@ FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures"
 
 PUBLIC_DIRECTORIES = ("acme-v02.api.letsencrypt.org", "acme-staging-v02.api.letsencrypt.org")
 IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
+PARAMIKO_USE = re.compile(r"^\s*(?:import|from)\s+paramiko\b|\bparamiko\s*\.", re.MULTILINE)
 GLOBAL_ANCHOR_WRITES = (
     "update-ca-certificates",
     "/usr/local/share/ca-certificates",
     "/etc/ssl/certs",
     "/etc/pki/ca-trust",
 )
+# The controller case is the one place a globally routable address is required:
+# the product's own parser refuses private, loopback, multicast and documentation
+# ranges, so "the parser accepted this input" can only be decided with a global
+# one. That case opens no socket — its connect is a recorder and its assertions
+# count zero connections, zero remote writes and zero remote commands — so these
+# are names the harness reads, not hosts it reaches. The pair is listed here so a
+# second such file is visible rather than assumed.
+#
+# The address case is the mirror image and the same kind of name: `PRE-04` hands
+# each refused class to the parser to read the refusal, and a multicast group is
+# the one class `ipaddress` calls global, so the literal cannot be replaced by a
+# private one without deleting the clause it proves. Nothing in that case opens a
+# socket either: each value is written into a mode-0600 configuration file and
+# answered by `load_config`.
+NAMED_GLOBAL_ADDRESSES = {
+    "operator_access.py": {"45.13.20.10", "91.203.40.20"},
+    # `239.1.2.3` is the multicast literal PRE-04 hands the parser; the
+    # `104.16.0.0/13` pair is the dated Cloudflare snapshot the proxy-refusal
+    # cases resolve against. All three are read, never dialled.
+    "preflight_cases.py": {"239.1.2.3", "104.16.0.0", "104.16.0.1"},
+    # The WhatsApp entry in PREVIEW_USER_AGENTS carries the client's real
+    # version in its User-Agent, `WhatsApp/2.23.20.0`. That is a version
+    # string the vhost classifies, not an address the harness binds or
+    # reaches, and the list is worthless if the header is invented rather
+    # than the one the client sends.
+    "panel_surface.py": {"2.23.20.0"},
+}
 
 
 def executable_source(path: Path) -> str:
@@ -156,6 +184,7 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
         }
         for path in python_sources(HARNESS_DIR) + python_sources(FIXTURE_DIR):
             allowed = data_plane if path.name == "topology.py" else set()
+            allowed = allowed | NAMED_GLOBAL_ADDRESSES.get(path.name, set())
             found = [address for address in public_addresses(path.read_text(encoding="utf-8"))
                      if address not in allowed]
             self.assertEqual(found, [], path.name)
@@ -170,11 +199,29 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
         self.assertEqual(len(expected), 3, "keep the exception to one small, auditable list")
 
     def test_harness_never_reaches_a_remote_host_over_ssh(self):
+        # The literal name of the SSH library is not what reaches a host: the
+        # import that makes it available and the attribute that calls it are.
+        # The controller cases replace the product's optional dependency with a
+        # model so the product's own bootstrap runs without a socket, and that
+        # patch target is the dependency's name — which is why the rule reads the
+        # two forms that can actually open a connection instead of the word.
+        # The word itself may appear only as an entry of the refusal list a gate
+        # scans a suite command for (`CREDENTIAL_TOKENS`): naming what a command
+        # must not carry is the opposite of carrying it, and every other line
+        # stays refused.
         for path in python_sources(HARNESS_DIR):
             code = executable_source(path)
-            self.assertNotIn("paramiko", code, path.name)
-            self.assertIsNone(re.search(r"[\"']ssh[\"']", code), path.name)
-            self.assertIsNone(re.search(r"[\"']scp[\"']", code), path.name)
+            self.assertIsNone(PARAMIKO_USE.search(code), f"{path.name} uses the SSH library")
+            for match in re.finditer(r"[\"'](?:ssh|scp)[\"']", code):
+                line_start = code.rfind("\n", 0, match.start()) + 1
+                line_end = code.find("\n", match.start())
+                line = code[line_start:line_end if line_end != -1 else len(code)]
+                self.assertIn("CREDENTIAL_TOKENS", line,
+                              f"{path.name}: {match.group(0)} outside the refusal list")
+        for use in ("import paramiko\n", "from paramiko import Transport\n",
+                    "transport = paramiko.Transport(sock)\n",
+                    "paramiko.Ed25519Key.from_private_key_file(one)\n"):
+            self.assertIsNotNone(PARAMIKO_USE.search(use), use)
 
     def test_fixture_zone_uses_only_testbed_names_and_private_addresses(self):
         from test_fixture_dns import BASE_ZONE

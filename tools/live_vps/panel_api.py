@@ -3,6 +3,7 @@ Interacts with the real GoWave Panel over HTTPS using the mode-specific CA bundl
 """
 from __future__ import annotations
 
+import os
 import ssl
 import sys
 import time
@@ -16,17 +17,34 @@ from modules.api_client import GoWaveClient, GoWaveAPIError
 from .redaction import register_secret
 
 
+def configured_api_timeout() -> int:
+    """The per-attempt bound the rest of the controller reads from ``API_TIMEOUT``.
+
+    A caller that omits the optional argument gets this value rather than a
+    second literal: the live runner passes ``config["API_TIMEOUT"]`` explicitly,
+    and a default that drifted away from it would make "the client honours the
+    configured timeout" true only for the one code path that remembered to pass
+    it.
+    """
+    from .config import parse_positive_int
+
+    return parse_positive_int(os.environ.get("API_TIMEOUT", "15"), "API_TIMEOUT")
+
+
 class E2EPanelClient:
     def __init__(
         self,
         panel_domain: str,
-        ssl_context: ssl.SSLContext,
-        timeout: int = 15,
+        ssl_context: Optional[ssl.SSLContext] = None,
+        timeout: Optional[int] = None,
     ):
         self.panel_domain = panel_domain
         self.base_url = f"https://{panel_domain}"
         self.ssl_context = ssl_context
-        self.timeout = timeout
+        # ``None`` keeps the caller's current behaviour: ``GoWaveClient`` without
+        # a context uses the system store, exactly as it did before the live
+        # controller started handing in the run's own bundle.
+        self.timeout = configured_api_timeout() if timeout is None else timeout
         self.client = GoWaveClient(
             base_url=self.base_url,
             ssl_context=self.ssl_context,

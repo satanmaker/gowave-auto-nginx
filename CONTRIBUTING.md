@@ -2,8 +2,9 @@
 
 ## Branching & Pull Request Workflow
 
-- `main` is the primary protected branch.
+- Target development pull requests at `develop`. `main` carries releases only; its release guard accepts pull requests only from this repository's `develop` branch.
 - Feature branches should follow the naming scheme: `feature/<topic>`, `fix/<topic>`, or `docs/<topic>`.
+- The Podman product-acceptance workflow runs on pull requests into `develop`, pushes to `develop`, and manual dispatch (recovery jobs exclude pushes). Lint/nonroot and root/integration workflows run on pull requests into `develop` and manual dispatch, not every feature-branch push.
 - Keep pull requests focused on specific tasks or issues.
 - All commits should have clear, descriptive commit messages referencing related tasks or specs.
 
@@ -13,7 +14,7 @@
 
 ### 1. Shell Script Standards
 - Target environment: `bash` on Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13.
-- Always include `set -euo pipefail`.
+- Always include `set -Eeuo pipefail`, including in payloads streamed over SSH. `-E` propagates `ERR` traps into functions so failure-path rollback runs there too.
 - Validate syntax using `bash -n <script>`.
 - All shell scripts must pass `shellcheck --severity=error`.
 - Always use `local` variables inside functions.
@@ -44,6 +45,14 @@ The test suite enforces strict EUID privilege separation:
 
 ### Running Local Validation
 
+Run commands from the repository root. Run `root` and `systemd` suites only in a
+disposable test container or VM, never on an installed production host: they
+exercise privileged host configuration and service changes. Rootful Podman
+acceptance also provisions privileged systemd containers; use a dedicated test
+host with the prerequisites in [the Podman guide](docs/PODMAN_E2E.md#prerequisites).
+Do not treat a privilege check or a container boundary as proof of safety on a
+production host.
+
 1. **Syntax & Completeness**:
    ```bash
    for s in *.sh modules/*.sh assets/**/*.sh; do [ -f "$s" ] && bash -n "$s"; done
@@ -56,13 +65,32 @@ The test suite enforces strict EUID privilege separation:
    python3 tests/run_ci.py --suite integration
    ```
 
-3. **Local Podman Pre-Flight Gate**:
-   Before deploying to any physical or cloud VPS, run:
+3. **Local Podman Product Acceptance** (dedicated test host only):
    ```bash
-   ./tests/podman_testbed.sh
-   ./tests/podman_testbed.sh multi-node
+   sudo python3 -m tools.run_podman_e2e --topology aio
+   sudo python3 -m tools.run_podman_e2e --topology multi-node
+   sudo python3 -m tools.run_podman_e2e --topology panel-only
    ```
-   All 8 stages must pass across all 4 target operating systems.
+   These are the product-acceptance entrypoints used by CI; the older
+   `tests/podman_testbed.sh` remains a separate transport testbed, not a substitute
+   for them. The default distribution is `ubuntu-24.04`; use `--distribution`
+   explicitly for the other targets. See [the invocation reference](docs/PODMAN_E2E.md#invocation)
+   for the supported aliases, matrix-defined budget ceilings and artifact checks.
+   A passing run proves only the selected topology, distribution and options,
+   not all four supported operating systems or a live VPS deployment.
+
+4. **Pre-Push Acceptance Gate**:
+   Install the hook once per clone; from then on `git push` runs both full
+   Podman suites (`aio`, then `multi-node`) against the pinned fixtures before
+   anything leaves the machine, and blocks the push on the first failure:
+   ```bash
+   python3 -m tools.pre_push_e2e --install-hook
+   ```
+   The suites provision privileged systemd containers, so the hook runs the gate
+   as root and `sudo` may prompt interactively. `git push --no-verify` bypasses
+   the hook; the required pull-request checks then judge the change. The gate
+   reads which topologies it covers from the `gate:` list in
+   `tests/cases/matrix.yaml` — never edit the list to make a push pass.
 
 ---
 

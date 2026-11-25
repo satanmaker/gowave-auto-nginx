@@ -1,0 +1,1701 @@
+# Requirement -> scenario -> case/test -> CI job, for the delta spec.
+#
+# One row per scenario of
+# `openspec/specs/podman-e2e/spec.md`. `cases` names ids
+# the suites actually declare (`AIO-DP-*` and `MN-DP-*` expand against the
+# matrix); `tests` names `tests.<module>.<Class>[.<method>]` ids that exist;
+# `jobs` names jobs a workflow declares. A row with `gap` names the ledger task
+# that still owns the missing work, and `tools/podman_e2e/trace.py --strict`
+# refuses the table while any gap remains.
+#
+# The `behaviours` block below is a second view of the same cases: it names one
+# promise at a time and quotes the `tests/cases/matrix.yaml` declaration that
+# promise rests on, so a reader can ask what a single behaviour is proved by
+# without walking the scenario rows. `behaviour_obligations` names the
+# declarations the report has to cover; an obligation the behaviours stop
+# naming is a failure, not a shorter report.
+schema: gowave-podman-traceability/v1
+version: 1
+spec: openspec/specs/podman-e2e/spec.md
+requirements:
+  - requirement: Independent All-in-One acceptance topology
+    scenarios:
+      - scenario: All-in-One clean installation
+        cases: [AIO-INSTALL, AIO-PACKAGES, AIO-04, AIO-01, AIO-03, AIO-05, AIO-02, TLS-01, NGX-04]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAioSuite
+          - tests.test_podman_aio.TestAioVerificationCases
+          - tests.test_podman_aio.TestTlsCaBundleCase
+          - tests.test_podman_aio.TestVisionRouteCase
+          - tests.test_podman_runner.TestPodmanRunnerContract
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: All-in-One repeated provisioning
+        cases: [AIO-IDEMPOTENT, AIO-RESTART]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestIdempotentCase
+          - tests.test_podman_aio.TestRestartCase
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Independent Multi-Node acceptance topology
+    scenarios:
+      - scenario: Multi-Node clean installation and registration
+        cases: [MN-INSTALL, WRK-04, WRK-05, CLUS-01, CLUS-02, CLUS-03]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestMultiNodeSuite
+          - tests.test_podman_multi_node.TestWorkerRegistrationCase
+          - tests.test_podman_cluster.TestClusterCases
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Master and Worker optional domain configuration
+        cases: [MN-VISION, NGX-04]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_cluster.TestVisionCase
+          - tests.test_podman_multi_node.TestMultiNodeCounts
+          - tests.test_podman_multi_node.TestVisionRouteCase
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Worker dispatch is observed without the secret
+        cases: [MN-ARGV-OBSERVER]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_argv_observer.TestStraceParsing
+          - tests.test_podman_argv_observer.TestAcceptanceFixtures
+          - tests.test_podman_argv_observer.TestObserverWiring
+          - tests.test_podman_argv_observer.TestNodeAddIsTraced
+          - tests.test_podman_argv_observer.TestArgvObserverCase
+          - tests.test_podman_argv_observer.TestObserverDocumentation
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Multi-Node deployment with one failed node and partial success
+        cases: [MN-PARTIAL-SUCCESS]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestPartialSuccessCase
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: The composed wizard corrects a duplicate cover domain and retries one Worker
+        cases: [MN-WIZARD-FLOW]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestWizardFlowCase
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Add-node refused by Panel API verification failure
+        cases: [MN-ADD-NODE-REFUSED]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestAddNodeRefusedCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Independent Panel-only acceptance topology
+    scenarios:
+      - scenario: Panel-only clean installation
+        cases: [PO-INSTALL, PO-HOST, PO-API]
+        topologies: [panel-only]
+        tests:
+          - tests.test_podman_panel_only.TestPanelOnlySuite
+          - tests.test_podman_panel_only.TestPanelOnlyInstallCase
+          - tests.test_podman_panel_only.TestPanelOnlyHostCase
+          - tests.test_podman_panel_only.TestPanelOnlyApiCase
+        jobs: [Panel-only Podman Acceptance]
+      - scenario: Panel-only Worker registration
+        cases: [PO-SQUAD, PO-SQUAD-REFUSED]
+        topologies: [panel-only]
+        tests:
+          - tests.test_podman_panel_only.TestPanelOnlySquadCase
+          - tests.test_podman_panel_only.TestPanelOnlyRefusalProbe
+        jobs: [Panel-only Podman Acceptance]
+      - scenario: Add-node refused by Panel API verification failure
+        cases: [MN-ADD-NODE-REFUSED]
+        topologies: [panel-only]
+        tests:
+          - tests.test_podman_panel_only.TestPanelOnlyAddNodeRefusedCase
+        jobs: [Panel-only Podman Acceptance]
+
+  - requirement: Real Panel subscription lifecycle
+    scenarios:
+      - scenario: Subscription User-Agent policy is enforced
+        cases: [SUB-SERVED, SUB-UA-ABSENT, SUB-UA-BLANK]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_subscriptions.TestSubscriptionCases
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Subscription is issued, updated where supported, and revoked
+        cases: [AIO-CLIENT, AIO-REVOKE, MN-REVOKE]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_traffic.TestRevocationCase
+          - tests.test_podman_aio.TestPanelApiCases
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Panel subscription representations
+    scenarios:
+      - scenario: Base64 share-link list matches the profile inventory
+        cases: [SUB-B64]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_subscriptions.TestSubscriptionCases
+          - tests.test_podman_subscriptions.TestSubscriptionClientProbe
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Xray JSON is validated in both served shapes
+        cases: [SUB-JSON-SHAPES]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_subscriptions.TestSubscriptionCases
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Versioned protocol and client coverage matrix
+    scenarios:
+      - scenario: Complete client and inbound matrix is executed
+        cases: [AIO-MATRIX, MN-MATRIX, WRK-06, AIO-DP-*, MN-DP-*]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+          - tests.test_podman_traffic.TestMatrixCase
+          - tests.test_podman_multi_node.TestMultiNodeCounts
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Real client data-plane verification
+    scenarios:
+      - scenario: Supported protocol transfers payload
+        cases: [AIO-MATRIX, MN-MATRIX, AIO-DP-*, MN-DP-*]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_traffic.TestDataPlaneCase
+          - tests.test_podman_traffic.TestTrafficProbeTransfer
+          - tests.test_podman_worker_subscriptions.TestWorkerDataPlaneCase
+          - tests.test_podman_multi_node.TestDataPlaneSourceEvidence
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Prohibited destination remains inaccessible
+        cases: [AIO-NEG-DEST]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_traffic.TestTrafficProbeProhibited
+          - tests.test_podman_aio.TestNegativeCases
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Deterministic DNS and ACME fixtures
+    scenarios:
+      - scenario: Certificate issuance and renewal
+        cases: [ACME-01, ACME-02, TLS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAcmeRenewalCase
+          - tests.test_podman_acme_fixture.TestPodmanAcmeFixture
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: DNS A/AAAA and TTL behavior
+        cases: [DNS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_dns.TestDnsCase
+          - tests.test_fixture_dns.TestDnsFixture
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: NXDOMAIN and stale-answer handling
+        cases: [DNS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_dns.TestDnsCaseWiring
+          - tests.test_podman_dns.TestDnsProbe
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: ACME challenge and service failure
+        cases: [ACME-02, NGX-WORKER-ACME80]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_aio.TestAcmeOutageCase
+          - tests.test_podman_multi_node.TestAcme80Case
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Camouflage decoy and certificate lineage
+    scenarios:
+      - scenario: Decoy renders for the derived apex
+        cases: [DECOY-01, NGX-COVER-DERIVE, NGX-COVER-SITE, NGX-DECOY-ROUTE]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_aio.TestDecoyCase
+          - tests.test_podman_multi_node.TestCoverDeriveCase
+          - tests.test_podman_multi_node.TestCoverSiteCase
+          - tests.test_podman_multi_node.TestDecoyRouteCase
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Unresolvable cover names block rendering
+        cases: [NGX-COVER-UNRESOLVED]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestCoverUnresolvedCase
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Worker keeps its decoy and ACME route
+        cases: [NGX-WORKER-ACME80, NGX-DECOY-ROUTE]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestAcme80Case
+          - tests.test_podman_multi_node.TestDecoyRouteCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Private test CA trust for both client engines
+    scenarios:
+      - scenario: Fixture chain is trusted by Xray and Mihomo
+        cases:
+          - TLS-VERIFY-ANCHORS
+          - AIO-DP-XHTTP-xray
+          - AIO-DP-XHTTP-mihomo
+          - AIO-DP-WS-xray
+          - AIO-DP-WS-mihomo
+          - AIO-DP-TROJAN-GRPC-xray
+          - AIO-DP-TROJAN-GRPC-mihomo
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_client_trust.TestPodmanClientTrust
+          - tests.test_podman_client_image.TestClientImageContract
+          - tests.test_podman_tls_anchors.TestTlsAnchors
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Non-bypassable node egress attribution
+    scenarios:
+      - scenario: Worker data-plane traffic cannot bypass Worker
+        cases: [MN-EGRESS, MN-DP-worker-*]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestEgressCase
+          - tests.test_podman_multi_node.TestDataPlaneSourceEvidence
+          - tests.test_podman_worker_subscriptions.TestWorkerDataPlaneCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Podman-only Master address selection for Worker provisioning
+    scenarios:
+      - scenario: Worker provisioning uses the actual private Master address
+        cases: [PODNET-MASTER-ADDR]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestMasterAddressCase
+          - tests.test_podman_address.TestPodmanAddressOverride
+          - tests.test_podman_multi_node.TestWorkerProvisioningCommand
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Fail-closed local ACME test mode
+    scenarios:
+      - scenario: Pebble endpoint is rejected outside test mode
+        cases: [AIO-NEG-ACME]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestNegativeCases
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: Arbitrary ACME URL is rejected inside test mode
+        cases: [AIO-NEG-ACME, ACME-REJECT-ARB]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_aio.TestNegativeCases
+          - tests.test_podman_acme_mode.TestAcmeMode
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Security and network isolation verification
+    scenarios:
+      - scenario: Unauthorized management access
+        cases: [FW-01, FW-02, FW-03, FW-04, AIO-NEG-PORT]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_denial.TestManagementDenialCase
+          - tests.test_podman_denial.TestHostFirewallParsers
+          - tests.test_podman_denial.TestHostFirewallIpv6Parsers
+          - tests.test_podman_multi_node.TestMasterAccessCase
+          - tests.test_podman_multi_node.TestIpv6PolicyCase
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: SSH host-key pinning rejects mismatch and supports rotation
+        cases: [MN-SSHKEY]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestSshHostKeyCase
+          - tests.test_podman_multi_node.TestWorkerTrustPin
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: mTLS rejects invalid client certificates
+        cases:
+          - MTLS-01
+          - MTLS-02
+          - MTLS-03
+          - MTLS-04
+          - MTLS-05
+          - MTLS-06
+          - MTLS-07
+          - MTLS-08
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestMtlsCases
+          - tests.test_podman_multi_node.TestMtlsNegativeReport
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Lifecycle recovery acceptance
+    scenarios:
+      - scenario: Restore Panel and Worker backups
+        cases: [MN-BACKUP, MN-BACKUP-VOL, MN-RESTORE]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestBackupCase
+          - tests.test_podman_multi_node.TestBackupVolumeCase
+          - tests.test_podman_multi_node.TestRestoreCase
+        jobs: [Multi-Node Podman Acceptance, Multi-Node Lifecycle and Recovery Acceptance]
+      - scenario: Failed channel update rolls back
+        cases: [AIO-CHANNEL-NOOP, AIO-CHANNEL-ROLLBACK, AIO-CHANNEL-DEV]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestChannelCases
+        jobs: [All-in-One Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance]
+
+  - requirement: Backup archive confidentiality
+    scenarios:
+      - scenario: Backup archives are excluded from exported evidence
+        cases: [MN-BACKUP, MN-BACKUP-BAD]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestArtifactLeaks
+          - tests.test_podman_multi_node.TestBackupRejectCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Failure injection and recovery
+    scenarios:
+      - scenario: Recovery after Worker outage
+        cases: [MN-OUTAGE, MN-RESTART, MN-SSH-DOWN]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestWorkerOutageCase
+          - tests.test_podman_multi_node.TestWorkerRestartCase
+          - tests.test_podman_multi_node.TestSshServiceDownCase
+        jobs: [Multi-Node Podman Acceptance, Multi-Node Lifecycle and Recovery Acceptance]
+      - scenario: Interrupted operator execution
+        cases: [AIO-INTERRUPT]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestChannelCases
+        jobs: [All-in-One Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance]
+
+  - requirement: Independent topology CI gates
+    scenarios:
+      - scenario: One topology job is absent or incomplete
+        tests:
+          - tests.test_ci_workflows.TestIndependentAcceptanceWorkflows
+          - tests.test_podman_groups.TestRequiredGroupRun
+          - tests.test_podman_gate.TestPodmanGateContract
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - All-in-One Lifecycle and Recovery Acceptance
+          - Multi-Node Lifecycle and Recovery Acceptance
+
+  - requirement: Pre-push and pull-request acceptance gate
+    scenarios:
+      - scenario: Pre-push run blocks a regressed change
+        cases: [GATE-PREPUSH]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_pre_push.TestPrePushGate
+          - tests.test_podman_gate_tiers.TestGateTiers
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Budget overrun is not a truncated pass
+        cases: [GATE-BUDGET]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_budget.TestBudgetCase
+          - tests.test_podman_budget.TestEntrypointBudget
+          - tests.test_podman_budget.TestDeclaredBudget
+          - tests.test_podman_gate.TestPodmanGateContract
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - All-in-One Lifecycle and Recovery Acceptance
+          - Multi-Node Lifecycle and Recovery Acceptance
+          - Lint, Completeness, and Suite Nonroot
+
+  - requirement: Harness ceilings never decide a product verdict
+    scenarios:
+      - scenario: A slow legitimate step keeps its ceiling
+        cases: [AIO-INSTALL, PO-INSTALL]
+        topologies: [aio, panel-only]
+        tests:
+          - tests.test_podman_budget.TestOperationCeilings
+        jobs:
+          - All-in-One Podman Acceptance
+          - Panel-only Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+      - scenario: A budget kill inside a cleanup probe stays INCOMPLETE
+        tests:
+          - tests.test_podman_aio.TestRestoreDeadlineCase
+          - tests.test_podman_runner.TestResultSemantics
+        jobs:
+          - All-in-One Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+      - scenario: A ceiling that fires names its own limit
+        cases: [AIO-INSTALL, MN-INSTALL]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_runner.TestHarnessLimitVerdict
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+
+  - requirement: Coverage completeness and error paths
+    scenarios:
+      - scenario: Unmapped behavior or orphan case fails the audit
+        cases: [GATE-COVERAGE]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_behaviors.TestBehaviorInventory
+          - tests.test_podman_traceability.TestTraceabilityRules
+          - tests.test_podman_gate_tiers.TestGateTiers
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Shared contract diverges from live acceptance
+        tests:
+          - tests.test_podman_contracts.TestSharedContracts
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+
+  - requirement: Case incubation and promotion path
+    scenarios:
+      - scenario: New case starts in Podman
+        tests:
+          - tests.test_podman_aio.TestNginxConfigCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Promotion keeps one definition
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Live-only case states its reason
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+
+  - requirement: Live scenario parity
+    scenarios:
+      - scenario: Parity inventory matches both suites
+        cases: [GATE-DIVERGENCE]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+          - tests.test_podman_gate_tiers.TestGateTiers
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Partial case splits the proof
+        cases: [DP-09, DP-10, DP-11]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+          - tests.test_podman_staging_trust.TestStagingTrustCases
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Podman-first case has a promotion target
+        tests:
+          - tests.test_podman_aio.TestAcmeRenewalCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case
+          - tests.test_podman_aio.TestAcmeOutageCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+
+  - requirement: Trustworthy result and diagnostics
+    scenarios:
+      - scenario: Secret redaction
+        tests:
+          - tests.test_podman_redaction.TestRedactionFilter
+          - tests.test_podman_redaction.TestArtifactTreeHoldsNoSentinel
+          - tests.test_podman_redaction.TestDiagnosticsNeverPrintValues
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Unexpected skip
+        cases: [GATE-STATUS]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_runner.TestResultSemantics
+          - tests.test_podman_status.TestStatusCase
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+      - scenario: Install-dependent case without a successful installation
+        tests:
+          - tests.test_podman_aio.TestDiagnosticArtifactsCase
+        jobs:
+          - All-in-One Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+
+  - requirement: Safe isolation and cleanup
+    scenarios:
+      - scenario: Cleanup after failure
+        tests:
+          - tests.test_podman_cleanup.TestPodmanStaleRunRecovery
+          - tests.test_podman_cleanup.TestEntrypointReclaimsStaleRuns
+          - tests.test_podman_fixture_isolation.TestPodmanFixtureIsolation
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+# Cases that serve a requirement the delta spec states, where the spec writes no
+# scenario for the behavior the case proves. Each entry names the requirement and
+# why no scenario fits; `trace.py` still refuses an id no suite declares, and an
+# id that is also mapped to a scenario above.
+cases_by_requirement:
+  - requirement: Real Panel subscription lifecycle
+    cases: [AIO-AUTH]
+    reason: >-
+      the documented admin login, its bearer token and the authenticated read
+      surface are what every subscription call consumes; the spec states the
+      subscription scenarios and not the token underneath them
+  - requirement: Panel subscription representations
+    cases: [SUB-EDGE, SUB-EDGE-BAD]
+    reason: >-
+      the requirement states the bytes a consuming client is served and says
+      nothing about the listener that stands between the Panel and that client:
+      the public edge is where a pasted link is read first, and it has to answer
+      a preview crawler with an empty 204, close a raw target no client would
+      send, and keep the credential out of its access log. No scenario of the
+      requirement states the edge contract
+  - requirement: Independent All-in-One acceptance topology
+    cases: [NGX-HYGIENE, NGX-SCANNER]
+    reason: >-
+      the requirement's scenarios state what the All-in-One install leaves
+      running and what a client is served, and nothing about the listener that
+      answers before the Panel: the edge has to keep its build out of every
+      answer it writes, hand the Panel the peer address rather than a
+      client-chosen one, and drop the scanner targets without a byte. No
+      scenario of the requirement states the listener's own hygiene
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PRE-INPUTS, PRE-INPUTS-BAD]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states what happens to a request that
+      cannot be honoured: the installer has to refuse a partial or malformed
+      input before it stops NGINX or writes a managed path, and the refusal has
+      to name the input. The host the first install left serving is the control,
+      so one entry covers both the missing value and the value that is present
+      but invalid
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PRE-PROXY-CIDR, PRE-PROXY-CIDR-OVERRIDE]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the proxy CIDR preflight:
+      a name answering from the Cloudflare proxy CIDR snapshot is refused
+      before any certificate request, and GOWAVE_PREFLIGHT_ALLOW_PROXIED=1
+      records the operator's decision to continue anyway. Both cases serve the
+      same parity sentence for the preflight refusal that the live scenario
+      states.
+  - requirement: Camouflage decoy and certificate lineage
+    cases: [NGX-05]
+    reason: >-
+      `nginx -t` on the generated tree and the deploy hook's refusal to reload a
+      broken snippet are the contract that keeps the decoy and its lineage
+      serving; the spec states the rendered decoy and not the tree reloaded
+  - requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+    cases: [TLS-LINEAGE]
+    reason: >-
+      the requirement states the ACME directory selection and certificate lineage
+      isolation; its scenarios cover ACME directory selection and lineage
+      adoption, but no scenario states the repeated-install adoption of an
+      existing suffixed lineage. This case serves that parity sentence by
+      driving select_acme_lineage with a pre-existing suffixed lineage and
+      verifying the adoption message, the returned directory, deterministic
+      repetition, and that no exact-name lineage is created.
+  - requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+    cases: [TLS-LINEAGE-BAD]
+    reason: >-
+      the requirement states the ACME directory selection and certificate lineage
+      isolation; its scenarios cover ACME directory selection and lineage
+      adoption, but no scenario states the refusal of expired or mismatched
+      lineages. This case serves that parity sentence by driving
+      select_acme_lineage with an expired lineage and a mismatched-directory
+      lineage and verifying both are refused with the correct message.
+  - requirement: Security and network isolation verification
+    cases: [AIO-NEG-DEP]
+    reason: >-
+      the public surface fails while the Panel's loopback API keeps answering,
+      which is the isolation the requirement names, stated by no scenario
+  - requirement: Failure injection and recovery
+    cases: [AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY]
+    reason: >-
+      the requirement names dependency, network, service, filesystem and process
+      failures; its two scenarios state a Worker outage and an interrupted
+      operator, so the disk, Panel, core-process and latency faults serve the
+      requirement directly
+  - requirement: Live scenario parity
+    cases: [AIO-PKT-02, MN-PKT-03, AIO-NEG-PIN, GATE-TEARDOWN]
+    reason: >-
+      all four witness a sentence of the live capability the delta spec states
+      no scenario of its own for. The first two serve its per-case
+      packet-evidence requirement — INCOMPLETE when the capture tool, the
+      source-IP identity or a valid summary is missing, FAIL when a correct
+      payload is attributed to the wrong VPS — and AIO-NEG-PIN serves its
+      pinned-version requirement, where a floating installer branch or an
+      installer whose bytes miss the configured digest has to be refused before
+      anything runs. GATE-TEARDOWN serves its teardown-policy requirement: the
+      policy a run ends in is a configuration file, a digest-pinned hook and a
+      comparison, so the container reads what preflight refuses, what the hook
+      is handed and the status a broken restore may not become. What the delta
+      spec states about all four is the parity sentence itself, a Podman case
+      for every container-reproducible live scenario
+  - requirement: Live scenario parity
+    cases: [VIS-CONFIG, VIS-GATE, VIS-05, VIS-06]
+    reason: >-
+      all four serve the same parity sentence for Vision sentences the delta
+      spec writes no scenario about. VIS-CONFIG is the configuration's own
+      reader: four accepted combinations, eight duplicate classes refused by
+      name, and the live runner exiting on a duplicate before it creates a run
+      directory — the uniqueness sentence of the live requirement. VIS-GATE is
+      the port sentence: only the host whose own Vision domain is configured
+      owes 8444 and 9444, and a host exempt from them is still held to the
+      default port set. VIS-05 is the failure sentence: the installed host is
+      asked once more for a Vision domain the fixture resolver answers with
+      NXDOMAIN, which puts the failure in the Vision stage after the Panel and
+      REALITY lineages already exist, so the rollback has something to preserve
+      and the case compares digests of those lineages, the deploy hook, its
+      ownership record and the NGINX tree instead of trusting the installer's
+      account of itself. VIS-06 is the reporting sentence beside it: the same
+      failing Vision stage with a compensation that cannot finish, because a
+      detached watcher empties the journal's ledger once the transaction is
+      VERIFYING, so the API rollback refuses to enumerate — and what the case
+      reads is the aggregate CRITICAL line and the retained journal naming that
+      refusal, never a clean compensation reported as PASS
+  - requirement: Live scenario parity
+    cases: [PRE-01, PRE-02, PRE-03, PRE-04, PRE-05, PRE-06, ADDR-01, ADDR-02, ADDR-03]
+    reason: >-
+      all nine serve the same parity sentence for the two sentences every run
+      decides before it touches a host: what it trusts, and what it calls its
+      targets. PRE-01 is the trust sentence — one host's key pinned and the
+      other's absent, refused by name with the file that was read, the
+      known_hosts byte count unchanged so the refusal is known to be a read and
+      not a scan that appended the host it was asked to verify, an empty file
+      refused with its own words, and the same check accepting the pinned key so
+      the refusal is the pin and not a check that always fails; the ordering is
+      read from the runner's own source, because a refusal that arrives after a
+      remote baseline was collected has already used the key. PRE-04 is the
+      address sentence: nine IPv4 and five IPv6 classes — loopback, the three
+      RFC1918 ranges, link-local, multicast, documentation, unspecified and
+      broadcast — are each refused by key and by value while naming the rule,
+      the parser is shown to carry no switch that could relax it, the harness's
+      own addresses are shown to be global so its control configuration is not
+      an exemption, and the operator's source shows the configuration parsed
+      before its first `_bootstrap_one`. PRE-02, PRE-03,
+      PRE-05 and PRE-06 are the DNS sentence, answered by two real fixture
+      resolvers on loopback because preflight refuses fewer than two independent
+      resolvers: a name publishing another address fails with the domain, both
+      addresses and both resolvers in the message and `PASS` when the same name
+      is corrected, so the verdict is attributable; an unexpected AAAA fails
+      while ENABLE_IPV6=false and the same names are accepted without it; with
+      IPv6 on, every name's AAAA must be the configured address, a missing one
+      is a missing record rather than a correct one, and a wrong one is named;
+      and PRE-06 is the bypass clause — a configured Vision name's AAAA is held
+      to the same rule, two resolvers disagreeing about it fail the run instead
+      of being read as the union of their answers, and a firewall verification
+      handed no IPv6 target is `INCOMPLETE` rather than `PASS`. ADDR-01, ADDR-02
+      and ADDR-03 are the identity sentence: one address cannot be both hosts
+      even when a second SSH port makes them look like two, the four mandatory
+      names are pairwise unique under case folding, a non-root account is
+      refused with no sudo path, and each refusal is shown to arrive before the
+      local lock, before an SSH client, and before the operator's first
+      `_bootstrap_one` — the order being read from both modules' own source.
+      What the delta spec states about all eight is the parity sentence itself,
+      a Podman case for every container-reproducible live scenario
+  - requirement: Live scenario parity
+    cases: [MN-LOCK, MN-LOCK-LOSS, MN-LOCK-PATH, MN-LOCK-CLI, MN-LOCK-NESTED]
+    reason: >-
+      all five serve the same parity sentence for the two live requirements the
+      delta spec writes no scenario about: the pair-wide lock a run holds over
+      both hosts, and the one lock every management entry point has to take.
+      MN-LOCK is the exclusivity sentence — a second runner is refused before
+      either host is modified, by a sentence naming the held lock path, keeps no
+      lease, and leaves the owner's published leases exactly as they were, run id
+      and holder pid and token alike; the lock file outlives its holder, so once
+      the owner releases a fresh runner takes both hosts with different tokens
+      and the product's own `validate_mutation_lease` accepts the new holder's
+      lease while refusing the released one. MN-LOCK-LOSS is the fail-closed
+      sentence: one session's holder is terminated inside the host as a dropped
+      connection ends it, the runner stops reporting both sessions alive, every
+      mutating phase is then gated `INCOMPLETE` naming the lost lock while a
+      read-only phase still reports, a contender that wins the freed host
+      releases it when the other refuses so no run holds half the pair, and
+      resuming means reacquiring both locks and revalidating the saved state
+      rather than trying again. MN-LOCK-PATH is the refusal-before-mutation
+      sentence of the entry-point requirement: a lock file that is a symlink, a
+      directory, a FIFO, group-readable or owned by another user, and a lock
+      directory that is itself a symlink, are each refused with the host address
+      and the object named, the object is then found untouched and the pair-wide
+      lock still free — each shape read on the host that was refused, and both
+      hosts cleared first so the refusal cannot be the other host's leftover.
+      MN-LOCK-CLI is the other half of that requirement, the commands rather than
+      the path: the shipped `install`, `node add`, `node rollback`,
+      `node reapply`, `domain-change`, `channel`, `uninstall` and
+      `backup restore` are run against the holder and each has to print the
+      lock's own sentence instead of the sentence it prints once it is past the
+      lock, exit nonzero, leave every file it could rewrite at its digest, leave
+      the protocol's two files alone and leave the holder's session alive, so a
+      command with a private lock or none at all cannot pass; the Worker's own
+      canonical file is read too, and its `remote_payload`/`remote_rollback`
+      half is named as not driven because a valid Worker lease would reinstall
+      it. MN-LOCK-NESTED is the re-entrancy sentence: the run's own lease is
+      accepted in both transports the product supports — the environment and the
+      `GOWAVE_LEASE:` stdin line — while a child with no lease is refused, and
+      acceptance is proved with the parent's session alive, the lease
+      byte-identical, the host's digests unchanged and the lock still held, so
+      "the child ran" cannot be "the child took a lock the parent had dropped";
+      a lease from a released holder and one replayed from a terminated holder
+      are then refused as invalid or stale with a nonzero exit, and the
+      terminated holder's token is refused by the product's own validator
+  - requirement: Live scenario parity
+    cases: [RUNID-01, RESUME-01]
+    reason: >-
+      both serve the same parity sentence for the durable-run-state requirement
+      the delta spec writes no scenario about. RUNID-01 is the artifact-root
+      sentence: every hostile run id the requirement names — `..`, a separator,
+      an encoded separator, NUL, dot only, empty, a leading dash, more than 64
+      characters and a symlinked component — is refused by the product's own
+      validator with the rule it broke and with the root unchanged, the accepted
+      shapes resolve to a directory named strictly below that root that
+      validation does not create, and the runner's own source order places the
+      validation before the directory and before the SSH client. RESUME-01 is
+      the partial-mode sentence: the record is written by the product's writer at
+      mode 0600 and read by its own reader, the gate accepts a phase whose
+      prerequisites passed and refuses another run id, commit or non-secret
+      identity, a phase that already has a terminal result, and every phase whose
+      prerequisite is not PASS with a sentence naming the reason, teardown is
+      refused without both baselines, the baseline comparison reports drift on a
+      host that grew a GoWave directory, started listening on a required port or
+      lost a required tool while tolerating the fields no gate reads, and the
+      runner re-collects that baseline before it copies the repository
+  - requirement: Live scenario parity
+    cases: [ENV-01, ENV-02, DP-12, DP-14, LOCAL-01]
+    reason: >-
+      all five serve the same parity sentence for four live sentences whose
+      subjects are files and verdicts rather than a running pair. ENV-01 and
+      ENV-02 are the disposable-environment gate: a container built from the
+      run's own pinned image, given the two target-side tools the gate's own
+      refusal asks for, passes `check_disposable_gate` with its ten-key manifest
+      recorded and `evaluate_preflight_eligibility` reporting PASS while a
+      sentinel file and the package count are byte-identical before and after,
+      so the inspection is a read and not a repair; the same host then
+      accumulates one contamination at a time — an existing `/opt/gowave`, a
+      running unit, a listener on 443 made by the host's own sshd, a hidden
+      `tcpdump` — and each step is refused by the gate's own sentence,
+      cumulatively, with the verdict FAIL, the four reasons recorded verbatim in
+      `master_gate_errors` and `worker_gate_errors`, the contaminated objects
+      still in place, and the runner's own source order placing the halt before
+      its first remote write. DP-12 is the production-trust sentence: the
+      production bundle is the Control Machine's own public roots byte for byte,
+      carries no Staging marker and no pinned Staging name, while the Staging
+      bundle carries the four pinned roots and their marker; a pinned root
+      verifies against the bundle that holds it and is refused by the production
+      one with `openssl` as the only trust source, a public root verifies against
+      production, the context built from it requires a certificate and a host
+      name, and an unknown mode is refused rather than guessed. DP-14 is the
+      skipped-traffic sentence: with `TEST_TRAFFIC_VERIFICATION` off, and with
+      one case recorded SKIP, the suite's verdict is INCOMPLETE at both ends of
+      the 8/10 range where those same cases pass with it on; the JUnit document
+      a CI reader sees carries the skip and the traffic phase as an error,
+      `result.json` records INCOMPLETE at mode 0600, the container aggregate
+      turns a declared SKIP into FAIL, and the runner's own phase aggregation is
+      quoted from its source because it is inline in `run_e2e` and has no
+      callable seam. LOCAL-01 is the CI-credential sentence: the workflow that
+      claims it declares read-only repository permission, interpolates no
+      `secrets.` expression, runs in no Environment, installs the repository's
+      own dependency file in one step and runs the discovery this case then runs
+      with nothing a credential could arrive in — no `GOWAVE_*`, no agent
+      socket, an empty home directory — which passes in seconds
+  - requirement: Live scenario parity
+    cases: [OP-01, OP-02, SSHID-01, SSHID-02, TSSH-01, TSSH-02]
+    reason: >-
+      all six serve the same parity sentence for the four live sentences about
+      the operator's own controller rather than about a running pair. OP-01 is
+      the input-gate sentence: the controller is driven with thirteen scripted
+      answers and one field changed at a time, and each of the four invalid
+      classes the sentence names — an unparsable address, a Vision domain that
+      duplicates a panel domain, a malformed FQDN, a non-root SSH account — is
+      refused by the strict parser with its own sentence while
+      `socket.create_connection` is never called and no bootstrap is reached;
+      the fully valid input then reaches exactly one bootstrap, and the source
+      order places `load_config` before the first `_bootstrap_one` call, so the
+      order is carried by a call site rather than by a comment. OP-02 is the
+      password sentence: `_bootstrap_one` reads it through one `getpass` prompt
+      whose text says hidden, hands it to exactly one `auth_password` call, and
+      drops it before the first byte reaches the host, so it appears in no
+      child's argv, in no environment variable, in no file under the runtime
+      directory and in none of the controller's own output, while the ephemeral
+      private key it does write is mode 0600. SSHID-01 and SSHID-02 are the
+      host-key pair: a matching fingerprint lets password authentication
+      proceed and pins the exact key the controller observed into a mode-0600
+      `known_hosts` file, while a mismatched one aborts with the controller's
+      own refusal, reads no password, writes no file, sends no command, arms no
+      timer and leaves `authorized_keys` byte-identical. TSSH-01 and TSSH-02 are
+      the temporary-access pair: the provider's existing `authorized_keys` entry
+      survives beside exactly one `restrict ssh-ed25519` entry carrying the
+      revocation marker, a persistent `OnActiveSec=2h` timer unit is written and
+      armed before the entry is moved into place, and a bootstrap that fails
+      after that point sends one cleanup attempt whose unverified outcome is
+      reported with the timer named as the remaining bound — the timer still
+      armed, the key never installed, the existing entry untouched
+  - requirement: Live scenario parity
+    cases: [HOOK-02]
+    reason: >-
+      HOOK-02 is the deploy-hook sentence of the ownership requirement, and it
+      is driven rather than quoted: `modules/nginx.sh` is sourced in a temporary
+      tree so `verify_deploy_hook_preflight`, `install_managed_deploy_hook` and
+      `rollback_managed_deploy_hook` answer with the manifest, the ownership
+      record and the digest they actually write. A hook the installation did not
+      write is refused with the sentence that names the unmanaged resource, its
+      bytes and the recovery root are unchanged and no manifest exists
+      afterwards; the product's own hook is then installed with
+      `created_by_tx` true, the recorded path and the digest the file has, and a
+      repeated install recognises it instead of refusing; a hook edited after
+      installation is preserved with the rollback refusing, and an untouched one
+      is removed together with the ownership record that named it. The teardown
+      half is `tools/live_vps/teardown.py`: `PRESERVE` answers with exactly its
+      status, policy, message, residual state and two baseline denials — a
+      restored baseline and a clean-baseline eligibility, both false — and
+      claims no baseline it never compared, while
+      the snapshot path — driven with a real executable restore hook and two
+      matching captured baselines — reports `INCOMPLETE` with the pair-lock and
+      ownership comparisons named as not implemented rather than claiming PASS.
+  - requirement: Live scenario parity
+    cases: [TXN-01]
+    reason: >-
+      TXN-01 is the signal sentence of the transactional requirement, and it is
+      driven as the shipped bytes rather than quoted: `tools/podman_e2e/signal_compensation.py`
+      slices `handle_signal`, `handle_error`, `compensate_once`, the cleanup and
+      the five traps out of the payload `gowave-node-auto.sh` streams to a
+      Worker, renames the shipped `compensate_remote_worker` so a wrapper can
+      count its callers, and runs the block over a scratch host root whose two
+      roots — `WORKER_STATE_ROOT` and `WORKER_HOST_ROOT` — are the ones the
+      compensation itself takes. The interrupted deployment is a real
+      transaction: the before-image and the journal are written by the shipped
+      functions, one inventoried binary is mutated and its mode changed, and the
+      signal arrives while the run is between mutations. Four runs decide the
+      sentence — TERM, HUP and INT against a restorable before-image, and TERM
+      against one whose copy was altered after it was written, so the
+      verification clause is decided in both directions. What the case reads
+      back is the handlers' own report, the number of times the compensator ran,
+      the sentinel of the mutation the interrupted run must never reach, the
+      journal's state and mode, the bytes and the mode the restore left, the
+      restore's own preserved-path sentence, the exit status and the payload's
+      temp file. The service manager is stubbed because a rollback that stopped
+      `gowave-node.service` would take down the host the suite installed; every
+      other step of the compensation is the product's. Thirteen damages make the
+      case refuse for the clause it protects: a TERM, HUP or INT handler that
+      skips the compensator, a handler that compensates beside the guarded call,
+      a run whose signal and error traps both stop nothing, a journal that is
+      never written, a restore that skips pre-existing paths, one that writes a
+      fixed mode, one that trusts a write it did not read back, one that trusts
+      a copy changed after it was written, an interruption that exits zero, a
+      cleanup that keeps the payload's temp file, and a compensation that
+      removes the journal.
+  - requirement: Live scenario parity
+    cases: [TXN-02]
+    reason: >-
+      TXN-02 is the journal sentence of the transactional requirement, driven on
+      both halves of the product. The journal half is `modules/recovery.py`: a
+      mid-switch journal written by the product's own atomic writer is validated
+      by its validator, is left at mode 0600 with no temporary sibling behind and
+      still names the snapshot it took when read back, while a journal whose
+      state does not belong to its operation is refused by the validator. The
+      boot half is `recover_boot_files` from `modules/recovery.sh`, sourced in a
+      temporary tree with the mutation lock and the file rollback stubbed: a
+      recoverable journal is named by the state it reports, reaches the rollback
+      of the snapshot the journal names and is left in `ROLLED_BACK`; a snapshot
+      the journal names but the disk does not hold, a snapshot outside
+      `RECOVERY_DIR`, and a journal that fails validation are each refused with
+      the sentence that says what is refused, and each refusal leaves the journal
+      exactly as it found it; a host with no journal reports nothing to recover.
+      The ordering clause is read from the function's own body: the mutation lock
+      is taken before the journal is read and before it is validated, which is
+      what makes the next mutation wait for the recovery.
+  - requirement: Live scenario parity
+    cases: [TXN-03]
+    reason: >-
+      TXN-03 is the two-sided sentence of the transactional requirement: a failed
+      `node add` whose Worker restore and Panel rollback disagree is reported
+      INCOMPLETE and is not recorded as rolled back until both sides verify.
+      `tools/podman_e2e/rollback_sides.py` slices the shipped
+      `finalize_failed_node_add` out of `gowave-auto.sh` and runs it over a
+      scratch tree. The Worker side is a stub `$SCRIPT_DIR/gowave-node-auto.sh`
+      that records the transaction it was given and exits with the scenario's
+      status — the seam the product already has, because the Worker rollback is
+      a separate process on another host — and the API side is the product's own
+      `rollback_provisioning` reading a journal this case wrote with the
+      product's own atomic writer. Three runs decide the sentence: a
+      `NODE_ADD_PREPARED` journal with no entities is a verified API side, and a
+      `NODE_ADD_APPLYING` journal without a durable action ledger is the refusal
+      that same function records. Each side failing while the other succeeds
+      leaves the journal in `NODE_ADD_ROLLBACK_REQUIRED` with `rollback_sides`
+      naming both verdicts, the aggregate refusal an operator reads, and the
+      API's own refusal still in the record; both sides verified is the only run
+      that reaches `NODE_ADD_ROLLED_BACK`. That the API writer cannot hide a
+      later Worker failure is the clause the product failed before this case:
+      the API rollback finalized a clean rollback itself, so the journal said
+      ROLLED_BACK over a host that was never put back.
+  - requirement: Live scenario parity
+    cases: [NEG-03]
+    reason: >-
+      NEG-03 is the container half of the live scenario "Partial SSH deployment
+      leaves no false COMMITTED journal state": what the Master records when the
+      transport to a Worker it has already registered never answers. The
+      operator's own `node add` runs on the installed Master, addressed to an
+      address whose sshd is absent and whose host key the case pinned first, so
+      the product registers the node with the Panel, writes the transaction
+      journal, appends the node to `state.json` and only then dials. What the
+      case reads is the Master's own recovery: the journal is left in
+      `NODE_ADD_ROLLBACK_REQUIRED` with its action ledger intact and both
+      compensation sides recorded -- the Worker side INCOMPLETE because nothing
+      on the far end answered, the Panel API side ROLLED_BACK because the
+      product's own `rollback_provisioning` deleted the entities the transaction
+      created -- the product prints the INCOMPLETE sentence an operator acts on
+      and no success line, `state.json` matches the pre-dispatch snapshot apart
+      from its update timestamp, the Worker is gone from it, the Panel inventory
+      is back to its pre-attempt counts, and the mutation lock is free. What the
+      container does not prove is the far end: the remote payload never started,
+      so the Worker's own restore is HOOK-03's and TXN-01's subject and a drop in
+      the middle of the payload is the live run's. The case leaves the Master as
+      it found it -- journal removed, `state.json` restored, pin withdrawn -- so
+      the rest of the suite is not reading a half-finished transaction.
+  - requirement: Live scenario parity
+    cases: [OWN-01]
+    reason: >-
+      OWN-01 is the container half of the live requirement's scenario "Existing
+      Worker system configuration is not overwritten": the Worker configuration
+      MUST NOT truncate `/etc/sysctl.d/99-gowave-node.conf` when it did not write
+      it, and later treat it as transaction-created. Two writers can truncate
+      that path -- the panel's `configure_bbr_and_mtu` in `modules/security.sh`,
+      which owns `/etc/sysctl.d/99-gowave.conf`, and the worker's
+      `configure_host_security` in the payload `gowave-node-auto.sh` streams to
+      the host. Each is run as the product runs it, on the host that carries it:
+      the AIO contour sources the panel module in the container it installed, the
+      multi-node contour runs the worker's writer on the worker container. Each
+      writer is handed a path and asked about five states -- a file another tool
+      wrote, an empty file, a symlink to the product's own lines, a file of
+      nothing but those lines, and no file at all -- and the case reads back the
+      exit status, the bytes, the mode and the `_SYSCTL_CREATED_BY_US` verdict
+      the function leaves behind. The unmanaged file keeps its bytes and its
+      mode, the refusal names the path it refused, an empty file and a symlink
+      are refused rather than adopted on the strength of what they contain, the
+      product's own earlier file is rewritten in place without being recorded as
+      created by this run, and only a path that did not exist is created, marked
+      and removable by a rollback. What the container proves is the writer's own
+      decision and the bytes it leaves on disk; the live run remains the source
+      of truth for the baseline inspection that rejects or snapshots a real host
+      before the first remote mutation. The kernel is not the subject: `sysctl`,
+      `modprobe`, `systemctl` and `swapon` answer from shims, so no host is
+      touched and no install runs.
+  - requirement: Live scenario parity
+    cases: [OWN-02]
+    reason: >-
+      OWN-02 is the container half of the live requirement's scenario "Existing
+      Worker service or binary paths are not removed": a systemd unit, drop-in,
+      binary or managed webroot that already exists is not a rollback target
+      unless a complete ownership record proves it belongs to this run. The
+      guard is `verify_worker_mutation_targets_preflight` in the payload
+      `gowave-node-auto.sh` streams to the host, and its writer is
+      `record_worker_mutation_targets`, which records every managed path this
+      install left behind with the digest of each file and the target of each
+      link it wrote, at mode 0600. The guard
+      runs in `main` after the deploy-hook preflight and before the first
+      managed path is touched -- before `setup_system_prereqs`,
+      `configure_host_security`, `configure_firewall`, `unpack_cover_reality`,
+      `configure_edge_nginx` and the upstream installer -- so a refusal leaves
+      the host as it was. The case drives both shipped functions over a scratch
+      root and reads back nineteen facts: a unit file another tool wrote is
+      refused with the path named and keeps its bytes and its mode, a directory
+      at a managed binary path is refused, a symlink is refused even when its
+      target holds the very bytes the record names and stays a link, the guard
+      writes no record on its way out, the record this install wrote adopts its
+      own files and names them, a recorded file whose bytes changed is refused
+      with its path named, a record that does not claim this product created
+      anything is refused rather than trusted, a root with none of the
+      managed paths is accepted, and the link the upstream installer writes into
+      `/usr/local/bin` is adopted by the target the record names, stays that
+      link, and is refused once it is re-pointed elsewhere. What the container
+      proves is the guard's
+      verdict and the bytes it leaves on disk; the live run remains the source
+      of truth for the paths a real Worker carries before the first remote
+      mutation. The record is the upgrade boundary this batch discloses: a host
+      installed before the record existed has no record to adopt its unit,
+      binaries, links and webroot, so the next install refuses and names the
+      first path it cannot prove rather than overwriting it.
+  - requirement: Live scenario parity
+    cases: [OWN-03]
+    reason: >-
+      OWN-03 is the firewall half of the same sentence: a host whose UFW is
+      active, or holds rules and default policies the operator set, must come
+      back from an injected failure with every original rule, every default
+      policy and the enabled state -- not with the four rules this install adds
+      deleted from whatever is left. The before-image is `firewall_image
+      capture` inside the payload's `configure_firewall`, taken before the first
+      `ufw default`, `ufw allow` or `ufw --force enable` runs; the way back is
+      `firewall_image restore`, which the compensating rollback and the
+      standalone rollback both call. The image lives in the transaction's own
+      recovery directory and holds the enabled state, the three default
+      policies, the rule text, the IPv4 and IPv6 kernel dumps and the seven UFW
+      configuration files it may rewrite, each copy at mode 0600 with its digest
+      and its owner, and a baseline it cannot read back is refused before
+      anything is mutated. The case drives the four shipped functions over a
+      scratch root whose `ufw`, `iptables-save`, `ip6tables-save`,
+      `iptables-restore` and `ip6tables-restore` are shims that keep the state
+      in files, and reads back twenty facts: the image is per transaction,
+      taking it changes nothing, it names the enabled state, the three policies,
+      the rule text, both dumps and the configuration it rewrote, a second
+      capture is refused rather than overwriting the first, a firewall that was
+      off is captured as off rather than refused, a restore with no image is
+      refused rather than guessing, the read-back compares the rules and not the
+      counters and the timestamp a dump carries, and an install whose baseline
+      cannot be read is refused and leaves no half image behind. The injected
+      failure is the install's own sequence -- `user.rules` rewritten with its
+      two rules, the operator's permissive incoming policy set to deny, UFW
+      enabled -- and the restore returns the active state, the rule that lived
+      only in the kernel dump and therefore in no file UFW reloads, the
+      operator's own policy and the original `/etc/default/ufw`, and a second
+      restore leaves the same firewall; the other direction starts from an
+      inactive UFW, whose `ufw status verbose` prints no default policy line at
+      all and whose rules live only in the kernel, and ends inactive with them
+      back. The read-back is the product's own: `ufw status verbose` must
+      match the image byte for byte, and `iptables-save` must return the same
+      rules once the timestamp and the counters it prints are set aside -- they
+      move by themselves, and a restore zeroes them -- so a partial restore is a
+      refusal and not a report. The kernel is not the
+      subject and no host is touched: no install runs, and the container proves
+      the functions' verdict and the bytes they leave on disk.
+  - requirement: Live scenario parity
+    cases: [OWN-04]
+    reason: >-
+      OWN-04 is the aggregate of §Complete Mutation-Target Baseline and
+      Resource Ownership: after a later deployment step fails, every path the
+      transaction created is removed only while it is still what the install
+      wrote, every path that was here before is put back with its recorded
+      content and metadata, and anything changed afterwards -- or that no
+      record can prove -- is preserved with the cleanup reported incomplete
+      instead of a success reported for a rollback that left the host dirty.
+      The before-image is `worker_targets_image capture`, taken after the ACME
+      snapshot and before `setup_system_prereqs` mutates anything, and written
+      into the transaction's own recovery directory; the way back is
+      `worker_targets_image restore`, which the in-payload compensation and the
+      standalone rollback both call in place of the blanket `rm -rf` list that
+      used to name `/opt/gowave-node`, `/opt/remnanode`, the two binaries, the
+      six NGINX files and both webroots whether or not this transaction wrote
+      them. Each inventoried path is recorded as absent, as a file with its
+      bytes copied into the image at mode 0600 plus its mode, its owner and its
+      digest, as a symlink with its target, or as a directory, and the manifest
+      is written at mode 0600 after the copies. The record a created path is
+      compared against is the ownership record OWN-02 already ships, so a path
+      with no record behind it is preserved rather than removed. The case
+      drives the six shipped functions over a scratch root and reads back
+      nineteen facts: the image is per transaction, taking it changes nothing,
+      it names every inventoried path and calls none of them absent that is
+      there, it holds the pre-existing file's bytes and its mode and owner, the
+      link's target and the directory, a second capture is refused rather than
+      overwriting the first, a restore removes the created paths, restores the
+      pre-existing file's bytes, mode and link, preserves a created path that
+      was touched after the record was written, preserves every created path
+      when the record is gone, preserves everything and names the missing image
+      when there is none, refuses to write a before-image copy that changed
+      after it was taken, and reports the cleanup incomplete with a non-zero
+      exit whenever it preserved anything. What the container proves is the
+      functions' verdict and the bytes they leave on disk; the live run remains
+      the source of truth for the paths a real Worker carries.
+  - requirement: Live scenario parity
+    cases: [HOOK-03]
+    reason: >-
+      HOOK-03 is the sentence that makes a Worker run recoverable after the
+      process cannot clean up after itself: a deployment terminated by SIGKILL,
+      a kernel panic or a power loss leaves its transaction journal behind, and
+      the next authenticated entrypoint reconciles it before it writes anything
+      of its own. The journal is `worker_transaction_journal` and
+      `worker_journal_action` in `gowave-node-auto.sh`: one writer for the
+      states this product knows, written at mode 0600 through a temporary
+      sibling and a rename with the file and its directory synced, refusing a
+      journal that cannot be read back, that names another transaction, or that
+      would reopen a transaction already installed. The install writes
+      `started` after its before-image exists and before `setup_system_prereqs`
+      touches the first path, marks it `installed` once
+      `record_worker_mutation_targets` has verified what it wrote, and the
+      standalone rollback reconciles every other transaction under the mutation
+      lock while skipping the one it was invoked for. The reader restores a
+      `started` transaction from its own Worker and firewall before-images and
+      releases its directory; a transaction that installed but was never
+      finalized, one whose before-image cannot be restored, and one whose
+      journal cannot be read back all keep their directory and make the new
+      operation fail, so a half-written host is never built upon. The case
+      drives the shipped functions over a scratch root and reads back sixteen
+      facts: the journal is per transaction, names the transaction it belongs
+      to and starts in `started`, is mode 0600, the verified end marks it
+      installed, a later run cannot reopen it, an installed journal is retained
+      with its install untouched, a pre-existing path comes back from the
+      before-image, the reconciled directory is released and a second reconcile
+      is a no-op, a journal with nothing written under it is released, a created
+      path no record proves is preserved with the transaction retained and the
+      incomplete outcome reported, an unreadable journal and a before-image that
+      changed after it was taken both refuse rather than release, the firewall
+      before-image is consulted, and the rollback entrypoint skips its own
+      transaction. What the container proves is the functions' verdict and the
+      bytes they leave on disk; the live run remains the source of truth for the
+      host a real Worker carries.
+  - requirement: Live scenario parity
+    cases: [HOOK-04]
+    reason: >-
+      HOOK-04 is the other half of a rollback: compensation restores the paths
+      the transaction wrote and never the packages it installed, so a host
+      restored through PRESERVE carries package residue that the report has to
+      name. What the package manager changed is therefore recorded while the
+      transaction still knows it: `record_worker_package_baseline` captures a
+      sorted `package<TAB>version` inventory into the transaction's own
+      recovery directory after the journal exists and before
+      `setup_system_prereqs` can install anything, and
+      `record_worker_package_changes` diffs it against the host once every
+      package-mutating step is behind the run — and again in the compensation,
+      before the paths are put back. Both files are written through a temporary
+      sibling with a fsync and a rename, at mode 0600; a package manager that
+      cannot answer writes `#unavailable` instead of an empty inventory, and a
+      baseline outside a journal directory or a delta without a baseline is
+      refused rather than invented. The report is the shipped teardown:
+      `read_package_changes` parses that record and refuses a missing header, an
+      unknown kind, a short or long row, a field that is not a package name or
+      version, and `#unavailable` mixed with rows; `execute_teardown` under
+      PRESERVE returns the packages as `residual_state`, `restored_baseline`
+      and `clean_baseline_eligible` false, and a message naming the remedy,
+      while a teardown handed no record at all reports `inventory: unrecorded`
+      rather than "no changes". The case drives the shipped functions over a
+      scratch root with a stub package manager and hands the bytes the shell
+      wrote to the shipped reader and the shipped teardown, so it decides
+      sixteen facts: the baseline and the delta exist at mode 0600, the delta
+      states the installed, upgraded and removed package with the versions on
+      both sides, `#unavailable` is stated, both refusals hold, the record goes
+      with the transaction, PRESERVE reports the residue, denies a restored
+      baseline, denies eligibility and says `unrecorded` without a record, and
+      every malformed record is refused. What the container proves is the
+      record's shape and the report's verdict; whether a given host's dpkg
+      inventory is complete stays the live run's to say.
+  - requirement: Live scenario parity
+    cases: [HOOK-01]
+    reason: >-
+      HOOK-01 is the shape half of the same sentence: a manifest records that a
+      transaction created a hook at the managed path, not that what now sits
+      there is that hook. `verify_deploy_hook_preflight` from `modules/nginx.sh`
+      is sourced in a temporary tree and asked about eight shapes at that path --
+      a symlink whose target holds the recorded bytes, a symlink to a provider's
+      own file, a directory, a FIFO, a file edited after its manifest, a file
+      the manifest names under a different path, a manifest that cannot be
+      parsed at all, and a hook directory that is itself a symlink -- and each
+      one is refused, with the symlink still pointing where it did, the
+      target's bytes unchanged, the directory still a directory and the FIFO
+      still a FIFO afterwards. The unmanaged regular file is the clause read in
+      full: it is refused with the sentence that names the unmanaged host
+      resource, and its bytes, its 0640 mode and its owner are unchanged while
+      the count of manifests under the recovery root is the same before and
+      after. The positive control is the file the manifest names and whose
+      digest it records, which is adopted, so the refusals are not a
+      preflight that refuses everything. No host is touched and no install runs;
+      the case reads the exit status and what the preflight left on disk.
+  - requirement: Live scenario parity
+    cases: [REV-01, REV-02, BOOT-02]
+    reason: >-
+      the three are the withdrawal sentence of the credential requirement,
+      decided by the controller the operator runs on this machine: the temporary
+      access a run installs is taken back when the run ends. `_cleanup_access`,
+      `_revoke_all`, `_cleanup_summary_message`, `_write_operator_only_report`
+      and `_refresh_report` are driven against a model of the SSH client that
+      answers the four probes the cleanup makes and records every command it is
+      sent, so REV-01 reads the whole pass rather than a claim: the client is
+      built from the control-machine key and the pinned `known_hosts`, the
+      remote revoke script is named and run, `authorized_keys` is searched for
+      the run's marker and the expiry timer is probed, and the sentinel body of
+      that key appears in no command and in no report, which is left at mode
+      0600 inside a 0700 directory. REV-02 walks every way the cleanup can fail
+      — the marker alone, the timer alone, both, a target whose revoke script is
+      missing, and a verification whose connection dies — and each one is
+      INCOMPLETE with the sentence that names what remains, the stuck host
+      fails the run even though the clean one passes, and `_refresh_report` on
+      an otherwise PASS run-state rewrites the overall result to INCOMPLETE and
+      records the cleanup under `operator_access_cleanup` while a passing
+      cleanup leaves the same state at PASS. BOOT-02 reads the same withdrawal
+      on a finished pair, from the hosts' own files rather than from the record:
+      both markers gone from `authorized_keys`, both expiry timer files gone, the
+      provider's own entry still in place, and three contours that must not pass
+      — a cleanup whose script did nothing is `INCOMPLETE` and names what
+      survived, and an unreachable host is recorded as such without stopping the
+      revocation of the host behind it. Its damages are the ways a pass can be
+      claimed without the key being gone: a revocation that skips a host, reuses
+      one connection for both, removes the provider's entry, leaves a timer file,
+      reports its own residue as a pass, or stops at the first failure. The
+      transport is a seam and the host is a model: no SSH server answers, and
+      none of the three claims one does.
+  - requirement: Live scenario parity
+    cases: [NEG-01, NEG-04]
+    reason: >-
+      both serve the parity sentence for the live negative suite's own matrix —
+      the table about fault, component and the boundary the run has to stop at,
+      which the delta spec states no scenario about. The table is a conjunction,
+      so what the two cases read is the suite's case list rather than a verdict:
+      NEG-01 requires the live requirement's sentence to still print fifteen
+      rows, one per scenario id, each row's component cell still naming the
+      component the case's table names, the live runner still defining one
+      `run_neg_NN_*` function per row, and every witness a case this suite
+      builds for the contour that row names — read from the catalog's own driver
+      registry, so a witness removed from the code fails here instead of quietly
+      emptying a catalog entry. NEG-04 is the same audit over the first ten rows,
+      whose sentence states its scope inline (`NEG-01 through NEG-10`) instead of
+      printing the table. Their damages are a row unbolded, a row naming another
+      component, a sentence that lost the ten-row scope, a runner missing one
+      scenario, and a witness built on no contour. What neither can check is
+      that a witness asserts the right boundary: the mapping from row to case is
+      a judgement written out row by row with a sentence saying what each
+      witness proves.
+  - requirement: Live scenario parity
+    cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
+    reason: >-
+      all five serve the same parity sentence for rows of the live matrix the
+      delta spec writes no scenario about. AIO-AUTH-NEG is the
+      forged-credential row: four tokens copied from the one the documented
+      login issued each fail exactly one clause of the Panel's own gate — an
+      expired token signed with the Panel's real secret, a token signed with a
+      foreign key, an unsigned `alg: none` token, and a correctly signed token
+      naming an administrator record that does not exist — and every one is
+      answered 401 with the middleware's `Unauthorized` body while the issued
+      token still reads the same route before and after, so neither the refusal
+      nor the control can be a route that simply stopped answering.
+      MN-DUP-ADD is the duplicate-registration row: the operator's own
+      `node add`, run for a name that `state.json` already holds at another
+      address, exits nonzero with the existing-name refusal — naming the address
+      the record holds — before the Panel client is constructed, and the state
+      file's bytes, the committed journal's bytes and the Panel inventory are
+      what they were, which is what distinguishes a refusal from a second record
+      that was created and then cleaned up. The same name at the address the
+      record already holds is the same node answering again and is accepted on
+      purpose, because the wizard's per-node retry re-enters exactly that call;
+      the case pins the second address with a throwaway key first, since an
+      unpinned address is refused by the host-key check instead, and takes the
+      pin out again. The
+      third row of that group, a corrupted database inside an otherwise valid
+      archive, is a variant of `MN-BACKUP-BAD` and is traced through the backup
+      scenario rather than as a case of its own. RED-01 and RED-02 are the two
+      rows of the live redaction requirement, which the delta spec also states
+      without a scenario: RED-01 reads the operator's own credentials file,
+      registers both secret values with the run's filter and writes the raw dump
+      through the writer every artifact goes through, then reads the tree back —
+      the field names survive, both values are `[REDACTED]`, and the run's own
+      audit finds no file that changes when redacted, so a sibling artifact
+      still holding a secret fails this case instead of being published. RED-02
+      asks the real failure collector for its bundle on a healthy host and reads
+      every area file back: the host's own kernel, distribution and installed
+      package version, the unit state, journalctl's output, a listener, the
+      vhost test, ufw's verdict and iptables' chain policy, and the served
+      certificate's subject and validity — with no private key material and
+      every file at 0600. The report-side half of that clause — API object
+      summaries, traffic results and per-case timings — is carried by
+      `result.json`, which the runner writes after the last case, so the case
+      names it as not claimed here rather than reading a file that does not
+      exist yet. APIC-01 is the bounded-client row: the controller's own
+      `E2EPanelClient` logs in and lists nodes against the Panel's public name
+      with the run's bundle, which is what makes the bundle the thing that
+      carried the login, while a context with no anchor at all and the same
+      bundle pointed at `127.0.0.1` are both refused — the second being
+      hostname verification rather than a store the image happened to have.
+      `API_TIMEOUT` is set to a value neither the client nor the parser defaults
+      to and read back from both, and a caller that omits every optional
+      argument still inherits that bound and the default context, so
+      "production callers keep their behaviour" is measured rather than
+      assumed. The two shipped sources are then read for a bypass token, so an
+      `allowInsecure` or a disabled hostname check added to either makes the
+      other clauses describe a client nobody ships
+  - requirement: Independent Multi-Node acceptance topology
+    cases: [MN-ENV-CONTRACT]
+    reason: >-
+      the requirement states what the Worker registration leaves running and
+      what a client is served, and no scenario states the environment contract:
+      the operator's `node add` accepts all seven inputs through environment
+      variables instead of positional arguments, registers the Worker with the
+      Panel, and the Panel reports the correct endpoint and connected state. The
+      case serves that parity sentence by driving `node add` with the seven
+      environment variables and verifying the Panel's node, endpoint and host
+      inventory.
+  - requirement: Independent All-in-One acceptance topology
+    cases: [VERIFIED-ARTIFACT-FETCH]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the pinned artifact chain:
+      the installer fetches the GoWave Node installer and the Panel release
+      assets from ordered hosts with a pinned SHA-256 digest; a host that
+      cannot deliver falls through to the next, a digest mismatch is terminal
+      and the next host is never tried, no host delivering leaves nothing
+      behind, and the destination file is replaced only after its bytes are
+      verified. This case serves that parity sentence by driving the
+      fetch_verified_artifact helper with a local test server.
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PINNED-INSTALLER-HOSTS]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the pinned installer URLs:
+      the commit is tried on GitHub first and jsDelivr second; the order is
+      fixed and the environment variable GOWAVE_NODE_INSTALLER_COMMIT selects
+      the exact commit. This case serves that parity sentence by driving the
+      pinned_node_installer_urls function.
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PANEL-ASSET-VERIFICATION]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the panel asset verification:
+      a release asset is checked against SHA256SUMS before the next URL is
+      tried; a mismatched asset aborts without falling through, the binary is
+      not left behind, and no release API fallback occurs. This case serves
+      that parity sentence by driving the download_panel_release function with
+      a mismatched checksum.
+  - requirement: Trustworthy result and diagnostics
+    cases: [FAIL-STEP]
+    reason: >-
+      the requirement states the secret redaction and unexpected skip
+      diagnostics, and no scenario states the ERR trap contract: the ERR trap
+      with CURRENT_STEP prints a located failure naming the step, the failing
+      command and its status, prints it exactly once, and exits with the step's
+      status, and a step that succeeds prints no report. This case serves that
+      parity sentence by sourcing gowave-auto.sh and forcing a step failure. The
+      handler's own double-compensation guard is proven by the unit suite
+      (tests/test_failure_report.py), not by this case.
+
+# What the published report has to cover, one declaration at a time. A plain
+# path is met by any behaviour that quotes it; `every_value` makes every element
+# of the manifest's list an obligation of its own, so a fifth Vision combination
+# added to the matrix turns this audit red instead of quietly widening a report
+# that still names four.
+behaviour_obligations:
+  - path: user_agent.accepted
+  - path: user_agent.absent
+  - path: user_agent.blank
+  - path: representations.base64
+  - path: representations.xray-json
+  - path: topologies.multi-node.vision_combinations
+    every_value: true
+
+# Behaviours the change names one by one. `declares` quotes the manifest — the
+# audit refuses a path it does not hold and a value it does not state — which is
+# what keeps a behaviour from claiming a policy the matrix has moved away from.
+behaviours:
+  - behaviour: A subscription request carrying a User-Agent is served
+    requirement: Real Panel subscription lifecycle
+    declares:
+      path: user_agent.accepted
+      value: non-empty header
+    cases: [SUB-SERVED]
+    topologies: [aio, multi-node]
+    tests:
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_each_representation_is_fetched_with_its_client_user_agent
+      - tests.test_podman_subscriptions.TestSubscriptionWiring.test_every_subscription_case_is_in_the_shared_catalog
+    jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - behaviour: A subscription request without a User-Agent header is refused
+    requirement: Real Panel subscription lifecycle
+    declares:
+      path: user_agent.absent
+      value: 403
+    cases: [SUB-UA-ABSENT]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_absent_user_agent_case_is_refused_for_every_representation
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_an_absent_user_agent_is_a_request_without_the_header
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A subscription request with a blank User-Agent header is refused
+    requirement: Real Panel subscription lifecycle
+    declares:
+      path: user_agent.blank
+      value: 403
+    cases: [SUB-UA-BLANK]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_blank_user_agent_case_is_a_separate_result
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_a_blank_user_agent_is_an_empty_header_not_a_missing_one
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: The public edge serves the subscription without advertising it
+    requirement: Panel subscription representations
+    cases: [SUB-EDGE, SUB-EDGE-BAD]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionEdgeCases.test_edge_case_names_what_the_client_and_the_crawlers_received
+      - tests.test_podman_subscriptions.TestSubscriptionEdgeCases.test_forgery_case_names_both_refusals_and_the_access_log
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_the_edge_contract_scope_asks_the_edge_for_every_published_family
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: The public edge hides its build and hands the Panel only the peer address
+    requirement: Independent All-in-One acceptance topology
+    cases: [NGX-HYGIENE, NGX-SCANNER]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_aio.TestHygieneCase.test_hygiene_case_names_the_server_the_page_the_peer_and_the_routes
+      - tests.test_podman_aio.TestHygieneCase.test_hygiene_case_rejects_a_peer_the_panel_did_not_record
+      - tests.test_podman_aio.TestHygieneCase.test_scanner_case_names_the_refused_set_and_the_control
+      - tests.test_nginx_routing.TestNginxRouting.test_panel_vhost_hands_the_panel_only_the_peer_address
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: An incomplete install request is refused before the installed host is touched
+    requirement: Independent All-in-One acceptance topology
+    cases: [PRE-INPUTS, PRE-INPUTS-BAD]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_aio.TestPreflightInputCase.test_missing_case_names_the_refusal_the_inventory_and_the_panel
+      - tests.test_podman_aio.TestPreflightInputCase.test_missing_case_rejects_a_host_it_rewrote
+      - tests.test_podman_aio.TestPreflightInputCase.test_bad_case_quotes_the_value_it_rejected
+      - tests.test_podman_aio.TestPreflightInputCase.test_the_probe_asks_without_a_terminal_and_reads_the_product_back
+      - tests.test_preflight.TestPreflightInputs.test_a_missing_panel_input_names_the_component_and_the_field
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: The base64 representation is the share-link list the inventory describes
+    requirement: Panel subscription representations
+    declares:
+      path: representations.base64
+      value: /api/sub/{shortUuid}
+    cases: [SUB-B64]
+    topologies: [aio, multi-node]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_share_link_case_imports_the_decoded_list
+      - tests.test_podman_subscriptions.TestSubscriptionClientProbe.test_the_base64_list_decodes_and_a_json_body_does_not
+    jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - behaviour: The Xray JSON representation is served as a bare object and as a list
+    requirement: Panel subscription representations
+    declares:
+      path: representations.xray-json
+      value: /api/sub/{shortUuid}/v2ray-json
+    cases: [SUB-JSON-SHAPES]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_json_shape_case_loads_the_served_list_and_the_bare_object
+      - tests.test_podman_subscriptions.TestSubscriptionClientProbe.test_json_shapes_accepts_the_served_list_and_the_bare_object
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: Worker provisioning dials the Master's private run address
+    requirement: Podman-only Master address selection for Worker provisioning
+    cases: [PODNET-MASTER-ADDR]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestMasterAddressCase.test_the_run_address_is_accepted_when_the_worker_uses_it
+      - tests.test_podman_address.TestPodmanAddressOverride.test_address_must_be_assigned_on_this_host
+      - tests.test_podman_multi_node.TestWorkerProvisioningCommand.test_the_command_is_the_operator_entrypoint_with_positional_roles
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on neither node
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: neither
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_a_node_without_vision_is_proven_to_have_no_endpoint_under_its_name
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on the Master only
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: master-only
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_the_inbound_is_matched_by_its_transport_not_by_its_tag
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on the Worker only
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: worker-only
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_a_worker_that_keeps_a_vision_vhost_without_it_is_refused
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on both nodes
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: both
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_each_combination_checks_both_nodes_against_their_own_names
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: A Worker whose pinned host key does not match is refused
+    requirement: Security and network isolation verification
+    cases: [MN-SSHKEY]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestSshHostKeyCase.test_a_wrong_pin_that_still_connects_is_refused
+      - tests.test_podman_multi_node.TestWorkerTrustPin.test_the_pin_is_reported_and_present_on_both_sides
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: A rotated Worker host key is adopted and a stale pin is not
+    requirement: Security and network isolation verification
+    cases: [MN-SSHKEY]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestSshHostKeyCase.test_the_pinned_key_gates_every_operation_and_a_rotation_is_adopted
+      - tests.test_podman_multi_node.TestSshHostKeyCase.test_a_stale_pin_accepted_after_rotation_is_refused
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: The decoy apex is derived from the cover names each role resolves
+    requirement: Camouflage decoy and certificate lineage
+    cases: [NGX-COVER-DERIVE]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestCoverDeriveCase.test_both_roles_report_the_derived_apex_and_their_binding
+      - tests.test_podman_multi_node.TestCoverDeriveCase.test_the_generated_tables_run_the_shipped_decisions
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: A cover name that does not resolve blocks the decoy instead of rendering it
+    requirement: Camouflage decoy and certificate lineage
+    cases: [NGX-COVER-UNRESOLVED]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestCoverUnresolvedCase.test_every_probe_refuses_and_names_the_records_it_withheld
+      - tests.test_podman_multi_node.TestCoverUnresolvedCase.test_a_probe_that_renders_the_apex_is_rejected
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: The decoy renders the site under the derived apex on every route
+    requirement: Camouflage decoy and certificate lineage
+    cases: [DECOY-01, NGX-COVER-SITE]
+    topologies: [aio, multi-node]
+    tests:
+      - tests.test_podman_aio.TestDecoyCase.test_every_route_serves_the_site_and_refuses_every_management_path
+      - tests.test_podman_multi_node.TestCoverSiteCase.test_the_shipped_site_passes_every_assertion
+    jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - behaviour: DNS answers stay in the address family they were published for
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_family_answered_with_the_other_family_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_answers_a_and_aaaa_with_configured_ttl
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: DNS answers carry the TTL the zone published
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_record_that_publishes_the_wrong_ttl_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_stale_mode_uses_the_short_ttl
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A name the zone does not hold answers NXDOMAIN
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_an_unknown_name_that_answers_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_unknown_names_are_nxdomain_and_never_forwarded
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A stale answer expires within the record TTL instead of outliving it
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_resolver_that_keeps_the_old_answer_past_the_ttl_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_zone_change_applies_without_a_restart
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A steered wrong answer is served as published instead of being repaired
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_wrong_answer_that_is_repaired_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_wrong_answer_mode_returns_the_steered_address
+    jobs: [All-in-One Podman Acceptance]
+
+# The contracts this capability shares with the live acceptance capability
+# (`openspec/specs/live-vps-e2e/spec.md`). `live_asserts` are sentences of the
+# mapped requirement, whitespace-normalised, and the audit refuses one the live
+# spec no longer holds; `cases` are catalog cases the live suite also runs, so a
+# contract may only rest on `live-parity` cases the container reproduces
+# (`environment: container`). `counts.live` is the sentence that states the
+# number and `counts.podman` names where this suite's number lives — the
+# manifest's own `positive_case_counts`, or a catalog case's assertion — so the
+# audit compares two readings rather than accepting a paraphrase. A divergence
+# is fixed here, not recorded as a container-only variant.
+shared_contracts:
+  - id: subscription-policy
+    contract: Subscription delivery and User-Agent policy
+    live_requirement: Real Subscription Delivery and User-Agent Policy
+    live_asserts:
+      - "No mock server responses are permitted."
+      - "User-Agent policy SHALL be verified against the real Panel"
+      - "actual HTTP response codes SHALL be used (not mock assumptions)"
+      - "if that is 403, the runner records a pass"
+    cases: [SUB-01, SUB-02, SUB-03, SUB-04]
+    agreement: >-
+      Both suites fetch the payload from the real Panel and judge the status the
+      installed User-Agent policy returns, so a missing or blank header is an
+      outcome rather than a canned 403.
+    counts:
+      - observable: proxy-capable outbounds per subscription
+        live: "exactly eight, nine, or ten according to the number of configured Vision domains"
+        podman: "case:SUB-02:assertion"
+
+  - id: case-counts
+    contract: Data-plane case counts
+    live_requirement: Data Plane E2E Traffic Through All VPN Endpoints
+    live_asserts:
+      - "yielding sixteen, eighteen, or twenty mandatory runtime cases"
+      - "All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS ingress evidence"
+    cases: [DP-15]
+    agreement: >-
+      Both suites require every active endpoint to be exercised by a real Xray
+      and a real Mihomo process, so the pair owes sixteen, eighteen or twenty
+      runtime cases and the Vision combinations add two each.
+    counts:
+      - observable: mandatory Data Plane runtime cases
+        live: "yielding sixteen, eighteen, or twenty mandatory runtime cases"
+        podman: "matrix:multi-node:positive-cases"
+
+  - id: vision-independence
+    contract: Independent optional Vision domains
+    live_requirement: Independent Optional Vision Domains
+    live_asserts:
+      - "Each configured domain SHALL be provisioned and verified only on its corresponding VPS"
+      - "When a host's Vision domain is absent, its default four-inbound topology remains unchanged"
+    cases: [VIS-01, VIS-07]
+    agreement: >-
+      Enabling Vision on one node leaves the other node's four-inbound topology,
+      certificate and route untouched in both suites, and a Vision failure fails
+      the host that owns it.
+
+  - id: firewall-evidence
+    contract: Firewall isolation evidence
+    live_requirement: UFW Firewall Isolation Verification
+    live_asserts:
+      - "A timeout alone is not sufficient evidence of UFW DROP"
+      - "Each negative probe MUST be paired with a known-good positive probe"
+      - "ambiguous evidence is `INCOMPLETE`"
+    cases: [FW-01, FW-02, FW-04]
+    agreement: >-
+      A refused control-plane connection counts only beside a successful probe
+      from the allowed vantage and firewall evidence read on the target, and
+      ambiguous evidence is INCOMPLETE rather than a firewall PASS.
+    counts:
+      - observable: control-plane port under test
+        live: "The runner SHALL verify isolation of TCP/3002 on Master and Worker"
+        podman: "matrix:product:node_api_port"
+
+  - id: redaction
+    contract: Redacted diagnostic artifacts
+    live_requirement: Redacted Diagnostic Artifact Collection
+    live_asserts:
+      - "The following data SHALL NOT appear in any artifact"
+      - "only field names"
+      - "actual values are replaced with `[REDACTED]`"
+      - "no plaintext secret appears in any artifact"
+    cases: [RED-01, RED-02]
+    agreement: >-
+      Secrets are recorded by field name only in both suites, every artifact
+      byte passes the redactor, and a file that changes when redacted fails the
+      run instead of being published.
+
+  - id: result-semantics
+    contract: Result status semantics
+    live_requirement: Result Status Semantics
+    live_asserts:
+      - "Overall `PASS` requires all mandatory phases completed"
+      - "`SKIP` and `NOT_RUN` are non-passing"
+      - "all sixteen, eighteen, or twenty Data Plane runtime cases verified"
+    cases: [RES-01, RES-02, RES-03]
+    agreement: >-
+      Overall PASS requires every expected data-plane case, a skip never reads
+      as a pass, an unexecuted case is reported rather than dropped, and each
+      failing case is named individually in the machine-readable result.
+    counts:
+      - observable: Data Plane runtime cases an overall PASS requires
+        live: "all sixteen, eighteen, or twenty Data Plane runtime cases verified"
+        podman: "matrix:multi-node:positive-cases"

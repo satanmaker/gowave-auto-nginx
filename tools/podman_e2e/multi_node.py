@@ -15,23 +15,46 @@ operator ships.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
+import io
 import ipaddress
 import json
 import os
 import re
 import shlex
+import stat
+import tarfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, denial, matrix as matrix_data, mtls, topology,
+    acme_fixture, acme_mode, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
+    ingress, local_ci,
+    lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
+    firewall_image, gate_tiers, mutation_baseline,
+    negative_journal,
+    negative_matrix,
+    ownership_targets,
+    package_residual,
+    preflight_cases, revocation,
+    rollback_sides,
+    runstate_cases,
+    signal_compensation,
+    skip_policy, staging_trust, status, teardown, tls_anchors, topology, transaction_recovery,
+    trust_bundle,
+    vision as vision_policy, worker_journal,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
+# The same rule the live runner applies to a pin it configured, so the Worker's
+# core and the Master's are held to one definition of "the configured version".
+from tools.live_vps.versions import output_matches_expected_version, version_token
 
 INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
+ARGV_OBSERVER_CASE_ID = "MN-ARGV-OBSERVER"
 WORKER_STATE_CASE_ID = "WRK-05"
 WORKER_CONFIG_CASE_ID = "WRK-06"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
@@ -47,6 +70,14 @@ VISION_CASE_ID = "MN-VISION"
 SSH_KEY_CASE_ID = "MN-SSHKEY"
 MATRIX_CASE_ID = "MN-MATRIX"
 EGRESS_CASE_ID = "MN-EGRESS"
+ENV_CONTRACT_CASE_ID = "MN-ENV-CONTRACT"
+# Partial success: one Worker fails, another succeeds, Panel continues.
+PARTIAL_SUCCESS_CASE_ID = "MN-PARTIAL-SUCCESS"
+# Add-node refused by Panel API verification failure.
+ADD_NODE_REFUSED_CASE_ID = "MN-ADD-NODE-REFUSED"
+# The composed wizard: one plan card, a mixed onboarding batch and the retry of
+# the one node that failed.
+WIZARD_FLOW_CASE_ID = "MN-WIZARD-FLOW"
 # One requirement, one case id: the AIO suite runs the same contract on its own
 # host, and a cluster runs it on both roles.
 NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
@@ -186,13 +217,168 @@ ACME_CHALLENGE_TOKEN = "gowave-e2e-http01-token"
 # product's resolution precondition and certbot's HTTP-01 both still hold.
 ACME_NEW_PANEL_DOMAIN = "panel2.testbed.internal"
 ACME_NEW_REALITY_DOMAIN = "reality2.testbed.internal"
+
+# VIS-06: a compensation that could not finish is reported, not called clean.
+#
+# The scenario needs two faults at once: a Vision provisioning stage that fails,
+# and the Panel-side rollback of that same transaction that fails too. The first
+# is a Vision name the fixture resolver answers with NXDOMAIN, which is how
+# VIS-05 fails a host's own stage. The second is the product's own durable
+# ledger: once the transaction is at NODE_ADD_VERIFYING the actions it recorded
+# are removed from the journal, so `rollback_provisioning` refuses to delete
+# what it can no longer enumerate and leaves the journal asking for an operator.
+#
+# It is a *second* node, addressed to the Worker the run already provisioned,
+# because `state.json` refuses a name it has registered and because the payload
+# it re-streams is the same operator path a new Worker takes. The Panel keys a
+# node by its address, so the second record reaches the same host through an
+# alias the case adds to the Worker's interface. The case is placed after every
+# case that reads a healthy cluster: the Worker it fails is torn down by the very
+# compensation being observed.
+VIS_COMPENSATION_CASE_ID = "VIS-06"
+SECOND_WORKER_NODE_NAME = "worker-2"
+SECOND_WORKER_DOMAIN = "worker-two.testbed.internal"
+SECOND_WORKER_REALITY_DOMAIN = "worker-two-reality.testbed.internal"
+# Asked for and never answered: the name sits inside the fixture zone's suffix
+# with no record behind it, so HTTP-01 cannot validate it and the stage that runs
+# last on the Worker is the one that fails.
+SECOND_WORKER_VISION_DOMAIN = "worker-two-vision.testbed.internal"
+NODE_ADD_RECOVERY_ROOT = "/var/lib/gowave-auto-nginx/recovery"
+NODE_ADD_JOURNAL = f"{NODE_ADD_RECOVERY_ROOT}/journal.json"
+NODE_ADD_STATE = "/var/lib/gowave-auto-nginx/state.json"
+# The injection is a detached process on the Master rather than an argument or a
+# stream: the dispatch stays the product's own command.
+LEDGER_WATCH_PATH = "/root/gowave-e2e-ledger-watch.py"
+LEDGER_WATCH_LOG = "/root/gowave-e2e-ledger-watch.log"
+LEDGER_WATCH_SECONDS = 1800
+# The refusal `rollback_provisioning` prints when it cannot enumerate the actions
+# of a transaction that had already started mutating the API.
+LEDGER_REFUSAL = (
+    "Transaction entered APPLYING/VERIFYING without a durable action ledger; "
+    "API side effects may exist and automatic rollback is unsafe."
+)
+VISION_STAGE_LINE = (
+    f"Acquiring Let's Encrypt TLS certificate for Vision ({SECOND_WORKER_VISION_DOMAIN})..."
+)
+REMOTE_FAILURE_LINE = (
+    "Remote Worker deployment failed; rolling back Worker host configuration "
+    "and Panel API entities."
+)
+REMOTE_CRITICAL = "CRITICAL: Remote Worker host rollback failed; manual inspection required."
+API_CRITICAL = "CRITICAL: API rollback incomplete; recovery journal requires operator attention."
+AGGREGATE_CRITICAL = (
+    f"CRITICAL: Rollback failed for Worker '{SECOND_WORKER_NODE_NAME}'; "
+    "recovery journal retained."
+)
+SUCCESS_LINE = f"Worker '{SECOND_WORKER_NODE_NAME}' successfully added and deployed."
+
+# Both archive types are separate contracts and both are unencrypted and
+# secret-bearing, so this case records what each archive carries -- member paths,
+# declared checksums, environment key names and where private keys sit -- and
+# never reads out a value the archive protects.
+BACKUP_CASE_ID = "MN-BACKUP"
+BACKUP_TIMEOUT_SECONDS = 600
+BACKUP_READ_TIMEOUT_SECONDS = 180
+# One archive type per role, because that is the role each one restores.
+BACKUP_TYPES: Dict[str, str] = {"master": "panel", "worker": "node"}
+# A Panel archive is the Panel, not the host: the database, the environment, the
+# installation state, the managed NGINX tree and the lineages it renews.
+BACKUP_PANEL_REQUIRED_PATHS = (
+    "opt/gowave/gowave.db",
+    "opt/gowave/.env",
+    "var/lib/gowave-auto-nginx/state.json",
+)
+BACKUP_PANEL_REQUIRED_PREFIXES = (
+    "etc/nginx/conf.d/gowave-",
+    "etc/nginx/stream-enabled/gowave-",
+    "etc/letsencrypt/live/",
+    "etc/letsencrypt/archive/",
+    "etc/letsencrypt/renewal/",
+)
+# The Worker archive is its `.env` credentials only; it is not a system image and
+# it does not carry the Panel's database.
+BACKUP_NODE_PATHS = ("opt/gowave-node/.env",)
+# The key whose presence makes each archive secret-bearing. Only the name is read.
+BACKUP_SECRET_KEYS: Dict[str, str] = {"panel": "APP_SECRET", "node": "SECRET_KEY"}
+# A restore is only proven by what it undoes: this case creates a client and a
+# Worker environment edit, backs the role up, destroys both, and asks the
+# product's own restore to bring them back byte for byte.
+RESTORE_CASE_ID = "MN-RESTORE"
+RESTORE_CASE_TIMEOUT_SECONDS = 1800
+RESTORE_STEP_TIMEOUT_SECONDS = 240
+RESTORE_COMMAND_TIMEOUT_SECONDS = 300
+# The marker an injected Worker environment edit leaves behind. It names nothing
+# the node reads, so the running node is undisturbed until the restore replaces
+# the file.
+RESTORE_SENTINEL_KEY = "GOWAVE_E2E_RESTORE_SENTINEL"
+RESTORE_NODE_ENV = "/opt/gowave-node/.env"
+# The archives are unencrypted, so they live on a run-owned volume: the case
+# proves the directory is that volume and that no archive reaches an artifact.
+BACKUP_VOLUME_CASE_ID = "MN-BACKUP-VOL"
+BACKUP_VOLUME_TIMEOUT_SECONDS = 600
+# An archive keeps the product's own 0600 file mode; the volume around it is
+# root-only, because the payloads inside are readable by whoever reads the file.
+BACKUP_VOLUME_DIRECTORY_MODE = "700"
+# Nothing an artifact may contain: an archive is gzip, a private key announces
+# itself, and a secret-bearing variable is written as a name plus a value.
+ARTIFACT_FORBIDDEN_MARKERS = ("BEGIN PRIVATE KEY", "SECRET_KEY=", "APP_SECRET=")
+ARTIFACT_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+# A restore refuses an archive it cannot honour -- and refuses it before it stops
+# a service, takes a snapshot or writes a single live file.
+REJECT_CASE_ID = "MN-BACKUP-BAD"
+REJECT_CASE_TIMEOUT_SECONDS = 1800
+REJECT_COMMAND_TIMEOUT_SECONDS = 300
+# The database the archive carries, and the line the product's own preflight
+# prints when the copy it staged is not the database it claims to be.
+REJECT_DATABASE_MEMBER = "files/opt/gowave/gowave.db"
+REJECT_DATABASE_PATH = "opt/gowave/gowave.db"
+REJECT_INTEGRITY_PREFIX = "Pre-restore check failed: staged database integrity check returned:"
+# Each variant breaks exactly one promise the format makes, so the case can name
+# the promise that was broken rather than "some error happened". The last one
+# breaks a promise about the content rather than the container: the archive is
+# well formed and its manifest names the digest of what it carries, so the only
+# gate left is the database the restore would apply.
+REJECT_VARIANTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("truncated", ("not a readable Format v1 tar.gz", "could not be read back")),
+    ("garbage", ("not a readable Format v1 tar.gz",)),
+    ("checksum", ("Checksum mismatch for member opt/gowave/.env",)),
+    ("incomplete", ("Missing archive member declared in meta.json: opt/gowave/.env",)),
+    ("no-database", ("missing its required member: opt/gowave/gowave.db",)),
+    ("wrong-type", ("Backup type mismatch",)),
+    ("sqlite", (REJECT_INTEGRITY_PREFIX,)),
+)
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
 SSH_TRUST_TIMEOUT_SECONDS = 240
+# The pair-wide lock cases open their own SSH sessions into both containers and
+# pay a refusal, a reacquisition or a repair per shape, so they are bounded by the
+# number of host round trips rather than by a service's readiness.
+LOCK_TIMEOUT_SECONDS = 600
+LOCK_PATH_TIMEOUT_SECONDS = 900
 # The transaction id only has to satisfy the product's own format; it names a
 # leftover snapshot the case plants on the Worker to observe a remote effect.
 SSH_ROTATION_TX_ID = "worker_install_sshkey_rotation"
+# The Worker's SSH daemon is what the controller speaks to; the node itself is a
+# unit and a control port, so the two can be faulted separately.
+SSH_DOWN_CASE_ID = "MN-SSH-DOWN"
+SSH_UNIT = "ssh.service"
+# Ubuntu 24.04 ships socket activation alongside the daemon: `ssh.socket` owns
+# port 22 and starts an `ssh@…service` instance per connection, so stopping the
+# service alone leaves the port answering and prints that its triggering unit is
+# still active. Both units are the fault; neither is the node.
+SSH_SOCKET_UNIT = "ssh.socket"
+SSH_DOWN_TX_ID = "worker_install_sshdown"
+SSH_DOWN_TIMEOUT_SECONDS = 900
+# OpenSSH names the reason it never reached a listener; each of these is a
+# transport failure rather than the host-key verification SSHKEY measures.
+SSH_CONNECT_FAILURES: Tuple[str, ...] = (
+    "ssh: connect to host",
+    "Connection refused",
+    "Connection timed out",
+    "No route to host",
+    "Network is unreachable",
+)
 WORKER_REPORT_TIMEOUT_SECONDS = 120
 # A stopped node is only reported offline once the Panel's own heartbeat window
 # has expired, and a node that starts again has to re-register and re-apply its
@@ -237,6 +423,24 @@ NODE_ADD_TIMEOUT_SECONDS = topology.NODE_ADD_TIMEOUT_SECONDS
 NODE_HEALTH_TIMEOUT_SECONDS = 600
 NODE_HEALTH_INTERVAL_SECONDS = 5
 
+# A duplicate name at a second address is refused from `state.json` before the
+# Panel client is constructed, so the case is one more `node add` against a pair
+# that is already committed: the bound covers the operator's command reaching its
+# own first check, not a Worker install. The same name at the *same* address is
+# the retry of a known identity and is deliberately accepted by the product.
+DUPLICATE_ADD_CASE_ID = "MN-DUP-ADD"
+DUPLICATE_ADD_TIMEOUT_SECONDS = 300
+# Two file reads and two Panel reads surround the refused command, each bounded
+# by the probe's own timeout rather than by the deployment's.
+DUPLICATE_ADD_CASE_TIMEOUT_SECONDS = 900
+DUPLICATE_ADD_REFUSAL = "state.json already registers the name"
+
+# The two wizard-orchestration cases below run no Worker deployment: one stubs
+# the SSH onboarding at that boundary and the other points the flow at an
+# address nothing answers on. The ceiling is a hang guard, not a deployment
+# budget, so it stays far below the `node add` allowance.
+WIZARD_OFFLINE_TIMEOUT_SECONDS = 300
+
 NODE_PORT = 3002
 
 # The node prepends its own stats/traffic API to whatever the Panel assigned it
@@ -269,6 +473,7 @@ def worker_control_script() -> str:
 # CLI's version and status commands, the config the node actually loaded, and the
 # settings file it was installed with. Nothing here is written by the harness, and
 # the Panel secret in `/opt/gowave-node/.env` is never read out.
+WORKER_CORE_BINARY = "/opt/gowave-node/rw-core"
 WORKER_STATE_SCRIPT = r"""
 python3 - <<'PY'
 import json
@@ -919,8 +1124,19 @@ class MultiNodeProduct:
 
     # --------------------------------------------------------------- node add
     def add_worker(self) -> Dict[str, Any]:
-        """Register and deploy the Worker through the operator's own command."""
+        """Register and deploy the Worker through the operator's own command.
+
+        The release API is blocked in the Worker before the operator's command
+        runs, so the core it serves is the one the pinned step placed: an install
+        that fell back to the upstream download could not finish here.
+        """
         host = self.require_installed()
+        block = aio.require_host_blocked(
+            NODE_ADD_CASE_ID, "the Worker",
+            aio.hosts_block_facts(
+                self.podman, host.worker_name, NODE_ADD_CASE_ID, role="Worker",
+            ),
+        )
         outcome = host.node_add()
         self.node_add_outcome = outcome
         require(
@@ -935,7 +1151,262 @@ class MultiNodeProduct:
             "worker_ip": host.plan.worker_ip,
             "worker_domain": host.worker_domain,
             "worker_reality_domain": host.worker_reality_domain,
+            "core_host_block": block,
         }
+
+    def worker_core_binary(self, case_id: str) -> Dict[str, Any]:
+        """What the Worker's core file reports, read by running it on the Worker.
+
+        ``worker_core_version`` reads the node's own self-report; this runs the
+        binary the node supervises, so one reading cannot stand in for the other.
+        """
+        host = self.require_worker()
+        proc = self.podman.exec(
+            host.worker_name, [WORKER_CORE_BINARY, "version"], check=False, timeout=120,
+        )
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        require(
+            case_id,
+            proc.returncode == 0 and bool(version_token(output)),
+            f"the Worker's own {WORKER_CORE_BINARY} reports nothing usable (exit "
+            f"{proc.returncode}): {output[:300]!r}",
+        )
+        return {
+            "binary": WORKER_CORE_BINARY,
+            "returncode": proc.returncode,
+            "version": version_token(output),
+            "output": output[:400],
+        }
+
+    def worker_core_control(self, case_id: str) -> Dict[str, Any]:
+        """The same ``node add`` on a disposable host, with the block on and the pin off.
+
+        A Worker that installs with the release API blocked proves the step placed
+        a core, but not that the block is what made the step necessary: with
+        ``XRAY_SERVER_VERSION=latest`` the step abstains, and the upstream
+        installer is the one that has to buy a core. Blocked, it must fail and say
+        which name it could not reach; unblocked it would succeed, which is how
+        this probe's own reach is confirmed.
+
+        The variable goes on the Master's command, not into the container's
+        environment: the Master's shell is what forwards it to the Worker over the
+        SSH stdin stream, so a variable set in the creation environment changes
+        nothing. The disposable host, its trust pin, the zone records and the
+        pair's registration files are all this case's own, and each is removed or
+        restored before it returns; the trace the observed deployment left is
+        checked to be the same bytes afterwards.
+        """
+        host = self.require_installed()
+        master = host.target_name
+        name = "worker-core-hole"
+        address = str(host.plan.second_node_ip)
+        worker_domain = SECOND_WORKER_DOMAIN
+        reality_domain = SECOND_WORKER_REALITY_DOMAIN
+        container = host.context.resource_name("worker-core-hole")
+        environment = {"XRAY_SERVER_VERSION": "latest"}
+
+        record_before = aio.probe_json(
+            case_id, "the Master's registration record before the control",
+            self.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+        )
+        journal_before = self.podman.exec(master, ["cat", NODE_ADD_JOURNAL], check=False).stdout
+        state_before = self.podman.exec(master, ["cat", NODE_ADD_STATE], check=False).stdout
+        require(
+            case_id,
+            bool(journal_before) and bool(state_before),
+            "the pair has no registration record to put back: "
+            f"{NODE_ADD_JOURNAL} and {NODE_ADD_STATE} must both exist",
+        )
+        zone_before = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
+        known_hosts_path = "/root/.ssh/known_hosts"
+        known_hosts_before = self.podman.exec(
+            master, ["cat", known_hosts_path], check=False,
+        ).stdout
+        trace_before = self.argv_trace_digest(master)
+
+        evidence: Dict[str, Any] = {
+            "node_name": name,
+            "node_address": address,
+            "worker_domain": worker_domain,
+            "worker_reality_domain": reality_domain,
+            "operator_environment": environment,
+            "journal_state_before": record_before.get("journal_state"),
+            "argv_trace_untouched": False,
+        }
+
+        def stop_host() -> None:
+            self.podman.stop(container)
+            self.podman.remove(container)
+
+        def restore_records() -> Dict[str, Any]:
+            for path, content in (
+                (NODE_ADD_JOURNAL, journal_before), (NODE_ADD_STATE, state_before),
+                (known_hosts_path, known_hosts_before),
+            ):
+                self.podman.exec(
+                    master,
+                    ["bash", "-c", f"umask 077; cat > {shlex.quote(path)}"],
+                    input_text=content,
+                    timeout=120,
+                )
+            return aio.probe_json(
+                case_id, "the Master's registration record after the control",
+                self.podman.exec_bash(
+                    master, duplicate_add_state_command(), check=False, timeout=120,
+                ),
+            )
+
+        try:
+            evidence["control_host"] = host.start_secondary_worker(
+                container, address, (worker_domain, reality_domain),
+            )
+            evidence["control_host"]["trust"] = host.pin_secondary_trust(container, address)
+
+            zone = copy.deepcopy(zone_before)
+            records = zone.setdefault("records", {})
+            records[worker_domain] = {"A": [address]}
+            records[reality_domain] = {"A": [address]}
+            records.pop(SECOND_WORKER_VISION_DOMAIN, None)
+            host.write_dns_zone(zone)
+            resolution = aio.probe_json(
+                case_id, "the Master's answer for the control host's names",
+                self.podman.exec_bash(master, name_resolution_command(), check=False, timeout=120),
+            )
+            evidence["control_host"]["resolved"] = resolution
+            require(
+                case_id,
+                address in (resolution.get(worker_domain) or []),
+                f"the control host's name {worker_domain} does not answer with {address}: "
+                f"{resolution.get(worker_domain)!r}",
+            )
+            evidence["core_host_block"] = aio.require_host_blocked(
+                case_id, "the control host",
+                aio.hosts_block_facts(self.podman, container, case_id, role="control host"),
+            )
+
+            script = host.node_add_script(
+                name, environment=environment, address=address,
+                worker_domain=worker_domain, reality_domain=reality_domain,
+                vision_domain="",
+            )
+            require(
+                case_id,
+                "XRAY_SERVER_VERSION=latest" in script,
+                f"the control command does not carry the opt-out: {script}",
+            )
+            started = time.monotonic()
+            proc = self.podman.exec_bash(
+                master, script, check=False, timeout=topology.NODE_ADD_TIMEOUT_SECONDS,
+            )
+            outcome = topology.InstallOutcome(
+                returncode=proc.returncode,
+                stdout=proc.stdout or "",
+                stderr=proc.stderr or "",
+                duration=time.monotonic() - started,
+                command=script,
+            )
+            self.context.evidence_text("mn-core-hole-control.stdout.log", outcome.stdout)
+            self.context.evidence_text("mn-core-hole-control.stderr.log", outcome.stderr)
+            combined = f"{outcome.stdout}\n{outcome.stderr}"
+            named = [
+                line.strip() for line in combined.splitlines()
+                if aio.PINNED_CORE_BLOCKED_HOST in line
+            ]
+            evidence.update({
+                "control_command": script,
+                "control_returncode": outcome.returncode,
+                "control_duration_seconds": round(outcome.duration, 1),
+                "control_matched_lines": named[-4:],
+            })
+            require(
+                case_id,
+                not outcome.ok,
+                "the control's node add succeeded with the release API blocked and the pin "
+                f"opted out, so nothing proved the block was in force: {outcome.tail(2000)}",
+            )
+            require(
+                case_id,
+                bool(named),
+                f"the control's node add failed with exit {outcome.returncode} without naming "
+                f"{aio.PINNED_CORE_BLOCKED_HOST}, so the failure is not the block: "
+                f"{outcome.tail(2000)}",
+            )
+            core_path = self.podman.exec(
+                container,
+                ["bash", "-c", f"test -e {WORKER_CORE_BINARY} && echo present || echo absent"],
+                check=False, timeout=60,
+            )
+            evidence["control_core_path"] = (core_path.stdout or "").strip()
+            require(
+                case_id,
+                evidence["control_core_path"] == "absent",
+                f"the control host holds {WORKER_CORE_BINARY} although its installer failed at "
+                f"the release API: {evidence['control_core_path']!r}",
+            )
+        except BaseException as primary:
+            # A control that failed before its own cleanup would leave a third
+            # node's records in the pair the remaining cases read.
+            try:
+                stop_host()
+                host.write_dns_zone(zone_before)
+                restore_records()
+            except Exception as secondary:
+                raise AssertionError(
+                    f"{primary} — and the cleanup after it failed as well: {secondary}"
+                ) from primary
+            raise
+
+        stop_host()
+        host.write_dns_zone(zone_before)
+        record_after = restore_records()
+        trace_after = self.argv_trace_digest(master)
+        evidence["argv_trace_untouched"] = trace_after == trace_before
+        inventory_after = panel_inventory(self.panel_surface(case_id).get("surface") or {})
+        restored = self.wait_for_nodes(case_id, expected=2)
+        evidence["cleanup"] = {
+            "container_removed": container not in {
+                str(item.get("name") or "") for item in self.podman.run_containers()
+            },
+            "state_digest_restored": record_after.get("state_digest")
+            == record_before.get("state_digest"),
+            "journal_digest_restored": record_after.get("journal_digest")
+            == record_before.get("journal_digest"),
+            "known_hosts_restored": self.podman.exec(
+                master, ["cat", known_hosts_path], check=False,
+            ).stdout == known_hosts_before,
+            "argv_trace_untouched": evidence["argv_trace_untouched"],
+            "nodes_after": restored.get("nodes", {}),
+        }
+        evidence["panel_inventory_after"] = inventory_after
+        require(
+            case_id,
+            evidence["cleanup"]["state_digest_restored"]
+            and evidence["cleanup"]["journal_digest_restored"],
+            f"the pair's registration files are not the ones this control started with: "
+            f"{evidence['cleanup']}",
+        )
+        require(
+            case_id,
+            evidence["cleanup"]["known_hosts_restored"],
+            "the Master's known_hosts still carries the control host's address",
+        )
+        require(
+            case_id,
+            evidence["argv_trace_untouched"],
+            f"the control's dispatch changed the trace the observed deployment left: it was "
+            f"{trace_before!r} and is now {trace_after!r}",
+        )
+        return evidence
+
+    def argv_trace_digest(self, master: str) -> str:
+        """The digest of the Master-side trace, or ``missing`` when there is none."""
+        proc = self.podman.exec(
+            master,
+            ["bash", "-c",
+             f"sha256sum {shlex.quote(argv_probe.TRACE_PATH)} 2>/dev/null || echo missing"],
+            check=False, timeout=60,
+        )
+        return (proc.stdout or "").strip()
 
     # ---------------------------------------------------------------- probes
     def panel_surface(self, case_id: str) -> Dict[str, Any]:
@@ -988,6 +1459,22 @@ class MultiNodeProduct:
             )
             self.worker_state_cache = parsed
         return self.worker_state_cache
+
+    def worker_core_version(self, case_id: str) -> str:
+        """The Xray core the Worker's own status reports, or an empty string.
+
+        A Worker tuple has to compare the client core with the core that served
+        it. The Master's core is read by the install, but the Worker's is not, so
+        it is read here from the same cached self-report the state case uses.
+
+        The self-report is a whole sentence — ``Xray 26.11.9 (Xray, Penetrates
+        Everything.) 676eaf6 (go1.27.3 linux/amd64)`` — while the install reads
+        the Master's core as the version token alone. Both sides are reduced by
+        the rule in ``tools/live_vps/versions.py``, so the tuple compares the
+        versions the two reports name rather than the shapes they arrive in.
+        """
+        status = self.worker_state(case_id).get("status") or {}
+        return version_token(parse_node_status(str(status.get("stdout") or "")).get("core") or "")
 
     def node_vision_facts(
         self, case_id: str, node: str, domain: str, port: int,
@@ -1685,12 +2172,229 @@ systemctl restart ssh.service
     }
 
 
+def case_ssh_service_down(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-SSH-DOWN: a Worker whose sshd is down is still a node, and comes back.
+
+    Everything the operator does to a Worker travels over OpenSSH, so losing the
+    daemon must stop those operations before they act — and it must stop nothing
+    else: the node keeps its unit and keeps carrying payload, because the control
+    plane and the data plane never used that port. The fault is both units that
+    can answer on 22, ``ssh.socket`` and ``ssh.service``: stopping the service
+    alone leaves the socket activating a daemon on the next connection.
+
+    The observation is the same one SSHKEY uses: the controller's remote-finalize
+    operation deletes a leftover ACME snapshot on the Worker, so a refused
+    connection and an executed command leave different evidence. The case restores
+    the unit in a ``finally`` and then repeats the very operation that was
+    refused, which is what separates "the daemon came back" from "the host is
+    still unreachable".
+    """
+    host = product.require_installed()
+    worker_ip = host.plan.worker_ip
+    transaction = f"/var/lib/gowave-auto-nginx/recovery/{SSH_DOWN_TX_ID}"
+    sentinel = f"{transaction}/sentinel"
+    known_hosts = "/root/.ssh/known_hosts"
+    finalized = "Worker ACME recovery snapshot finalized."
+
+    def snapshot_present() -> bool:
+        return product.podman.exec(
+            host.worker_name, ["test", "-f", sentinel], check=False,
+        ).returncode == 0
+
+    def ssh_state(action: str) -> Dict[str, Any]:
+        # The socket goes first on the way down: while it is active it would
+        # start a fresh per-connection daemon, and on the way back up it is the
+        # listener a client actually reaches.
+        result = product.podman.exec_bash(
+            host.worker_name,
+            f"systemctl {action} {SSH_SOCKET_UNIT} </dev/null >/dev/null 2>&1 || true\n"
+            f"systemctl {action} {SSH_UNIT} </dev/null >/dev/null 2>&1 || true\n"
+            f"echo \"service=$(systemctl is-active {SSH_UNIT} 2>/dev/null || true)\"\n"
+            f"echo \"socket=$(systemctl is-active {SSH_SOCKET_UNIT} 2>/dev/null || true)\"\n",
+            check=False, timeout=120,
+        )
+        fields: Dict[str, str] = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, value = line.strip().partition("=")
+            if separator:
+                fields[key.strip()] = value.strip()
+        return {
+            "action": action,
+            "service": fields.get("service", ""),
+            "socket": fields.get("socket", ""),
+            "detail": (result.stderr or "").strip()[-400:],
+        }
+
+    prepared = product.podman.exec_bash(host.worker_name, f"""
+set -eu
+umask 077
+install -d -m 0700 {shlex.quote(transaction)}
+: > {shlex.quote(sentinel)}
+test -f {shlex.quote(sentinel)}
+""", check=False, timeout=120)
+    require(
+        SSH_DOWN_CASE_ID,
+        prepared.returncode == 0 and snapshot_present(),
+        f"planting the Worker's leftover ACME snapshot exited {prepared.returncode}: "
+        f"{(prepared.stderr or '').strip()[-500:]}",
+    )
+
+    product.master.subscription_payloads(SSH_DOWN_CASE_ID)
+    inbound, client = product.worker_tuple()
+    baseline = product.node_transfer(
+        SSH_DOWN_CASE_ID, "worker", inbound, client, expect_refusal=True,
+    )
+    require(
+        SSH_DOWN_CASE_ID,
+        baseline.get("delivered")
+        and baseline.get("status") == 200
+        and baseline.get("request_id_match")
+        and baseline.get("body_match"),
+        f"the Worker never carried a payload before its sshd was stopped, so the "
+        f"degraded state would not be attributable to the fault: "
+        f"{baseline.get('reason', '')}",
+    )
+    require(
+        SSH_DOWN_CASE_ID,
+        baseline.get("source_ip") == host.plan.data_worker_ip,
+        f"the baseline payload left from {baseline.get('source_ip')!r} instead of the "
+        f"Worker's own data address {host.plan.data_worker_ip}",
+    )
+
+    stopped = ssh_state("stop")
+    require(
+        SSH_DOWN_CASE_ID,
+        stopped.get("service") != "active" and stopped.get("socket") != "active",
+        f"the Worker still answers for SSH after `systemctl stop {SSH_SOCKET_UNIT} {SSH_UNIT}`: "
+        f"{SSH_UNIT}={stopped.get('service')!r} {SSH_SOCKET_UNIT}={stopped.get('socket')!r} "
+        f"({stopped.get('detail') or 'no output'})",
+    )
+
+    refused: Dict[str, Any] = {}
+    during: Dict[str, Any] = {}
+    unit_during = ""
+    refused_survived = True
+    started: Dict[str, Any] = {}
+    try:
+        refused = product.remote_finalize(known_hosts, SSH_DOWN_TX_ID)
+        refused_output = (refused.stdout or "") + (refused.stderr or "")
+        refused_survived = snapshot_present()
+        unit_during = (product.podman.exec_bash(
+            host.worker_name, f"systemctl is-active {WORKER_UNIT} || true",
+            check=False, timeout=60,
+        ).stdout or "").strip()
+        during = product.node_transfer(
+            SSH_DOWN_CASE_ID, "worker", inbound, client, expect_refusal=True,
+        )
+
+        require(
+            SSH_DOWN_CASE_ID,
+            refused.returncode != 0,
+            f"the controller's remote operation exited 0 while the Worker's "
+            f"{SSH_SOCKET_UNIT} and {SSH_UNIT} were stopped: "
+            f"{refused_output.strip()[-800:]}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            any(marker in refused_output for marker in SSH_CONNECT_FAILURES),
+            f"the refused operation did not name a connection failure: "
+            f"{refused_output.strip()[-800:]!r}",
+        )
+        # A host-key failure here would mean sshd answered after all, so the
+        # refusal would be about the pin rather than about the daemon.
+        require(
+            SSH_DOWN_CASE_ID,
+            "Host key verification failed" not in refused_output,
+            f"the operation was refused by host-key verification, so a daemon was still "
+            f"answering on 22: {refused_output.strip()[-800:]!r}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            finalized not in refused_output and refused_survived,
+            f"the remote script ran although the Worker's sshd was stopped: "
+            f"{refused_output.strip()[-800:]!r}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            unit_during == "active",
+            f"{WORKER_UNIT} is {unit_during!r} on the Worker whose SSH was stopped, "
+            "so losing SSH took the node with it",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            during.get("delivered") is True
+            and during.get("status") == 200
+            and during.get("request_id_match")
+            and during.get("body_match"),
+            f"the Worker stopped carrying payload while only its sshd was down "
+            f"(status {during.get('status')!r}): {during.get('reason', '')}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            during.get("source_ip") == host.plan.data_worker_ip,
+            f"the payload during the fault left from {during.get('source_ip')!r} instead of "
+            f"the Worker's data address {host.plan.data_worker_ip}",
+        )
+    finally:
+        # The controller needs this daemon back whatever the checks above decided.
+        started = ssh_state("start")
+
+    require(
+        SSH_DOWN_CASE_ID,
+        started.get("service") == "active",
+        f"`systemctl start {SSH_SOCKET_UNIT} {SSH_UNIT}` left the Worker's daemon "
+        f"{started.get('service')!r} with its socket {started.get('socket')!r}: "
+        f"{started.get('detail') or 'no output'}",
+    )
+
+    recovered = product.remote_finalize(known_hosts, SSH_DOWN_TX_ID)
+    recovered_output = (recovered.stdout or "") + (recovered.stderr or "")
+    recovered_survived = snapshot_present()
+    require(
+        SSH_DOWN_CASE_ID,
+        recovered.returncode == 0,
+        f"the same operation was still refused after {SSH_UNIT} was started: "
+        f"{recovered_output.strip()[-800:]}",
+    )
+    require(
+        SSH_DOWN_CASE_ID,
+        finalized in recovered_output and not recovered_survived,
+        f"the operation reported success without removing the planted snapshot {sentinel}: "
+        f"{recovered_output.strip()[-800:]!r}",
+    )
+
+    return {
+        "worker_ip": worker_ip,
+        "ssh_unit_after_stop": stopped.get("service"),
+        "ssh_socket_after_stop": stopped.get("socket"),
+        "ssh_unit_after_start": started.get("service"),
+        "ssh_socket_after_start": started.get("socket"),
+        "refused_returncode": refused.returncode,
+        "refusal_names_transport": str(
+            any(marker in ((refused.stdout or "") + (refused.stderr or ""))
+                for marker in SSH_CONNECT_FAILURES)
+        ).lower(),
+        "remote_effect_during_fault": str(not refused_survived).lower(),
+        "worker_unit_with_sshd_down": unit_during,
+        "worker_status_with_sshd_down": during.get("status"),
+        "worker_source_ip_with_sshd_down": during.get("source_ip"),
+        "recovered_returncode": recovered.returncode,
+        "remote_effect_after_restore": str(not recovered_survived).lower(),
+    }
+
+
 def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
     """WRK-04: the operator's node add registers and deploys the Worker.
 
     A total node count cannot tell a registered Worker from a second copy of the
     Master, so the case names both nodes and their endpoints, and it reads the
     Worker's own connection state from the Panel rather than inferring it.
+
+    The release API is blocked in the Worker before that command runs, and the
+    core is read there twice, so "the Worker serves the pinned core" is a fact
+    about the Worker instead of an inference from the Master. A control on a
+    disposable host repeats the command with the pin opted out: blocked, it must
+    fail and name the host it could not reach.
     """
     host = product.require_installed()
     evidence = product.add_worker()
@@ -1745,7 +2449,1376 @@ def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
         },
         "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
     })
+    # The Worker's core is read twice: as the node's own status reports it, and by
+    # running the file the node supervises. One reading cannot stand for the other,
+    # and the release API was blocked when the installer ran, so both have to name
+    # the version the pin supplies. The reads follow the registration, because the
+    # status the node reports is only settled once the Panel lists it as connected.
+    core_expected = matrix_data.product(product.matrix).get("xray_version", "")
+    core_reported = product.worker_core_version(NODE_ADD_CASE_ID)
+    core_binary = product.worker_core_binary(NODE_ADD_CASE_ID)
+    for label, reported in (("status", core_reported), ("binary", core_binary["version"])):
+        require(
+            NODE_ADD_CASE_ID,
+            output_matches_expected_version(reported, core_expected),
+            f"the Worker's {label} reports {reported!r} as the core it runs while this "
+            f"deployment configured {core_expected!r}",
+        )
+    evidence.update({
+        "worker_core_version_from_status": core_reported,
+        "worker_core_version_from_binary": core_binary["version"],
+        "worker_core_version_expected": core_expected,
+        "worker_core_binary": core_binary,
+    })
+    # The positive outcome alone cannot say the blocked API was what made the step
+    # necessary; the control runs the same command with the pin opted out.
+    evidence["core_hole_control"] = product.worker_core_control(NODE_ADD_CASE_ID)
     return evidence
+
+
+ENV_CONTRACT_UNDO_SCRIPT = """
+import json, sys
+sys.path.insert(0, {repo!r})
+from modules.recovery import write_journal_atomically
+from modules.api_client import rollback_provisioning
+
+journal_path, state_path, credentials, node_name = sys.argv[1:5]
+
+def read(path):
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
+
+journal = read(journal_path)
+# Only this case's own transaction is undone. A journal naming the pair's Worker
+# is the record the later cases read, and undoing that one would delete the node
+# the suite is about.
+if journal.get("state") != "NODE_ADD_COMMITTED" or journal.get("node_name") != node_name:
+    print(json.dumps({{
+        "refused": True,
+        "state": journal.get("state"),
+        "node_name": journal.get("node_name"),
+    }}, sort_keys=True))
+    raise SystemExit(3)
+
+# ``rollback_provisioning`` refuses a committed transaction by design. The label
+# is moved to the state that compensation reads, the shipped undo path runs, and
+# the case restores the journal's bytes afterwards, so nothing of this rewind
+# survives it.
+journal["state"] = "NODE_ADD_VERIFYING"
+write_journal_atomically(journal_path, journal)
+rolled_back = rollback_provisioning(journal_path, state_path, credentials)
+print(json.dumps({{
+    "refused": False,
+    "rolled_back": bool(rolled_back),
+    "state_after": read(journal_path).get("state"),
+}}, sort_keys=True))
+raise SystemExit(0 if rolled_back else 1)
+"""
+
+
+def env_contract_add_script(
+    name: str, address: str, worker_domain: str, reality_domain: str,
+) -> str:
+    """The operator's own ``node add`` with every input taken from the environment.
+
+    No positional argument is passed, so a Panel record carrying this name, address
+    and domains is evidence that the seven variables, and not argv defaults,
+    carried the values. The Vision name is exported empty on purpose: this node
+    publishes no Vision inbound, and asking for the run's Vision name would make
+    the second host compete with the Worker for a certificate that name answers for.
+    """
+    return (
+        f"export GOWAVE_NODE_NAME='{name}'\n"
+        f"export GOWAVE_NODE_IP='{address}'\n"
+        f"export GOWAVE_WORKER_DOMAIN='{worker_domain}'\n"
+        f"export GOWAVE_REALITY_DOMAIN='{reality_domain}'\n"
+        "export GOWAVE_SSH_USER='root'\n"
+        "export GOWAVE_SSH_PORT='22'\n"
+        "export GOWAVE_VISION_DOMAIN=''\n"
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add\n"
+    )
+
+
+def env_contract_undo_command(node_name: str) -> str:
+    arguments = " ".join(
+        shlex.quote(value) for value in (
+            NODE_ADD_JOURNAL, NODE_ADD_STATE, aio.CREDENTIALS_FILE, node_name,
+        )
+    )
+    script = ENV_CONTRACT_UNDO_SCRIPT.format(repo=topology.REPO_IN_CONTAINER)
+    return (
+        f"PYTHONPATH={topology.REPO_IN_CONTAINER} "
+        f"python3 - {arguments} <<'PY'\n{script}\nPY\n"
+    )
+
+
+def case_env_contract(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-ENV-CONTRACT``: the environment contract alone registers a Worker.
+
+    ``node add`` takes all seven inputs from ``GOWAVE_*`` variables. Nothing here is
+    positional, so a Panel record carrying this case's name, address and domains is
+    evidence that the variables reached the registration.
+
+    The registration needs a host the pair does not hold. The Panel keys a node by
+    its address, so re-registering the Worker's own address is refused — that
+    refusal is ``MN-DUP-ADD``'s subject, and this case was reaching it by accident:
+    it asked the Panel for ``worker-env`` at the Worker's address, got ``HTTP 400``,
+    and left the failed transaction's journal behind for a dozen later cases to
+    read.
+
+    So the case starts a clean Worker of its own, registers it, and takes it back
+    out again. The pair's inventory, its ``state.json`` and its recovery journal are
+    what the later cases read, and each is asserted to be exactly what it was: the
+    undo is the product's own ``rollback_provisioning``, reached by moving the
+    journal from the committed label to the one that compensation reads, and the
+    opened bytes of both record files are put back afterwards.
+    """
+    import time
+
+    case_id = ENV_CONTRACT_CASE_ID
+    host = product.require_installed()
+    master = host.target_name
+    env_worker_name = "worker-env"
+    address = str(host.plan.second_node_ip)
+    worker_domain = SECOND_WORKER_DOMAIN
+    reality_domain = SECOND_WORKER_REALITY_DOMAIN
+    container = host.context.resource_name("worker-env")
+
+    surface_before = product.panel_surface(case_id).get("surface") or {}
+    inventory_before = panel_inventory(surface_before)
+    record_before = aio.probe_json(
+        case_id, "the Master's registration record before the case",
+        product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+    )
+    journal_before = product.podman.exec(
+        master, ["cat", NODE_ADD_JOURNAL], check=False,
+    ).stdout
+    state_before = product.podman.exec(master, ["cat", NODE_ADD_STATE], check=False).stdout
+    require(
+        case_id,
+        bool(journal_before) and bool(state_before),
+        "the pair has no registration record to put back: "
+        f"{NODE_ADD_JOURNAL} and {NODE_ADD_STATE} must both exist",
+    )
+    zone_before = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
+    # The trust the harness pins for the second address is the case's own, and a
+    # known_hosts entry for a container that no longer exists would be a key the
+    # next case's pin of that address contradicts.
+    known_hosts_path = "/root/.ssh/known_hosts"
+    known_hosts_before = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+
+    def stop_host() -> None:
+        product.podman.stop(container)
+        product.podman.remove(container)
+
+    def restore_record() -> Dict[str, Any]:
+        """Put the pair's record files back and report the digests that follow."""
+        for path, content in (
+            (NODE_ADD_JOURNAL, journal_before), (NODE_ADD_STATE, state_before),
+            (known_hosts_path, known_hosts_before),
+        ):
+            product.podman.exec(
+                master,
+                ["bash", "-c", f"umask 077; cat > {shlex.quote(path)}"],
+                input_text=content,
+                timeout=120,
+            )
+        return aio.probe_json(
+            case_id, "the Master's registration record after the case",
+            product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+        )
+
+    evidence = {
+        "env_worker_name": env_worker_name,
+        "env_worker_address": address,
+        "worker_endpoint": f"{address}:{NODE_PORT}",
+        "node_add_command": "gowave-auto.sh node add (via environment variables)",
+        "environment_contract_used": True,
+        "panel_inventory_before": inventory_before,
+    }
+
+    try:
+        evidence["second_worker"] = host.start_secondary_worker(
+            container, address, (worker_domain, reality_domain),
+        )
+        evidence["second_worker"]["trust"] = host.pin_secondary_trust(container, address)
+
+        zone = copy.deepcopy(zone_before)
+        records = zone.setdefault("records", {})
+        records[worker_domain] = {"A": [address]}
+        records[reality_domain] = {"A": [address]}
+        records.pop(SECOND_WORKER_VISION_DOMAIN, None)
+        host.write_dns_zone(zone)
+        resolution = aio.probe_json(
+            case_id, "the Master's answer for the second node's names",
+            product.podman.exec_bash(master, name_resolution_command(), check=False, timeout=120),
+        )
+        evidence["second_worker"]["resolved"] = resolution
+        require(
+            case_id,
+            address in (resolution.get(worker_domain) or []),
+            f"the second Worker's name {worker_domain} does not answer with {address}: "
+            f"{resolution.get(worker_domain)!r}",
+        )
+
+        script = env_contract_add_script(
+            env_worker_name, address, worker_domain, reality_domain,
+        )
+        started = time.monotonic()
+        proc = product.podman.exec_bash(
+            master, script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+        )
+        outcome = topology.InstallOutcome(
+            returncode=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            duration=time.monotonic() - started,
+            command="gowave-auto.sh node add (via environment variables)",
+        )
+        product.context.evidence_text("mn-node-add-env-contract.stdout.log", outcome.stdout)
+        product.context.evidence_text("mn-node-add-env-contract.stderr.log", outcome.stderr)
+        evidence["node_add_returncode"] = outcome.returncode
+        evidence["node_add_duration_seconds"] = (
+            round(outcome.duration, 1) if outcome.duration else 0
+        )
+        require(
+            case_id,
+            outcome.ok,
+            f"node add with environment contract failed with exit {outcome.returncode}:\n"
+            f"{outcome.tail(6000)}",
+        )
+
+        observed = product.wait_for_nodes(case_id, expected=3)
+        surface = product.panel_surface(case_id).get("surface") or {}
+        nodes = surface.get("nodes") or {}
+        hosts = surface.get("hosts") or {}
+        names = nodes.get("names") or []
+        endpoints = nodes.get("endpoints") or []
+        connected = nodes.get("connected") or {}
+        evidence["panel_nodes"] = observed.get("nodes", {})
+        evidence["panel_node_names"] = names
+        evidence["panel_node_endpoints"] = endpoints
+        evidence["panel_node_connected"] = connected
+        evidence["panel_hosts"] = {
+            "count": hosts.get("count"),
+            "security_layers": hosts.get("security_layers"),
+            "fingerprints": hosts.get("fingerprints"),
+        }
+        evidence["unauthenticated_nodes_status"] = surface.get("unauthenticated_nodes_status")
+        require(
+            case_id,
+            env_worker_name in names,
+            f"the Panel reports nodes {names or 'none'}, and none of them is the "
+            f"environment contract Worker {env_worker_name!r}",
+        )
+        require(
+            case_id,
+            evidence["worker_endpoint"] in endpoints,
+            f"the Panel reports endpoints {endpoints or 'none'} instead of registering the "
+            f"Worker at {evidence['worker_endpoint']}",
+        )
+        require(
+            case_id,
+            connected.get(env_worker_name) is True,
+            f"the Panel reports the Worker as {connected.get(env_worker_name)!r} "
+            f"rather than connected; observed {connected}",
+        )
+        require(
+            case_id,
+            hosts.get("count", 0) >= 3,
+            f"the Panel publishes {hosts.get('count')!r} hosts instead of one per node",
+        )
+    except BaseException as primary:
+        # A case that fails before its cleanup leaves a third node in a pair the
+        # remaining cases read, so the undo runs on the failure path too, and its
+        # own failure is reported beside the original one.
+        try:
+            stop_host()
+            product.podman.exec_bash(
+                master, env_contract_undo_command(env_worker_name),
+                check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+            )
+            host.write_dns_zone(zone_before)
+            restore_record()
+        except Exception as secondary:
+            raise AssertionError(
+                f"{primary} — and the cleanup after it failed as well: {secondary}"
+            ) from primary
+        raise
+
+    stop_host()
+    undo_proc = product.podman.exec_bash(
+        master, env_contract_undo_command(env_worker_name),
+        check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+    )
+    try:
+        undo = json.loads(undo_proc.stdout or "")
+    except json.JSONDecodeError:
+        undo = {"output": (undo_proc.stdout or undo_proc.stderr or "").strip()[-1500:]}
+    require(
+        case_id,
+        undo.get("refused") is False and undo.get("rolled_back") is True,
+        f"the product's compensation did not undo the registration (exit "
+        f"{undo_proc.returncode}): {undo}",
+    )
+    host.write_dns_zone(zone_before)
+    record_after = restore_record()
+    require(
+        case_id,
+        record_after.get("state_digest") == record_before.get("state_digest"),
+        f"the pair's state.json is not the file this case started with: {record_after}",
+    )
+    require(
+        case_id,
+        record_after.get("journal_digest") == record_before.get("journal_digest"),
+        f"the pair's recovery journal is not the one this case started with: {record_after}",
+    )
+    require(
+        case_id,
+        record_after.get("journal_state") == record_before.get("journal_state")
+        and record_after.get("journal_node_name") == record_before.get("journal_node_name"),
+        f"the restored journal reads {record_after.get('journal_state')!r} for "
+        f"{record_after.get('journal_node_name')!r} instead of "
+        f"{record_before.get('journal_state')!r} for "
+        f"{record_before.get('journal_node_name')!r}",
+    )
+    known_hosts_after = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+    require(
+        case_id,
+        known_hosts_after == known_hosts_before,
+        "the Master's known_hosts still carries the second address: "
+        f"it was {known_hosts_before.strip().splitlines()[-3:]} and is now "
+        f"{known_hosts_after.strip().splitlines()[-3:]}",
+    )
+    inventory_after = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+    require(
+        case_id,
+        inventory_after == inventory_before,
+        f"the Panel's inventory is not what it was before the case: it was "
+        f"{inventory_before} and is now {inventory_after}",
+    )
+    restored = product.wait_for_nodes(case_id, expected=2)
+    evidence["cleanup"] = {
+        "container_removed": container not in {
+            str(item.get("name") or "") for item in product.podman.run_containers()
+        },
+        "undo": undo,
+        "state_digest_restored": record_after.get("state_digest")
+        == record_before.get("state_digest"),
+        "journal_digest_restored": record_after.get("journal_digest")
+        == record_before.get("journal_digest"),
+        "known_hosts_restored": known_hosts_after == known_hosts_before,
+        "inventory_restored": True,
+        "nodes_after": restored.get("nodes", {}),
+    }
+    evidence["panel_inventory_after"] = inventory_after
+    return evidence
+
+
+def partial_success_script(success_name: str, failed_name: str, success_address: str) -> str:
+    """The wizard's own onboarding loop, given one Worker that fails and one that does not.
+
+    ``wizard_onboard_nodes`` is the subject: it is the code that decides whether a
+    single failed Worker is fatal, prints the per-node summary and offers the
+    retry. Only the SSH hop is replaced — the stub answers the same ``PHASE:``
+    marker, the same identity marker and the same catalog message the real
+    onboarding emits, so the phase, the diagnostic and the identity the summary
+    prints are read from the shape the shipped code produces rather than from a
+    structure invented here.
+
+    The successful stub names the Worker the deployment really registered, at the
+    address the Panel holds it at, so the shipped readback runs against the live
+    Panel and the summary carries the Panel's own uuid rather than a value this
+    case wrote.
+    """
+    return "\n".join([
+        "set -Eeuo pipefail",
+        f"source {topology.REPO_IN_CONTAINER}/gowave-auto.sh",
+        "trap - ERR",
+        "set +e",
+        "GOWAVE_STATE_DIR=$(mktemp -d)",
+        "export GOWAVE_STATE_DIR",
+        f"GOWAVE_PLAN_NODE_NAMES=('{success_name}' '{failed_name}')",
+        "GOWAVE_PLAN_NODE_CAMOUFLAGE=('cam-success.example' 'cam-failure.example')",
+        "GOWAVE_PLAN_NODE_VISION=('' '')",
+        "ssh_bootstrap_onboard_one() {",
+        "  case \"$1\" in",
+        f"    {success_name}) printf '==> Onboarding %s\\n' \"$1\";",
+        f"      printf 'NODE-IDENTITY:%s\\t{success_address}\\t{NODE_PORT}\\n' \"$1\" >&2;",
+        "      return 0 ;;",
+        f"    {failed_name}) printf 'PHASE:scan\\n' >&2;",
+        "      printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2;",
+        "      return 1 ;;",
+        "  esac",
+        "  return 1",
+        "}",
+        # A single failed node makes the skip option choice 2.
+        "wizard_onboard_nodes <<< '2'",
+        "rc=$?",
+        "printf 'GOWAVE_ONBOARD_EXIT=%d\\n' \"$rc\"",
+        "exit \"$rc\"",
+    ])
+
+
+def case_partial_success(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-PARTIAL-SUCCESS``: one Worker fails, its sibling still counts, and the code says so.
+
+    What the deployment already proved — a real Panel, a real Worker registered
+    and connected — is read back from the Panel. This case adds the branch that
+    the install path only reaches when a Worker is broken: the failed node has to
+    be named with its phase and diagnostic, the successful one has to stay a
+    success, the retry has to be offered for the failed node alone, and the
+    command has to exit with the partial-success code instead of reporting a
+    clean install or a total failure.
+    """
+    facts = product.panel_surface(PARTIAL_SUCCESS_CASE_ID)
+    nodes = (facts.get("surface") or {}).get("nodes") or {}
+    connected = nodes.get("connected") or {}
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        topology.WORKER_NODE_NAME in (nodes.get("names") or []),
+        f"the deployed Worker {topology.WORKER_NODE_NAME!r} is absent before the partial run, "
+        f"so a surviving sibling cannot be observed: {nodes.get('names')!r}",
+    )
+    # The Panel's own uuid for that Worker, read here and not written by the
+    # script: what the summary prints has to be this value or the screen is
+    # quoting the case rather than the Panel.
+    panel_uuid = (nodes.get("uuids") or {}).get(topology.WORKER_NODE_NAME) or ""
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        bool(panel_uuid),
+        f"the Panel reports no uuid for {topology.WORKER_NODE_NAME!r}, so the verified "
+        f"line cannot be told apart from a value the case wrote: {nodes.get('uuids')!r}",
+    )
+
+    failed_name = "worker-2"
+    host = product.require_installed()
+    script = partial_success_script(
+        topology.WORKER_NODE_NAME, failed_name, str(host.plan.worker_ip),
+    )
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        host.target_name, script, check=False,
+        timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+    )
+    outcome = topology.InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command=script,
+    )
+    output = f"{outcome.stdout}\n{outcome.stderr}"
+
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        outcome.returncode == 2,
+        f"one failed Worker and one successful sibling must exit 2, the partial-success code "
+        f"distinct from a clean install (0) and from a failed Panel deployment (1); the "
+        f"command exited {outcome.returncode}:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"{topology.WORKER_NODE_NAME}: registered and verified in the Panel (uuid " in output,
+        f"the per-node summary lost the successful sibling, or claimed it without the "
+        f"Panel's own uuid:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"{topology.WORKER_NODE_NAME}: registered and verified in the Panel "
+        f"(uuid {panel_uuid})" in output,
+        f"the summary claims a registration with a uuid the Panel did not answer for "
+        f"{topology.WORKER_NODE_NAME!r} (Panel uuid {panel_uuid!r}):\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        "Registered and verified in the Panel: 1 of 2." in output,
+        f"the summary did not count one verified node of two:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"{failed_name}: failed" in output,
+        f"the per-node summary lost the failed Worker:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        "phase: scan" in output,
+        f"the failed Worker is recorded without the phase that failed:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"reason: Could not read the SSH host key of {failed_name}." in output,
+        f"the failed Worker is recorded without its diagnostic:\n{output[-4000:]}",
+    )
+
+    offer_marker = "Some nodes failed. Select a node to retry, or skip:"
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        offer_marker in output,
+        f"no selective retry was offered after a partial success:\n{output[-4000:]}",
+    )
+    offer = output.split(offer_marker, 1)[1]
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        failed_name in offer,
+        f"the retry offer does not name the failed Worker:\n{offer[-2000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        topology.WORKER_NODE_NAME not in offer,
+        f"the retry offer names the Worker that succeeded:\n{offer[-2000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        "Retry skipped." in offer,
+        f"the skip choice produced no operator-visible confirmation:\n{offer[-2000:]}",
+    )
+
+    after = product.panel_surface(PARTIAL_SUCCESS_CASE_ID)
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    connected_after = nodes_after.get("connected") or {}
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        nodes_after.get("names") == nodes.get("names"),
+        f"the partial failure changed the Panel's node list: "
+        f"{nodes.get('names')!r} -> {nodes_after.get('names')!r}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        connected_after.get(topology.WORKER_NODE_NAME) is True,
+        f"the successful Worker stopped being connected after its sibling failed; "
+        f"observed {connected_after}",
+    )
+
+    return {
+        "partial_success_exit_code": outcome.returncode,
+        "successful_sibling": topology.WORKER_NODE_NAME,
+        "failed_node": failed_name,
+        "failed_phase": "scan",
+        "selective_retry_named_only_the_failed_node": True,
+        "panel_node_names": nodes_after.get("names"),
+        "successful_sibling_connected_before": connected.get(topology.WORKER_NODE_NAME),
+        "successful_sibling_connected_after": connected_after.get(topology.WORKER_NODE_NAME),
+        "output_tail": outcome.tail(4000),
+    }
+
+
+# The plan card this case enters. The names are valid DNS names and nothing
+# else: the plan is never applied, so no certificate, record or Panel entry is
+# created for them, and the wizard's pre-flight resolver is stubbed to answer
+# them without a public zone.
+WIZARD_FLOW_PANEL_NAME = "panel.invalid"
+WIZARD_FLOW_CAMOUFLAGE_NAME = "cdn.invalid"
+WIZARD_FLOW_NODE_NAMES: Tuple[str, str] = ("worker-1.invalid", "worker-2.invalid")
+WIZARD_FLOW_NODE_COVERS: Tuple[str, str] = ("cdn1.invalid", "cdn2.invalid")
+WIZARD_FLOW_LOCAL_LABEL = "local-01"
+WIZARD_FLOW_EMAIL = "admin@example.invalid"
+WIZARD_FLOW_CERTIFICATES = "6"
+
+
+def wizard_flow_script(worker_name: str, worker_address: str, worker_port: int = NODE_PORT) -> str:
+    """The composed wizard: one plan card, a mixed batch, one retry, the menu.
+
+    Three screens of the shipped code are the subject. ``wizard_collect_plan``
+    reads the card, and the only answers that need care are node 2's: its own
+    primary domain entered again as its cover domain, then node 1's cover
+    domain, then the correction — the two refusals have to land on that field
+    alone. ``wizard_onboard_nodes`` is given a batch where the Worker the Panel
+    already holds registers and the second one fails, then offered the retry
+    that may only name the failed node. ``cmd_interactive`` is the screen the
+    operator is returned to when the batch ends.
+
+    Only the SSH hop and the plan's resolver are replaced. The successful stub
+    emits the identity marker the real onboarding emits, naming the Worker the
+    deployment really registered at the address the Panel holds it at, so the
+    readback that prints the uuid is the shipped one against the live Panel.
+    The retry gate reads a host that a plan name addresses: the journal this run
+    points away from is absent, so the stubbed scan is the record that answers.
+    """
+    node1, node2 = WIZARD_FLOW_NODE_NAMES
+    cover1, cover2 = WIZARD_FLOW_NODE_COVERS
+    answers = [
+        "en",
+        "3",
+        WIZARD_FLOW_PANEL_NAME,
+        WIZARD_FLOW_CAMOUFLAGE_NAME,
+        "n",
+        WIZARD_FLOW_LOCAL_LABEL,
+        WIZARD_FLOW_EMAIL,
+        "2",
+        node1,
+        cover1,
+        "n",
+        worker_name,
+        node2,
+        node2,
+        cover1,
+        cover2,
+        "n",
+        "worker-2",
+        "n",
+    ]
+    return "\n".join([
+        "set -Eeuo pipefail",
+        f"source {topology.REPO_IN_CONTAINER}/gowave-auto.sh",
+        "trap - ERR",
+        "set +e",
+        "work=$(mktemp -d)",
+        'GOWAVE_STATE_DIR="$work/state"',
+        'mkdir -p "$GOWAVE_STATE_DIR"',
+        "export GOWAVE_STATE_DIR",
+        # The retry gate reads the journal this host wrote for a node it once
+        # provisioned; this plan names hosts that never were, so the absent file
+        # is stated rather than inherited from the deployment.
+        'GOWAVE_JOURNAL_FILE="$work/journal-absent.json"',
+        "export GOWAVE_JOURNAL_FILE",
+        # The language is asked, not inherited from the container it runs in.
+        "unset GOWAVE_WIZARD_LANG",
+        # Nothing here is applied, so none of the planned names has a record to
+        # answer: the pre-flight resolves through a stub instead of public DNS.
+        'printf "%s\\n" "#!/usr/bin/env bash" "exit 0" > "$work/resolver"',
+        'chmod +x "$work/resolver"',
+        'GOWAVE_WIZARD_RESOLVER="$work/resolver"',
+        "export GOWAVE_WIZARD_RESOLVER",
+        'calls="$work/calls"',
+        ': > "$calls"',
+        "",
+        "printf 'PLAN-BEGIN\\n'",
+        "wizard_collect_plan <<'PLAN'",
+        *answers,
+        "PLAN",
+        "plan_rc=$?",
+        "printf '\\nPLAN-END rc=%d\\n' \"$plan_rc\"",
+        "printf 'PLAN-VARIANT\\t%s\\n' \"${GOWAVE_PLAN_VARIANT:-}\"",
+        "printf 'PLAN-PANEL\\t%s\\t%s\\t%s\\t%s\\n' \"${GOWAVE_PLAN_PANEL_NAME:-}\" "
+        "\"${GOWAVE_PLAN_CAMOUFLAGE_NAME:-}\" \"${GOWAVE_PLAN_LOCAL_LABEL:-}\" "
+        "\"${GOWAVE_PLAN_EMAIL:-}\"",
+        "printf 'PLAN-COUNT\\t%s\\n' \"${GOWAVE_PLAN_NODE_COUNT:-}\"",
+        "printf 'PLAN-NODES\\t%s\\n' \"${GOWAVE_PLAN_NODE_NAMES[*]-}\"",
+        "printf 'PLAN-COVERS\\t%s\\n' \"${GOWAVE_PLAN_NODE_CAMOUFLAGE[*]-}\"",
+        "printf 'PLAN-LABELS\\t%s\\n' \"${GOWAVE_PLAN_NODE_LABELS[*]-}\"",
+        "",
+        # The diagnostics ask a failed node's host key over SSH; the answer is
+        # the shape the real scan produces, computed by the shipped fingerprint
+        # helper from a key this run generates.
+        'ssh_key="$work/hostkey"',
+        "ssh-keygen -q -t ed25519 -N '' -f \"$ssh_key\" >/dev/null",
+        'host_key_line=$(cat "$ssh_key.pub")',
+        'ssh_bootstrap_scan() { printf \'%s\\n\' "$host_key_line"; }',
+        "ssh_bootstrap_onboard_one() {",
+        "  case \"$1\" in",
+        f"    {node1})",
+        "      printf 'PHASE:scan\\n' >&2",
+        "      printf 'PHASE:add_node\\n' >&2",
+        f"      printf 'NODE-IDENTITY:%s\\t{worker_address}\\t{worker_port}\\n'"
+        f" '{worker_name}' >&2",
+        "      printf '%s\\t%s\\t%s\\n' \"$1\" 'scan add_node' 'ok' >> \"$calls\"",
+        "      return 0 ;;",
+        f"    {node2})",
+        '      attempts=$(grep -c "^$1" "$calls" 2>/dev/null)',
+        "      attempts=${attempts:-0}",
+        "      if (( attempts == 0 )); then",
+        "        printf 'PHASE:scan\\n' >&2",
+        "        printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2",
+        "        printf '%s\\t%s\\t%s\\n' \"$1\" 'scan' 'failed' >> \"$calls\"",
+        "        return 1",
+        "      fi",
+        "      printf 'PHASE:authorise\\n' >&2",
+        "      printf 'Permission denied (publickey) on %s.\\n' \"$1\" >&2",
+        "      printf '%s\\t%s\\t%s\\n' \"$1\" 'authorise' 'failed' >> \"$calls\"",
+        "      return 1 ;;",
+        "  esac",
+        "  return 1",
+        "}",
+        "",
+        "printf 'ONBOARD-BEGIN\\n'",
+        f"wizard_onboard_nodes 'https://{WIZARD_FLOW_PANEL_NAME}' 127.0.0.1 yes <<'RETRY'",
+        # The failed node is the only entry the offer holds, so its number is
+        # one; after the retry fails again the list still holds it, and the
+        # second choice is the skip that ends the batch.
+        "1",
+        "y",
+        "2",
+        "RETRY",
+        "onboard_rc=$?",
+        "printf '\\nONBOARD-END rc=%d\\n' \"$onboard_rc\"",
+        "printf 'CALLS-BEGIN\\n'",
+        'cat "$calls"',
+        "printf 'CALLS-END\\n'",
+        "",
+        # The screen the operator is returned to once the batch is done.
+        "printf 'MENU-BEGIN\\n'",
+        "(",
+        "  cmd_interactive <<'MENU'",
+        "0",
+        "MENU",
+        ")",
+        "menu_rc=$?",
+        "printf '\\nMENU-END rc=%d\\n' \"$menu_rc\"",
+        "exit \"$onboard_rc\"",
+    ])
+
+
+def case_wizard_flow(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-WIZARD-FLOW``: the composed wizard corrects one field and retries one node.
+
+    The plan step is where a refused answer costs the operator every earlier
+    answer if it is handled at the end of the card; the batch step is where a
+    failed node costs the successful sibling its place in the summary if the
+    failure is treated as fatal; the retry is where the list has to be the
+    failure record rather than the plan. Each of those is read from the
+    screen the shipped code prints, and the registration line is compared with
+    the uuid the Panel's own node list answers.
+    """
+    facts = product.panel_surface(WIZARD_FLOW_CASE_ID)
+    nodes = (facts.get("surface") or {}).get("nodes") or {}
+    node1, node2 = WIZARD_FLOW_NODE_NAMES
+    require(
+        WIZARD_FLOW_CASE_ID,
+        topology.WORKER_NODE_NAME in (nodes.get("names") or []),
+        f"the deployed Worker {topology.WORKER_NODE_NAME!r} is absent before the flow, so the "
+        f"plan's first node has nothing to register: {nodes.get('names')!r}",
+    )
+    # Read here and not written by the script: what the summary prints has to be
+    # this value or the screen is quoting the case rather than the Panel.
+    panel_uuid = (nodes.get("uuids") or {}).get(topology.WORKER_NODE_NAME) or ""
+    require(
+        WIZARD_FLOW_CASE_ID,
+        bool(panel_uuid),
+        f"the Panel reports no uuid for {topology.WORKER_NODE_NAME!r}, so the verified line "
+        f"cannot be told apart from a value the case wrote: {nodes.get('uuids')!r}",
+    )
+
+    host = product.require_installed()
+    script = wizard_flow_script(
+        topology.WORKER_NODE_NAME, str(host.plan.worker_ip), NODE_PORT,
+    )
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        host.target_name, script, check=False,
+        timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+    )
+    outcome = topology.InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command=script,
+    )
+    stdout = outcome.stdout
+    stderr = outcome.stderr
+    output = f"{stdout}\n{stderr}"
+
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "Traceback" not in output,
+        f"the composed wizard ended in a traceback:\n{output[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "PLAN-END rc=0" in stdout,
+        f"the plan card did not complete; a refused field has to be re-asked rather than "
+        f"ending the card:\n{output[-4000:]}",
+    )
+
+    # The two refusals land on node 2's cover domain alone, and each names what
+    # it collided with: the answer just given on this card, then node 1's role.
+    same_card = (
+        f"{node2} is already used by an answer you already gave in this card in this plan."
+    )
+    role_named = f"{WIZARD_FLOW_NODE_COVERS[0]} is already used by node 1 camouflage domain in this plan."
+    require(
+        WIZARD_FLOW_CASE_ID,
+        same_card in stderr,
+        f"repeating node 2's own primary domain as its cover domain was not refused on the "
+        f"card:\n{stderr[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        role_named in stderr,
+        f"reusing node 1's cover domain for node 2 did not name the role it belongs to:\n"
+        f"{stderr[-4000:]}",
+    )
+    vision_prompt = f"Enable Vision for {node2}?"
+    for prompt, expected in (
+        ("Select deployment scheme", 1),
+        ("Node 2 primary domain: ", 1),
+        ("Node 2 camouflage domain: ", 3),
+        (vision_prompt, 1),
+        ("Panel domain (", 1),
+    ):
+        require(
+            WIZARD_FLOW_CASE_ID,
+            stderr.count(prompt) == expected,
+            f"the plan asked {prompt!r} {stderr.count(prompt)} time(s) instead of {expected}: "
+            f"a refusal has to repeat that one field and keep every earlier answer:\n"
+            f"{stderr[-4000:]}",
+        )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stderr.index(same_card) < stderr.index(role_named) < stderr.index(vision_prompt),
+        f"the refusals were not asked where the field is: the correction has to happen before "
+        f"node 2's Vision question:\n{stderr[-4000:]}",
+    )
+
+    plan_expectations = {
+        "PLAN-VARIANT": "multi-node",
+        "PLAN-PANEL": "\t".join([
+            WIZARD_FLOW_PANEL_NAME, WIZARD_FLOW_CAMOUFLAGE_NAME,
+            WIZARD_FLOW_LOCAL_LABEL, WIZARD_FLOW_EMAIL,
+        ]),
+        "PLAN-COUNT": "2",
+        "PLAN-NODES": " ".join(WIZARD_FLOW_NODE_NAMES),
+        "PLAN-COVERS": " ".join(WIZARD_FLOW_NODE_COVERS),
+        "PLAN-LABELS": f"{topology.WORKER_NODE_NAME} worker-2",
+    }
+    for key, value in plan_expectations.items():
+        require(
+            WIZARD_FLOW_CASE_ID,
+            f"{key}\t{value}" in stdout,
+            f"the plan did not hold {key} = {value!r}:\n{stdout[-4000:]}",
+        )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        f"Certificates this plan spends: {WIZARD_FLOW_CERTIFICATES}" in stdout,
+        f"the reviewed plan was not costed at the corrected answers:\n{stdout[-4000:]}",
+    )
+
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "ONBOARD-END rc=2" in stdout,
+        f"one failed Worker and one successful sibling must end the batch at the "
+        f"partial-success code 2:\n{output[-4000:]}",
+    )
+
+    calls = stdout.split("CALLS-BEGIN\n", 1)[-1].split("\nCALLS-END", 1)[0].strip()
+    require(
+        WIZARD_FLOW_CASE_ID,
+        calls.splitlines() == [
+            f"{node1}\tscan add_node\tok",
+            f"{node2}\tscan\tfailed",
+            f"{node2}\tauthorise\tfailed",
+        ],
+        f"the batch did not onboard the first node once and then re-enter only the failed one; "
+        f"the calls it made were:\n{calls}",
+    )
+
+    # The same panel uuid twice: the retry reprints the summary, and the sibling's
+    # row has to survive it untouched.
+    verified_line = f"{node1}: registered and verified in the Panel (uuid {panel_uuid})"
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.count(verified_line) == 2,
+        f"the successful sibling is not registered and verified with the Panel's own uuid in "
+        f"both summaries (Panel uuid {panel_uuid!r}):\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.count("Registered and verified in the Panel: 1 of 2.") == 2,
+        f"the per-node count was not 1 of 2 in both summaries:\n{stdout[-4000:]}",
+    )
+    for phase, reason in (
+        ("scan", f"Could not read the SSH host key of {node2}."),
+        ("authorise", f"Permission denied (publickey) on {node2}."),
+    ):
+        require(
+            WIZARD_FLOW_CASE_ID,
+            f"{node2}: failed (phase: {phase}, reason: {reason})" in stdout,
+            f"the failed Worker is recorded without the stage and reason it stopped at "
+            f"({phase}):\n{stdout[-4000:]}",
+        )
+    offer = "Some nodes failed. Select a node to retry, or skip:"
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.count(offer) == 2,
+        f"the retry menu was printed {stdout.count(offer)} time(s) instead of twice — once for "
+        f"the offer and once after the failed retry:\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        f"  1) {node2}" in stdout and f"  1) {node1}" not in stdout,
+        f"the retry offer named a node other than the failed one:\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        f"Retrying {node2}..." in stdout and "Retry skipped." in stdout,
+        f"the retry was never started for the failed node, or the skip that ends the batch was "
+        f"not reported:\n{stdout[-4000:]}",
+    )
+
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "MENU-END rc=0" in stdout,
+        f"the operator was not returned to a menu that reads its choice and exits:\n"
+        f"{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.index("MENU-BEGIN") < stdout.index("GoWave Auto NGINX Manager")
+        < stdout.index("MENU-END"),
+        f"the menu was not drawn between the markers that bracket it:\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "0) Exit" in stdout,
+        f"the screen the batch returned to carries no exit choice:\n{stdout[-4000:]}",
+    )
+
+    after = product.panel_surface(WIZARD_FLOW_CASE_ID)
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    require(
+        WIZARD_FLOW_CASE_ID,
+        nodes_after.get("names") == nodes.get("names"),
+        f"the flow applied the plan it only entered and exited: the Panel's node list is "
+        f"{nodes.get('names')!r} -> {nodes_after.get('names')!r}",
+    )
+
+    return {
+        "plan_variant": "multi-node",
+        "plan_nodes": list(WIZARD_FLOW_NODE_NAMES),
+        "plan_cover_domains": list(WIZARD_FLOW_NODE_COVERS),
+        "plan_certificate_count": int(WIZARD_FLOW_CERTIFICATES),
+        "duplicate_answers_refused": [node2, WIZARD_FLOW_NODE_COVERS[0]],
+        "cover_prompt_asked": 3,
+        "onboarding_exit_code": 2,
+        "onboarding_calls": calls.splitlines(),
+        "registered_worker": topology.WORKER_NODE_NAME,
+        "registered_uuid": panel_uuid,
+        "failed_worker": node2,
+        "retry_attempted_only_for": node2,
+        "final_verified_count": "1 of 2",
+        "menu_returncode": 0,
+        "panel_node_names_before": nodes.get("names"),
+        "panel_node_names_after": nodes_after.get("names"),
+        "output_tail": outcome.tail(6000),
+    }
+
+
+def case_add_node_refused(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-ADD-NODE-REFUSED``: the wizard refuses an unverifiable Panel before mutating.
+
+    The Master already runs a Panel, so the flow is pointed at an address that
+    cannot answer a verified API — the operator's mistake of naming the wrong
+    Panel for an existing deployment. The attempt has to stop inside the
+    verification step: no Worker deployment is reached, no Worker credentials are
+    collected for the unverified address, and the Panel's own node list is what
+    it was before.
+
+    The Panel is named, not addressed: the wizard refuses a bare address before
+    it probes anything, so the case names one no resolver can answer and the flow
+    is refused at the API check itself.
+    """
+    product.require_installed()
+    before = product.panel_surface(ADD_NODE_REFUSED_CASE_ID)
+    nodes_before = (before.get("surface") or {}).get("nodes") or {}
+
+    container = product.require_installed().target_name
+    resolution = aio.add_node_refused_resolution(
+        product.podman, container, ADD_NODE_REFUSED_CASE_ID,
+    )
+    aio.require_add_node_refused_premise(ADD_NODE_REFUSED_CASE_ID, resolution)
+    script = aio.add_node_refusal_script()
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        container, script, check=False, timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+    )
+    outcome = topology.InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command=script,
+    )
+    output = f"{outcome.stdout}\n{outcome.stderr}"
+
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        not outcome.ok,
+        f"the wizard accepted a Panel address it could not verify and exited "
+        f"{outcome.returncode}:\n{output[-4000:]}",
+    )
+    reported = [marker for marker in aio.PANEL_VERIFICATION_FAILURES if marker in output]
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        bool(reported),
+        "the refusal named no verification failure, so it stopped for some other reason "
+        f"(expected one of {list(aio.PANEL_VERIFICATION_FAILURES)}):\n{output[-4000:]}",
+    )
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        "GOWAVE_CMD_NODE_CALLED" not in output,
+        "the refused attempt reached the Worker deployment boundary, so a mutation began "
+        f"before the Panel was verified:\n{output[-4000:]}",
+    )
+    # `read -p` prints its prompt only when stdin is a terminal, so the absence of
+    # a credential prompt would prove nothing here. The sentinel above is the real
+    # reading: Worker credentials are collected before `cmd_node add` and handed to
+    # it, so a boundary that was never crossed received none of them.
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        f"Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}..." in output,
+        "the flow never reached the verification step for the address it was given, so the "
+        f"refusal below cannot be attributed to Panel verification:\n{output[-4000:]}",
+    )
+
+    after = product.panel_surface(ADD_NODE_REFUSED_CASE_ID)
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        nodes_after.get("names") == nodes_before.get("names"),
+        f"the refused attempt changed the Panel's node list: "
+        f"{nodes_before.get('names')!r} -> {nodes_after.get('names')!r}",
+    )
+
+    return {
+        "panel_address": aio.ADD_NODE_REFUSED_PANEL,
+        "verification_failure_reported": reported,
+        "wizard_returncode": outcome.returncode,
+        "mutation_boundary_reached": "GOWAVE_CMD_NODE_CALLED" in output,
+        "verification_step_reached": True,
+        "panel_node_names_before": nodes_before.get("names"),
+        "panel_node_names_after": nodes_after.get("names"),
+        "output_tail": outcome.tail(2000),
+    }
+
+
+def case_argv_observer(product: MultiNodeProduct) -> Dict[str, Any]:
+    """WRK-01..03: the Worker dispatch was observed completely, and without the secret.
+
+    Three live sentences share one observation, so one case holds them. The
+    acceptance fixtures say this Master's strace captures a long argument whole
+    (both ``execve`` and ``execveat``) and keeps every element of a 128-argument
+    vector; the scan says the dispatch's own trace holds no cut vector and no
+    ``SECRET_KEY`` — raw or base64 — in any argv.
+
+    The trace is the one taken around the operator's real ``node add``
+    (``MULTI-NODE``: ``topology.node_add``), so nothing here re-runs the
+    deployment. The fixtures are judged before the trace is scanned: an observer
+    that cannot see a sentinel cannot be read as having seen a clean dispatch.
+    The scan removes the trace on the Master, ``envp`` included, before it
+    reports a single count.
+    """
+    host = product.require_worker()
+    podman = product.podman
+    observer = host.argv_observer
+    client = (observer or {}).get("client", "")
+    delivered = argv_probe.deliver(podman, host.target_name)
+    fixtures = argv_probe.run_fixtures(podman, host.target_name)
+    secret, secret_error = argv_probe.extract_secret(podman, host.target_name)
+    verdict = argv_probe.scan(podman, host.target_name, secret, client)
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        observer is not None and observer["ok"],
+        "the Master's argv observer was not usable, so the dispatch was never "
+        f"traced: {(observer or {}).get('error') or 'the deployment recorded no observer state'}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        delivered["delivered"],
+        f"the argv observer could not be placed on the Master: {delivered['error']}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        fixtures.get("status") == "PASS",
+        "the argv observer failed its own acceptance fixtures on this Master, so "
+        "its verdict on the dispatch cannot be read as complete: "
+        f"{fixtures.get('errors') or 'no reason recorded'}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        secret_error == "",
+        "the Master could not print its own SECRET_KEY, so the absence of that "
+        f"value from argv cannot be observed: {secret_error}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("status") == "PASS",
+        f"the dispatch trace is {verdict.get('status')}: "
+        f"{verdict.get('errors') or 'no reason recorded'}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("exec_count", 0) > 0,
+        "the dispatch trace holds no exec record, so the deployment it claims to "
+        "cover was not observed",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("secret_found") is False,
+        "a process argv vector in the dispatch trace carries the Master's SECRET_KEY",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("ssh_execs", 0) >= 1,
+        f"the dispatch trace holds {verdict.get('ssh_execs', 0)} exec records of the SSH "
+        "client, so it did not cover the deployment's own remote dispatch",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("trace_removed") is True,
+        "the trace carrying envp was not removed from the Master",
+    )
+    evidence = {
+        "argv_observer_strace_version": (observer or {}).get("version", ""),
+        "argv_observer_strace_installed": bool((observer or {}).get("installed")),
+        "argv_observer_limit": (observer or {}).get("limit", 0),
+        "argv_observer_ssh_client": client,
+        "argv_observer_probe_path": delivered.get("path", ""),
+        "argv_observer_fixtures": fixtures.get("fixtures", []),
+        "argv_observer_fixture_errors": fixtures.get("errors", []),
+        "argv_observer_exec_count": verdict.get("exec_count", 0),
+        "argv_observer_execve_count": verdict.get("execve_count", 0),
+        "argv_observer_execveat_count": verdict.get("execveat_count", 0),
+        "argv_observer_ssh_execs": verdict.get("ssh_execs", 0),
+        "argv_observer_secret_found": verdict.get("secret_found"),
+        "argv_observer_truncated": verdict.get("truncated"),
+        "argv_observer_abbreviated": verdict.get("abbreviated"),
+        "argv_observer_trace_bytes": verdict.get("trace_bytes", 0),
+        "argv_observer_trace_removed": verdict.get("trace_removed"),
+        "argv_observer_errors": verdict.get("errors", []),
+    }
+    return evidence
+
+
+DUPLICATE_ADD_STATE_SCRIPT = r"""
+import hashlib, json, sys
+
+state_path, journal_path = sys.argv[1:]
+
+
+def digest(path):
+    try:
+        with open(path, "rb") as stream:
+            return hashlib.sha256(stream.read()).hexdigest()
+    except OSError as error:
+        return "unreadable: " + type(error).__name__
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError) as error:
+        return {"unreadable": type(error).__name__}
+
+
+state = read(state_path)
+journal = read(journal_path)
+print(json.dumps({
+    "state_digest": digest(state_path),
+    "journal_digest": digest(journal_path),
+    "journal_state": journal.get("state"),
+    "journal_node_name": journal.get("node_name"),
+    "state_nodes": sorted(
+        str(node.get("name") or "") for node in (state.get("nodes") or [])
+        if isinstance(node, dict)
+    ),
+    "state_addresses": sorted(
+        str(node.get("address") or "") for node in (state.get("nodes") or [])
+        if isinstance(node, dict)
+    ),
+}, sort_keys=True))
+"""
+
+
+def duplicate_add_state_command() -> str:
+    """The two files a registration owns, read as bytes and as their node list."""
+    arguments = " ".join(shlex.quote(path) for path in (NODE_ADD_STATE, NODE_ADD_JOURNAL))
+    return f"python3 - {arguments} <<'PY'\n{DUPLICATE_ADD_STATE_SCRIPT}\nPY"
+
+
+def panel_inventory(surface: Dict[str, Any]) -> Dict[str, Any]:
+    """The Panel's inventory as a duplicate registration would extend it.
+
+    A second record would add a node, a profile, the hosts that publish its
+    inbounds and possibly an inbound to the managed squad, so those are read by
+    count and by digest. The connection flag is left out on purpose: it belongs to
+    the running node, not to the inventory, and it can change between two reads of
+    a healthy pair.
+    """
+    nodes = surface.get("nodes") or {}
+    profiles = surface.get("profiles") or {}
+    squads = surface.get("squads") or {}
+    hosts = surface.get("hosts") or {}
+    tokens = surface.get("tokens") or {}
+    return {
+        "node_count": nodes.get("count"),
+        "node_names": nodes.get("names"),
+        "node_endpoints": nodes.get("endpoints"),
+        "node_inbound_count": nodes.get("inbound_count"),
+        "node_inbound_digest": nodes.get("inbound_digest"),
+        "profile_count": profiles.get("count"),
+        "profile_inbound_digest": profiles.get("inbound_digest"),
+        "squad_count": squads.get("count"),
+        "squad_inbound_digest": squads.get("mvp_inbound_digest"),
+        "host_count": hosts.get("count"),
+        "host_inbound_digest": hosts.get("inbound_digest"),
+        "host_fingerprints": hosts.get("fingerprints"),
+        "token_count": tokens.get("count"),
+    }
+
+
+def case_duplicate_add(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NEG-14: a second server claiming a registered name is refused before any mutation.
+
+    Two ``node add`` runs look alike and are not. The same name at the same
+    address is the retry of a known identity: the installer keeps that Worker's
+    uuid, its Host records and its country, which is what a failed onboarding is
+    retried with, and refusing it would make the menu's per-node retry
+    impossible. The same name at a *different* address is a second server
+    claiming a name the record already gives to the first — the mistake this
+    case registers, and the one the product refuses from ``state.json`` before
+    it constructs ``GoWaveClient`` or opens an SSH session.
+
+    The order is the assertion. Nothing a registration would rewrite can have
+    moved: the journal the first registration committed, the state file that
+    names the Worker and the Panel inventory that record extends are read before
+    and after the attempt, and a refusal that had reached the client would show
+    up in at least one of them. The second address is pinned first, the way an
+    operator pins a key out of band, so the run is refused for the duplicate
+    name rather than for an unpinned host key — and the pin is taken out again,
+    because a key for an address no container holds would contradict the next
+    case's own pin of that address.
+
+    The command is the operator's own verb with the operator's own arguments --
+    the script the registration ran, given the other address -- rather than a
+    harness copy of the check, so the case cannot pass on a rule the product
+    does not ship.
+    """
+    case_id = DUPLICATE_ADD_CASE_ID
+    host = product.require_worker()
+    master = host.target_name
+    second_address = str(host.plan.second_node_ip)
+    known_hosts_path = "/root/.ssh/known_hosts"
+    before = aio.probe_json(
+        case_id, "the Master's registration record",
+        product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+    )
+    require(
+        case_id,
+        before.get("journal_state") == "NODE_ADD_COMMITTED",
+        f"the recovery journal is {before.get('journal_state')!r} rather than "
+        "NODE_ADD_COMMITTED, so this pair has no completed registration for a "
+        "duplicate to be refused against",
+    )
+    require(
+        case_id,
+        before.get("journal_node_name") == topology.WORKER_NODE_NAME,
+        f"the committed journal names {before.get('journal_node_name')!r} instead of "
+        f"the Worker {topology.WORKER_NODE_NAME!r}",
+    )
+    require(
+        case_id,
+        topology.WORKER_NODE_NAME in (before.get("state_nodes") or []),
+        f"state.json names {before.get('state_nodes')}, and none of them is "
+        f"{topology.WORKER_NODE_NAME!r}, so the duplicate would be refused for the "
+        "wrong reason",
+    )
+    before_inventory = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+    known_hosts_before = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+
+    # Pinned before the attempt so the refusal under test is the name, not a key
+    # the operator never verified; taken out again in the ``finally`` below.
+    pinned = host.pin_worker_address(second_address)
+
+    # The duplicate is not `host.node_add()`: that helper resets the Master-side
+    # argv trace the observer case scans, and this attempt must not touch it.
+    try:
+        attempt = product.podman.exec_bash(
+            master,
+            host.node_add_script(name=topology.WORKER_NODE_NAME, address=second_address),
+            check=False, timeout=DUPLICATE_ADD_TIMEOUT_SECONDS,
+        )
+        output = (attempt.stdout or "") + (attempt.stderr or "")
+        require(
+            case_id,
+            attempt.returncode != 0,
+            f"the second registration of {topology.WORKER_NODE_NAME!r} at "
+            f"{second_address} exited 0, so the duplicate was accepted: "
+            f"{output.strip()[-600:]}",
+        )
+        require(
+            case_id,
+            DUPLICATE_ADD_REFUSAL in output,
+            f"the second registration was refused without naming the existing record "
+            f"({DUPLICATE_ADD_REFUSAL!r}): {output.strip()[-600:]}",
+        )
+        # The record names the address it already holds, so a refusal produced by
+        # anything else — an unpinned key, a bad domain — cannot pass this.
+        require(
+            case_id,
+            str(host.plan.worker_ip) in output,
+            f"the refusal does not name the address the record holds "
+            f"({host.plan.worker_ip}), so it was not the duplicate-name check: "
+            f"{output.strip()[-600:]}",
+        )
+        require(
+            case_id,
+            "Traceback" not in output,
+            f"the second registration crashed instead of being refused: {output.strip()[-600:]}",
+        )
+    finally:
+        product.podman.exec(
+            master,
+            ["bash", "-c", f"umask 077; cat > {shlex.quote(known_hosts_path)}"],
+            input_text=known_hosts_before,
+            timeout=120,
+        )
+    known_hosts_after = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+    known_hosts_restored = known_hosts_after == known_hosts_before
+    require(
+        case_id,
+        known_hosts_restored,
+        "the case's own pin of the second address is still in known_hosts, so the "
+        "next case's pin of that address would be refused as a changed key",
+    )
+
+    after = aio.probe_json(
+        case_id, "the Master's registration record after the duplicate",
+        product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+    )
+    require(
+        case_id,
+        after.get("state_digest") == before.get("state_digest"),
+        "the refused duplicate rewrote state.json: it was "
+        f"{before.get('state_nodes')} and is now {after.get('state_nodes')}",
+    )
+    require(
+        case_id,
+        after.get("journal_digest") == before.get("journal_digest"),
+        f"the refused duplicate rewrote the recovery journal, which was "
+        f"{before.get('journal_state')!r} and is now {after.get('journal_state')!r}",
+    )
+    after_inventory = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+    require(
+        case_id,
+        after_inventory == before_inventory,
+        f"the refused duplicate changed the Panel inventory: it was {before_inventory} "
+        f"and is now {after_inventory}",
+    )
+    return {
+        "refusal": DUPLICATE_ADD_REFUSAL,
+        "returncode": attempt.returncode,
+        "recorded_address": str(host.plan.worker_ip),
+        "second_address": second_address,
+        "address_pinned": pinned,
+        "known_hosts_restored": known_hosts_restored,
+        "journal_state": after.get("journal_state"),
+        "state_nodes": after.get("state_nodes"),
+        "state_addresses": after.get("state_addresses"),
+        "inventory": after_inventory,
+        "state_unchanged": True,
+        "journal_unchanged": True,
+        "inventory_unchanged": True,
+    }
 
 
 def case_master_address(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -3286,12 +5359,12 @@ def case_worker_state(product: MultiNodeProduct) -> Dict[str, Any]:
         f"the Worker binary reports {version!r} while the Panel records "
         f"{versions.get('node')!r}",
     )
-    requested = (os.environ.get("GOWAVE_NODE_VERSION") or "").strip()
+    requested = matrix_data.product(product.matrix).get("node_version", "")
     if requested and requested.lower() != "latest":
         require(
             WORKER_STATE_CASE_ID,
             version_number(version) == version_number(requested),
-            f"the Worker runs {version!r} although this deployment requested {requested!r}",
+            f"the Worker runs {version!r} although this deployment configured {requested!r}",
         )
 
     status_command = facts.get("status") or {}
@@ -3313,6 +5386,12 @@ def case_worker_state(product: MultiNodeProduct) -> Dict[str, Any]:
         WORKER_STATE_CASE_ID,
         bool(panel_xray) and version_number(core) == version_number(panel_xray),
         f"the Worker's core reports {core!r} while the Panel records {panel_xray!r}",
+    )
+    xray_pin = matrix_data.product(product.matrix).get("xray_version", "")
+    require(
+        WORKER_STATE_CASE_ID,
+        output_matches_expected_version(core, xray_pin),
+        f"the Worker's core reports {core!r} while this deployment configured {xray_pin!r}",
     )
     return {
         "worker_version": version,
@@ -3466,7 +5545,6 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
     node applied. The absent configuration is asserted as exactly as the present
     one, so a node that received its neighbour's endpoint fails.
     """
-    product.require_worker()
     identity = vision_identity(product.matrix)
     port = identity["port"]
     target = "127.0.0.1:{};".format(port)
@@ -3493,6 +5571,7 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
         "vision_type": identity["type"],
         "vision_internal_port": port,
     }
+    declared_counts: Dict[str, int] = {}
     for node, name, domain, enabled in planned:
         record = nodes.get(name)
         require(
@@ -3501,6 +5580,7 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
             f"the Panel reports no node {name!r}; observed {sorted(nodes)}",
         )
         specs = [spec for spec in record.get("inbound_specs") or [] if isinstance(spec, dict)]
+        declared_counts[name] = len(specs)
         declared = [spec for spec in specs if vision_matches(spec, identity)]
         digests = [
             digest
@@ -3663,6 +5743,64 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
             f"the {node} applied config carries a Vision inbound although the run did "
             f"not configure one: {describe_inbounds(loaded_vision)}",
         )
+
+    # The other half of the same sentence is the configuration the run was given:
+    # the live runner reads it with the whitelist parser, so this deployment's own
+    # names are written as a document and read back. The two optional fields have
+    # to survive the reader unchanged — a parser that dropped or merged one would
+    # hand preflight a deployment that is not the one the nodes were installed for
+    # — and the endpoint total the parser's answer produces has to be the total the
+    # Panel declares, which is what links the configuration to the cluster.
+    deployment = product.require_worker()
+    document = vision_policy.deployment_document(
+        panel_domain=deployment.panel_domain,
+        reality_domain=deployment.reality_domain,
+        worker_domain=deployment.worker_domain,
+        worker_reality_domain=deployment.worker_reality_domain,
+        master_vision=topology.VISION_DOMAIN if product.vision else None,
+        worker_vision=topology.WORKER_VISION_DOMAIN if product.worker_vision else None,
+    )
+    for node, name, domain, enabled in planned:
+        parsed = (
+            document.master_vision_domain if node == "master"
+            else document.worker_vision_domain
+        )
+        require(
+            VISION_CASE_ID,
+            parsed == (domain if enabled else None),
+            f"the configuration this run was given carries {node} Vision domain {parsed!r}, "
+            f"while {name!r} was installed with {domain if enabled else None!r}",
+        )
+        evidence[f"parsed_{node}_vision"] = str(parsed or "")
+
+    core = len(matrix_data.inbounds(product.matrix, vision=False))
+    parsed_total = (
+        2 * core
+        + int(bool(document.master_vision_domain))
+        + int(bool(document.worker_vision_domain))
+    )
+    require(
+        VISION_CASE_ID,
+        parsed_total == product.expected_inbound_total,
+        f"the configuration produces {parsed_total} endpoints ({core} per node plus "
+        f"{int(bool(document.master_vision_domain))} on the Master and "
+        f"{int(bool(document.worker_vision_domain))} on the Worker), while the matrix "
+        f"owes {product.expected_inbound_total}",
+    )
+    declared_total = sum(count for count in declared_counts.values())
+    require(
+        VISION_CASE_ID,
+        declared_total == parsed_total,
+        f"the Panel declares {declared_total} endpoints across its nodes, while the "
+        f"configuration these nodes were installed from produces {parsed_total}: "
+        f"{declared_counts}",
+    )
+    evidence["endpoint_core_per_node"] = core
+    evidence["parsed_endpoint_total"] = parsed_total
+    evidence["declared_endpoint_total"] = declared_total
+    evidence["declared_inbounds_per_node"] = ",".join(
+        f"{name}={count}" for name, count in sorted(declared_counts.items())
+    )
 
     return evidence
 
@@ -4202,9 +6340,11 @@ def cover_site_links(text: str) -> List[str]:
 
 
 def cover_site_fetch(case_id: str, host: topology.MultiNodeTopology, apex: str,
-                     path: str) -> Dict[str, Any]:
+                     path: str, verify: bool = True) -> Dict[str, Any]:
     """One fetch of the apex from the independent client, or a failure naming it."""
-    report = host.client_http(f"https://{apex}{path}", timeout=COVER_SITE_PROBE_TIMEOUT_SECONDS)
+    report = host.client_http(
+        f"https://{apex}{path}", insecure=not verify, timeout=COVER_SITE_PROBE_TIMEOUT_SECONDS,
+    )
     probe = report.get("probe") or {}
     require(
         case_id,
@@ -4545,9 +6685,10 @@ def require_cover_lineage(case_id: str, label: str, facts: Dict[str, Any],
 
 
 def require_decoy_page(case_id: str, host: topology.MultiNodeTopology, name: str,
-                       index_sha256: str, wanted: Sequence[str]) -> Dict[str, Any]:
+                       index_sha256: str, wanted: Sequence[str],
+                       verify: bool = True) -> Dict[str, Any]:
     """One name answers with the rendered cover page over a lineage naming the pair."""
-    probe = cover_site_fetch(case_id, host, name, "/")
+    probe = cover_site_fetch(case_id, host, name, "/", verify=verify)
     require(
         case_id,
         probe.get("status") == 200,
@@ -4572,6 +6713,69 @@ def require_decoy_page(case_id: str, host: topology.MultiNodeTopology, name: str
         "body_sha256": probe.get("body_sha256"),
         "san": sans,
         "tls_version": (probe.get("peer") or {}).get("tls_version", ""),
+    }
+
+
+def require_decoy_management(
+    case_id: str, host: topology.MultiNodeTopology, names: Sequence[Tuple[str, bool]],
+    not_found_sha256: str,
+) -> Dict[str, Any]:
+    """No management path answers through a name the camouflage listener serves.
+
+    A scanning client asks the decoy for ``/api/`` and the transport paths next,
+    so a route that terminates on the decoy has to answer every one of them with
+    the site's own 404 page. A status alone would pass a bare NGINX error page
+    and a matching body alone would pass a route that served nothing, so both are
+    required together, exactly as the All-in-One decoy case requires them.
+
+    The panel's own name is the control: there the same read reaches the Panel
+    and is refused with 401/403, which is what makes the refusals below mean
+    "this route is the decoy" instead of "nothing answers on this host". A name
+    the stream map does not list is dialled without a name pin, because the
+    fallback lineage cannot name a hostname the product was never configured
+    with; what it proves is where the request lands.
+    """
+    observed: Dict[str, Any] = {}
+    for name, verify in names:
+        paths: Dict[str, Any] = {}
+        for path in aio.DECOY_MANAGEMENT_PATHS:
+            probe = cover_site_fetch(case_id, host, name, path, verify=verify)
+            status = probe.get("status")
+            paths[path] = {"status": status, "sha256": probe.get("body_sha256")}
+            require(
+                case_id,
+                status == 404,
+                f"https://{name}{path} answered {status} instead of being refused, so that "
+                f"route published a management interface "
+                f"({probe.get('error') or 'the probe reported no failure'})",
+            )
+            require(
+                case_id,
+                probe.get("body_sha256") == not_found_sha256,
+                f"https://{name}{path} was refused with a body that is not the cover site's "
+                f"own 404.html ({probe.get('body_sha256')} vs {not_found_sha256}), so the "
+                f"answer came from another listener: {(probe.get('body_snippet') or '')[:200]}",
+            )
+        observed[name] = paths
+
+    panel = cover_site_fetch(case_id, host, host.panel_domain, "/api/nodes")
+    status = panel.get("status")
+    require(
+        case_id,
+        status in (401, 403),
+        f"an anonymous /api/nodes read on the panel name {host.panel_domain} answered {status} "
+        "instead of being refused, so the control that tells the Panel from the decoy is gone",
+    )
+    require(
+        case_id,
+        panel.get("body_sha256") != not_found_sha256,
+        f"the panel name answered /api/nodes with the camouflage site's 404 page, so "
+        f"{host.panel_domain} is served by the decoy rather than by the Panel",
+    )
+    return {
+        "names": observed,
+        "panel_anonymous_api_status": status,
+        "panel_anonymous_api_sha256": panel.get("body_sha256"),
     }
 
 
@@ -4627,7 +6831,12 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
     refuses connections from both client networks while 443 answers them; and
     the certificate a client receives for the apex, its www and the REALITY name
     is the installed lineage that names the pair, so the camouflage is what a
-    scanning client sees rather than an Xray fingerprint.
+    scanning client sees rather than an Xray fingerprint. A fourth claim is what
+    the scanner asks next: no name that terminates on the decoy answers a
+    management path, so the cover apex, its www, the REALITY name without
+    REALITY authentication and an SNI the stream map does not list each answer
+    every management path with the site's own 404 page, while the panel's own
+    name refuses the same read with 401/403.
 
     The role that decides no apex (its own resolution puts the pair elsewhere)
     owes no cover route at all, so the case reads each role's own decision
@@ -4696,20 +6905,40 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
         "the Master could not read its rendered cover site: "
         f"{(rendered.stderr or '').strip()[-500:]}",
     )
-    index_sha256 = (parse_cover_site(rendered.stdout or "")["files"].get("index.html") or {}).get(
-        "sha256", "")
+    rendered_site = parse_cover_site(rendered.stdout or "")
+    index_sha256 = (rendered_site["files"].get("index.html") or {}).get("sha256", "")
     require(
         case_id,
         index_sha256,
         f"the Master rendered no index.html for {apex}, so there is no page the decoy "
         "could be serving",
     )
+    not_found_sha256 = (rendered_site["files"].get("404.html") or {}).get("sha256", "")
+    require(
+        case_id,
+        not_found_sha256,
+        f"the Master rendered no 404.html for {apex}, so a refusal on the decoy could not be "
+        "told apart from a server default",
+    )
+    require(
+        case_id,
+        not_found_sha256 != index_sha256,
+        "the cover site's 404.html and its index.html are the same document, so a management "
+        "path answered with the front page would read as a refusal",
+    )
     wanted = [apex, f"www.{apex}"]
+    unmapped = topology.PROBE_UNMAPPED_SNI
     evidence["client"] = {
         "apex": require_decoy_page(case_id, host, apex, index_sha256, wanted),
         "www": require_decoy_page(case_id, host, f"www.{apex}", index_sha256, wanted),
         "reality": require_decoy_page(
             case_id, host, host.reality_domain, index_sha256, wanted,
+        ),
+        # The fallback lineage cannot name a hostname the product was never
+        # configured with, so this route is read without a name pin: what it
+        # proves is where an unlisted SNI lands, which is the decoy.
+        "unmapped": require_decoy_page(
+            case_id, host, unmapped, index_sha256, [], verify=False,
         ),
     }
     panel = cover_site_fetch(case_id, host, host.panel_domain, "/")
@@ -4724,6 +6953,22 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
         "body_sha256": panel.get("body_sha256"),
     }
 
+    # The routes above serve the site; the question a scanner asks next is
+    # whether the same names will answer for the deployment's own management
+    # paths. The cover names, the REALITY name without REALITY authentication
+    # and an SNI the stream map does not list are exactly the four ways into the
+    # camouflage listener, and none of them may answer one.
+    evidence["management"] = require_decoy_management(
+        case_id, host,
+        (
+            (apex, True),
+            (f"www.{apex}", True),
+            (host.reality_domain, True),
+            (unmapped, False),
+        ),
+        not_found_sha256,
+    )
+
     # Both client networks attempt the real TCP path: 443 has to answer from each
     # of them, because a decoy that is unreachable only where nothing is
     # reachable would prove nothing.
@@ -4734,6 +6979,56 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
             ("client", host.client_name), ("untrusted", host.untrusted_name),
         )
     }
+    return evidence
+
+
+def case_vision_route(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-04 on a cluster: each node's own contour, or its own absence.
+
+    The delegated name is provisioned per node, so the same contract is asked of
+    each host separately and against its own name: a cluster where the Master
+    carries the contour and the Worker does not is a legitimate deployment, and
+    reading only the Master would call it complete. The two answers are recorded
+    under the node they belong to, because flattening them would let the Worker's
+    absence satisfy the Master's route and vice versa.
+
+    Both nodes are asked through the operator's own host, and the traffic legs
+    leave from the Control Machine, which resolves each node's name to that
+    node's address: a Worker contour proven from the Master's address would be
+    evidence about the wrong host.
+    """
+    host = product.require_worker()
+    master = aio.vision_route_contract(
+        aio.VISION_ROUTE_CASE_ID, "the Master", topology.VISION_DOMAIN, bool(product.vision),
+        lambda script: product.podman.exec_bash(
+            host.target_name, script, check=False,
+            timeout=aio.VISION_CONTOUR_TIMEOUT_SECONDS * 2,
+        ),
+        host.client_http,
+    )
+    worker = aio.vision_route_contract(
+        aio.VISION_ROUTE_CASE_ID, "the Worker", topology.WORKER_VISION_DOMAIN,
+        bool(product.worker_vision),
+        lambda script: product.podman.exec_bash(
+            host.worker_name, script, check=False,
+            timeout=aio.VISION_CONTOUR_TIMEOUT_SECONDS * 2,
+        ),
+        host.client_http,
+    )
+    evidence = {"master": master, "worker": worker}
+    # The route is one layer of the same endpoint: the Panel's node records, the
+    # hosts published for them and the matrix's own case count have to describe
+    # the combination the two contours above were just asked about.
+    evidence.update(vision_policy.endpoint_contract(
+        aio.VISION_ROUTE_CASE_ID,
+        product.cluster_facts(aio.VISION_ROUTE_CASE_ID),
+        (
+            ("master", LOCAL_NODE_NAME, product.master_inbound_count),
+            ("worker", topology.WORKER_NODE_NAME, product.worker_inbound_count),
+        ),
+        len(matrix_data.clients(product.matrix)),
+        product.positive_case_count,
+    ))
     return evidence
 
 
@@ -5095,6 +7390,1602 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
         "server_lines": (decoy.stdout or "").splitlines(),
         "certificate": certificate,
     }
+    return evidence
+
+
+# ------------------------------------------------- VIS-06: incomplete compensation
+# The resolver is asked from the Master, because that is the host whose own
+# `node add` precondition and whose certbot both read it: an answer observed
+# anywhere else would not be the one the failing stage sees.
+NAME_RESOLUTION_SCRIPT = r"""
+import json, socket, sys
+
+
+def answer(name):
+    try:
+        return sorted({item[4][0] for item in socket.getaddrinfo(name, None)})
+    except OSError as error:
+        return [type(error).__name__]
+
+
+names = sys.argv[1:]
+print(json.dumps({name: answer(name) for name in names}, sort_keys=True))
+"""
+
+# Detached, so the dispatch below is the product's own command with no wrapper
+# around it. It writes the journal the way the product does -- a synced sibling
+# renamed over the file -- and only ever removes the ledger, so what the product
+# then refuses to do is refused because its own record is incomplete.
+LEDGER_WATCH_SCRIPT = r"""
+import json, os, sys, time
+
+path, seconds = sys.argv[1], float(sys.argv[2])
+deadline = time.monotonic() + seconds
+
+
+def rewrite(data):
+    temporary = path + ".e2e"
+    handle = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory = os.open(os.path.dirname(path), os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+while time.monotonic() < deadline:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        time.sleep(0.05)
+        continue
+    if data.get("op") == "node_add" and data.get("state") == "NODE_ADD_VERIFYING":
+        if not data.get("entities"):
+            print("the ledger was already empty at NODE_ADD_VERIFYING", flush=True)
+            raise SystemExit(1)
+        data["entities"] = {}
+        rewrite(data)
+        print("emptied the ledger for " + str(data.get("node_name")), flush=True)
+        raise SystemExit(0)
+    time.sleep(0.05)
+print("the journal never reached NODE_ADD_VERIFYING", file=sys.stderr, flush=True)
+raise SystemExit(2)
+"""
+
+JOURNAL_FACTS_SCRIPT = r"""
+import json, os, sys
+
+journal_path, state_path, watch_log = sys.argv[1:]
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError) as error:
+        return {"unreadable": type(error).__name__}
+
+
+journal = read_json(journal_path)
+state = read_json(state_path)
+try:
+    with open(watch_log, encoding="utf-8") as stream:
+        watcher = stream.read().strip()
+except OSError as error:
+    watcher = "unreadable: " + type(error).__name__
+print(json.dumps({
+    "journal": journal,
+    "journal_present": os.path.isfile(journal_path),
+    "state_nodes": [
+        str(node.get("name") or "") for node in (state.get("nodes") or [])
+        if isinstance(node, dict)
+    ],
+    "watcher_log": watcher[-800:],
+}, sort_keys=True))
+"""
+
+# What the compensation left on the Worker itself. Recorded rather than asserted:
+# the scenario is about the report, and a rollback that removed exactly what the
+# failed transaction created is VIS-05's subject, not this one's.
+WORKER_AFTERMATH_SCRIPT = r"""
+printf 'service=%s\n' "$(systemctl is-active gowave-node.service 2>/dev/null || true)"
+printf 'install_root=%s\n' "$([ -d /opt/gowave-node ] && echo present || echo absent)"
+printf 'acme_vhost=%s\n' "$([ -f /etc/nginx/conf.d/00-worker-acme-challenge.conf ] && echo present || echo absent)"
+printf 'worker_vhost=%s\n' "$([ -f /etc/nginx/conf.d/gowave-worker-https.conf ] && echo present || echo absent)"
+printf 'stream_map=%s\n' "$([ -f /etc/nginx/stream-enabled/gowave-worker-stream.conf ] && echo present || echo absent)"
+printf 'nginx_test=%s\n' "$(nginx -t >/dev/null 2>&1 && echo 0 || echo 1)"
+"""
+
+
+def second_node_address_script(address: str) -> str:
+    """Give the Worker a second address of its own, and report what it holds.
+
+    The Panel refuses two node records with one address, so the second record
+    reaches the Worker through an alias on the interface that already carries it.
+    The prefix length is read from that interface rather than assumed, and the
+    address is printed back from the kernel: a write that never landed would
+    otherwise surface as the product's own "connection refused" much later.
+
+    The ``read`` line ends its fields with a newline on purpose: bash's ``read``
+    returns 1 at EOF without a delimiter, and under ``set -e`` that would end the
+    script with the variables already assigned and no message at all.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        "read -r dev cidr < <(ip -4 -o addr show scope global | awk 'NR==1{printf \"%s %s\\n\", $2, $4}')\n"
+        f"ip addr add '{address}'/\"${{cidr#*/}}\" dev \"$dev\"\n"
+        "ip -4 -o addr show dev \"$dev\"\n"
+    )
+
+
+def second_worker_add_script(host: topology.MultiNodeTopology) -> str:
+    """The operator's own ``node add``, addressed to a second node on the Worker."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
+        f"--vision-domain '{SECOND_WORKER_VISION_DOMAIN}' "
+        f"'{SECOND_WORKER_NODE_NAME}' '{host.plan.second_node_ip}' "
+        f"'{SECOND_WORKER_DOMAIN}' '{SECOND_WORKER_REALITY_DOMAIN}'"
+    )
+
+
+def ledger_watch_start_script() -> str:
+    """Install the journal watcher on the Master and leave it running detached."""
+    return (
+        f"cat > {LEDGER_WATCH_PATH} <<'PY'\n{LEDGER_WATCH_SCRIPT}\nPY\n"
+        f"chmod 0600 {LEDGER_WATCH_PATH}\n"
+        f"rm -f {LEDGER_WATCH_LOG}\n"
+        f"setsid python3 {LEDGER_WATCH_PATH} {NODE_ADD_JOURNAL} {LEDGER_WATCH_SECONDS} "
+        f"</dev/null >{LEDGER_WATCH_LOG} 2>&1 &\n"
+        'printf \'watcher_pid=%s\\n\' "$!"\n'
+    )
+
+
+def journal_facts_command() -> str:
+    """Read the transaction's own record, the state file, and the watcher's log."""
+    arguments = " ".join(
+        shlex.quote(path) for path in (NODE_ADD_JOURNAL, NODE_ADD_STATE, LEDGER_WATCH_LOG)
+    )
+    return f"python3 - {arguments} <<'PY'\n{JOURNAL_FACTS_SCRIPT}\nPY"
+
+
+def name_resolution_command() -> str:
+    arguments = " ".join(
+        shlex.quote(name) for name in (
+            SECOND_WORKER_DOMAIN, SECOND_WORKER_REALITY_DOMAIN, SECOND_WORKER_VISION_DOMAIN,
+        )
+    )
+    return f"python3 - {arguments} <<'PY'\n{NAME_RESOLUTION_SCRIPT}\nPY"
+
+
+def case_vision_incomplete_compensation(product: MultiNodeProduct) -> Dict[str, Any]:
+    """VIS-06: a compensation that could not finish is reported, not called clean.
+
+    Two faults are injected, and neither is in the code under test. The first is
+    the product's own failure path: a second Worker provisioning asks for a
+    Vision name the fixture resolver answers with NXDOMAIN, so the stage that
+    runs last fails after that node's own and REALITY lineages exist. The second
+    damages the record the compensation reads: a detached watcher on the Master
+    empties the transaction's action ledger once it reaches
+    ``NODE_ADD_VERIFYING``, so ``rollback_provisioning`` cannot enumerate what
+    the transaction created and refuses to delete anything.
+
+    The second record needs an address of its own, because the Panel holds one
+    node per address: the case adds an alias to the Worker's interface and pins
+    the Worker's existing host key under it, so both records reach the same host
+    over the same key.
+
+    What is asserted is the reporting, in the order the scenario states it: the
+    remote failure that starts compensation is named, both rollback results are
+    printed -- the remote one as success, the API one as refused -- the refusal
+    is not suppressed, the aggregate line says the rollback failed and the
+    journal was retained, the success line is absent, the retained journal
+    records ``NODE_ADD_ROLLBACK_REQUIRED`` with that refusal as its reason, and
+    the Panel still holds the node whose cleanup was refused, which is what makes
+    the incomplete claim true rather than cautious.
+
+    Not exercised: the branch where the *remote* rollback is the one that fails.
+    Faulting SSH between the dispatch and its compensation is not a seam this
+    contour has, so the case proves the aggregate line over one failing result
+    and names the other as succeeded.
+    """
+    case_id = VIS_COMPENSATION_CASE_ID
+    host = product.require_worker()
+    master = host.target_name
+    node_address = host.plan.second_node_ip
+    evidence = {
+        "node_name": SECOND_WORKER_NODE_NAME,
+        "node_address": str(node_address),
+        "worker_ip": str(host.plan.worker_ip),
+        "worker_domain": SECOND_WORKER_DOMAIN,
+        "worker_reality_domain": SECOND_WORKER_REALITY_DOMAIN,
+        "vision_domain": SECOND_WORKER_VISION_DOMAIN,
+    }
+
+    # The Panel keys a node by its address, so the second record needs an address
+    # the first one does not already hold. It is an alias on the Worker's own
+    # interface: one host, two records, and the key the operator pinned is the
+    # same key under both addresses.
+    addressed = product.podman.exec_bash(
+        host.worker_name, second_node_address_script(node_address), check=False, timeout=120,
+    )
+    require(
+        case_id,
+        addressed.returncode == 0 and node_address in (addressed.stdout or ""),
+        f"the Worker does not hold the second address {node_address} the Panel record "
+        f"needs (exit {addressed.returncode}): "
+        f"{(addressed.stderr or addressed.stdout or '').strip()[-600:]}",
+    )
+    evidence["address_pinned"] = host.pin_worker_address(node_address)
+
+    # The second node's own names answer with that address, so the bootstrap
+    # vhost this transaction creates can validate them; the Vision name has no
+    # record, so the stage that is supposed to fail cannot succeed.
+    zone = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
+    records = zone.setdefault("records", {})
+    records[SECOND_WORKER_DOMAIN] = {"A": [str(node_address)]}
+    records[SECOND_WORKER_REALITY_DOMAIN] = {"A": [str(node_address)]}
+    records.pop(SECOND_WORKER_VISION_DOMAIN, None)
+    host.write_dns_zone(zone)
+
+    resolution = aio.probe_json(
+        case_id, "the Master's answer for the second node's names",
+        product.podman.exec_bash(master, name_resolution_command(), check=False, timeout=120),
+    )
+    evidence["resolved"] = resolution
+    require(
+        case_id,
+        str(node_address) in (resolution.get(SECOND_WORKER_DOMAIN) or []),
+        f"the Worker's own name {SECOND_WORKER_DOMAIN} does not answer with "
+        f"{node_address}: {resolution.get(SECOND_WORKER_DOMAIN)!r}",
+    )
+    require(
+        case_id,
+        str(node_address) not in (resolution.get(SECOND_WORKER_VISION_DOMAIN) or []),
+        f"the Vision name {SECOND_WORKER_VISION_DOMAIN} answers with the Worker address, "
+        "so the stage this case needs to fail would have validated",
+    )
+
+    started = product.podman.exec_bash(
+        master, ledger_watch_start_script(), check=False, timeout=120,
+    )
+    require(
+        case_id,
+        started.returncode == 0 and "watcher_pid=" in (started.stdout or ""),
+        f"the ledger watcher could not be started on the Master "
+        f"(exit {started.returncode}): {(started.stderr or started.stdout or '').strip()[-600:]}",
+    )
+    evidence["watcher_start"] = (started.stdout or "").strip()
+
+    command = second_worker_add_script(host)
+    started_at = time.monotonic()
+    attempt = product.podman.exec_bash(
+        master, command, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+    )
+    elapsed = time.monotonic() - started_at
+    stdout, stderr = attempt.stdout or "", attempt.stderr or ""
+    output = stdout + "\n" + stderr
+    product.context.evidence_text("mn-node-add-vision-incomplete.stdout.log", stdout)
+    product.context.evidence_text("mn-node-add-vision-incomplete.stderr.log", stderr)
+    evidence["command"] = command.strip()
+    evidence["attempt_returncode"] = attempt.returncode
+    evidence["attempt_seconds"] = round(elapsed, 1)
+
+    require(
+        case_id,
+        attempt.returncode != 0,
+        f"the second Worker provisioning exited 0, so there was no failure to "
+        f"compensate:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        VISION_STAGE_LINE in output,
+        f"the failure never reached the Vision certificate stage on the Worker, so this "
+        f"case observed a different failure:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        REMOTE_FAILURE_LINE in output,
+        f"the operator did not report the remote failure that starts compensation:\n"
+        f"{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        LEDGER_REFUSAL in output,
+        f"the API rollback's own refusal is missing from the report, so the reason the "
+        f"compensation could not complete was suppressed:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        API_CRITICAL in output,
+        f"the incomplete API rollback was not reported as a CRITICAL result:\n"
+        f"{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        REMOTE_CRITICAL not in output,
+        "the compensating rollback reports the Worker host as failed as well, so this run "
+        f"cannot attribute the incomplete result to the API side:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        AGGREGATE_CRITICAL in output,
+        f"the aggregate result of both rollbacks was not reported, so a failed "
+        f"compensation would read as a clean one:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        SUCCESS_LINE not in output,
+        f"the product reports the Worker as added and deployed after a compensation that "
+        f"did not complete:\n{output.strip()[-1500:]}",
+    )
+
+    facts = aio.probe_json(
+        case_id, "the Master's recovery journal and installation state",
+        product.podman.exec_bash(master, journal_facts_command(), check=False, timeout=120),
+    )
+    journal = facts.get("journal") or {}
+    evidence["journal"] = {
+        "state": journal.get("state"),
+        "op": journal.get("op"),
+        "transaction_id": journal.get("transaction_id"),
+        "node_name": journal.get("node_name"),
+        "rollback_error": journal.get("rollback_error"),
+        "entities": journal.get("entities"),
+        "present": facts.get("journal_present"),
+    }
+    evidence["state_nodes"] = facts.get("state_nodes")
+    evidence["watcher_log"] = facts.get("watcher_log")
+    require(
+        case_id,
+        facts.get("journal_present") is True,
+        "the recovery journal was removed, so the incomplete transaction is not retained "
+        f"for an operator: {facts.get('journal')!r}",
+    )
+    require(
+        case_id,
+        journal.get("state") == "NODE_ADD_ROLLBACK_REQUIRED",
+        f"the retained journal records {journal.get('state')!r} instead of "
+        "NODE_ADD_ROLLBACK_REQUIRED, so the run's status was not recorded as incomplete",
+    )
+    require(
+        case_id,
+        journal.get("rollback_error") == LEDGER_REFUSAL,
+        f"the retained journal does not carry the refusal as its reason: "
+        f"{journal.get('rollback_error')!r}",
+    )
+    require(
+        case_id,
+        journal.get("node_name") == SECOND_WORKER_NODE_NAME,
+        f"the retained journal names {journal.get('node_name')!r} instead of "
+        f"{SECOND_WORKER_NODE_NAME!r}",
+    )
+    require(
+        case_id,
+        not journal.get("entities"),
+        "the ledger the watcher emptied is back in the journal, so the refusal this case "
+        f"observes was produced by something else: {journal.get('entities')!r}",
+    )
+
+    cluster = product.cluster_facts(case_id)
+    nodes = (cluster.get("nodes") or {}).get("records") or []
+    node = panel_node(cluster, SECOND_WORKER_NODE_NAME, case_id)
+    names = sorted(str(record.get("name") or "") for record in nodes)
+    require(
+        case_id,
+        len(nodes) == 3,
+        f"the Panel lists {len(nodes)} nodes ({names}) instead of the Master, the Worker "
+        "and the node whose cleanup was refused",
+    )
+    require(
+        case_id,
+        (node.get("address"), node.get("port")) == (str(node_address), NODE_PORT),
+        f"the Panel lists {SECOND_WORKER_NODE_NAME} at {node.get('address')!r}:"
+        f"{node.get('port')!r} instead of {node_address}:{NODE_PORT}",
+    )
+    hosts = [
+        record for record in (cluster.get("hosts") or {}).get("records") or []
+        if str(record.get("address") or "") in (SECOND_WORKER_DOMAIN, SECOND_WORKER_REALITY_DOMAIN)
+    ]
+    evidence["panel"] = {
+        "nodes": names,
+        "node_address": node.get("address"),
+        "node_connected": node.get("connected"),
+        "hosts": [
+            {"address": record.get("address"), "sni": record.get("sni")} for record in hosts
+        ],
+    }
+
+    aftermath = product.podman.exec_bash(
+        host.worker_name, WORKER_AFTERMATH_SCRIPT, check=False, timeout=120,
+    )
+    evidence["worker_aftermath"] = parse_key_value_fields(worker_aftermath_text(aftermath))
+    return evidence
+
+
+def worker_aftermath_text(result: Any) -> str:
+    """The Worker probe's own lines; a probe that could not run says so."""
+    if result.returncode != 0:
+        return "probe=failed\n" + str(result.stderr or result.stdout or "").strip()[-400:]
+    return result.stdout or ""
+
+
+def backup_script(type_name: str) -> str:
+    """The operator's own backup command for one archive type."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh backup "
+        f"--type {shlex.quote(type_name)}\n"
+    )
+
+
+def backup_verify_script(archive: str, type_name: str) -> str:
+    """The product's own validator, run against the archive it just wrote."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/assets/backup/gowave-backup.sh verify "
+        f"{shlex.quote(archive)} {shlex.quote(type_name)}\n"
+    )
+
+
+def backup_volume_probe_script() -> str:
+    """Inside one role: what the archive directory is, and whether it is a volume.
+
+    The root filesystem is read beside it, because a directory that is merely part
+    of the container layer would report the same filesystem type and would vanish
+    with the container — the archive store has to be a mount of its own.
+    """
+    store = topology.BACKUP_STORE
+    return (
+        "set -u\n"
+        f"target=$(stat -f -c '%T' {store} 2>/dev/null || echo missing)\n"
+        "root=$(stat -f -c '%T' / 2>/dev/null || echo missing)\n"
+        f"owner=$(stat -c '%U' {store} 2>/dev/null || echo missing)\n"
+        f"mode=$(stat -c '%a' {store} 2>/dev/null || echo missing)\n"
+        f"mounts=$(grep -c ' {store} ' /proc/self/mounts 2>/dev/null || true)\n"
+        "printf 'target_type=%s root_type=%s owner=%s mode=%s mounts=%s\\n' "
+        '"${target}" "${root}" "${owner}" "${mode}" "${mounts:-0}"\n'
+    )
+
+
+def require_backup_volume(
+    case_id: str, label: str, facts: Dict[str, str],
+) -> None:
+    """The archive store is a root-only mount of its own, not part of the image."""
+    require(
+        case_id,
+        facts.get("target_type") not in ("", "missing", None)
+        and facts.get("target_type") != facts.get("root_type"),
+        f"{label}: the archive store reports filesystem {facts.get('target_type')!r} "
+        f"while the root is {facts.get('root_type')!r}, so the archives sit in the "
+        "container layer rather than on a volume of their own",
+    )
+    require(
+        case_id,
+        facts.get("owner") == "root",
+        f"{label}: the archive store is owned by {facts.get('owner')!r}, so an "
+        "unencrypted archive would be readable by another user",
+    )
+    require(
+        case_id,
+        facts.get("mode") == BACKUP_VOLUME_DIRECTORY_MODE,
+        f"{label}: the archive store is mode {facts.get('mode')!r} instead of "
+        f"{BACKUP_VOLUME_DIRECTORY_MODE}, so an unencrypted archive would be "
+        "readable by another user",
+    )
+    require(
+        case_id,
+        facts.get("mounts") == "1",
+        f"{label}: the archive store has {facts.get('mounts')!r} mount entries "
+        "instead of exactly one, so it is not the single run-owned volume",
+    )
+
+
+def artifact_leaks(directory: Path, archive_names: Sequence[str]) -> Dict[str, Any]:
+    """What an artifact tree holds, scanned by shape rather than by name.
+
+    The archives are secret-bearing, so the check is on what they *are*: a gzip
+    stream, a file named after an archive, or a line a probe would only write if it
+    printed a value. Everything here is a fact about the tree, never content.
+    """
+    files = [path for path in directory.rglob("*") if path.is_file()]
+    gzip_files: List[str] = []
+    named: List[str] = []
+    markers: List[str] = []
+    suffixes: List[str] = []
+    for path in files:
+        relative = str(path.relative_to(directory))
+        if any(name and name in path.name for name in archive_names):
+            named.append(relative)
+        if path.name.endswith(ARTIFACT_ARCHIVE_SUFFIXES):
+            suffixes.append(relative)
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        if content[:2] == b"\x1f\x8b":
+            gzip_files.append(relative)
+        for marker in ARTIFACT_FORBIDDEN_MARKERS:
+            if marker.encode("utf-8") in content:
+                markers.append(f"{relative}:{marker}")
+    return {
+        "files": len(files),
+        "gzip_files": sorted(gzip_files),
+        "archive_names": sorted(named),
+        "archive_suffixes": sorted(suffixes),
+        "secret_markers": sorted(markers),
+    }
+
+
+def case_backup_volume(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-BACKUP-VOL: the archives live on a run-owned volume no artifact can reach.
+
+    Both archives are unencrypted copies of a role's credentials and lineage, so
+    where they are written is part of the format's contract: the store is a mount
+    of its own, root-only, named after this run, removed by the same label the
+    cleanup uses — and nothing in the artifact tree is an archive, a gzip stream,
+    or a line carrying a value the archive protects.
+    """
+    case_id = BACKUP_VOLUME_CASE_ID
+    host = product.require_worker()
+    volumes = getattr(host, "backup_volumes", None) or {}
+    require(
+        case_id,
+        {"master", "worker"} <= set(volumes),
+        f"the roles do not each carry an archive volume: {sorted(volumes)}",
+    )
+    run_suffix = str(product.podman.context.run_id).rsplit("-", 1)[-1]
+    owned = product.podman.labelled_volumes()
+    artifacts = Path(product.podman.context.artifact_dir)
+    evidence: Dict[str, Any] = {"roles": {}}
+    archive_names: List[str] = []
+
+    for role, container, label, type_name in (
+        ("master", host.target_name, "the Master", "panel"),
+        ("worker", host.worker_name, "the Worker", "node"),
+    ):
+        name = str(volumes[role].get("name") or "")
+        mountpoint = Path(str(volumes[role].get("mountpoint") or ""))
+        require(
+            case_id,
+            name and run_suffix in name,
+            f"{label}'s archive volume is named {name!r}, so it is not scoped to this run",
+        )
+        require(
+            case_id,
+            name in owned,
+            f"{label}'s archive volume {name!r} does not carry this run's cleanup "
+            f"label, so cleanup would leave it behind ({sorted(owned)})",
+        )
+        require(
+            case_id,
+            mountpoint.is_dir(),
+            f"{label}'s archive volume {name!r} has no directory at {mountpoint}",
+        )
+        require(
+            case_id,
+            stat.S_IMODE(mountpoint.stat().st_mode) == 0o700,
+            f"{label}'s archive volume {name!r} is mode "
+            f"{oct(stat.S_IMODE(mountpoint.stat().st_mode))} on the host, so it is "
+            "not root-only",
+        )
+
+        probed = product.podman.exec_bash(
+            container, backup_volume_probe_script(), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            probed.returncode == 0,
+            f"{label} could not describe its archive store: "
+            f"{(probed.stderr or probed.stdout or '').strip()[-400:]}",
+        )
+        facts = parse_key_value_fields(probed.stdout or "")
+        require_backup_volume(case_id, label, facts)
+
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False,
+            timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"{label} could not write a {type_name} archive into its volume: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            archive.startswith(topology.BACKUP_STORE.rstrip("/") + "/"),
+            f"{label}'s {type_name} archive is at {archive!r}, which is not inside "
+            f"the archive store {topology.BACKUP_STORE}",
+        )
+        stored = mountpoint / Path(archive).name
+        require(
+            case_id,
+            stored.is_file(),
+            f"{label}'s {type_name} archive {Path(archive).name} is not on the host "
+            f"volume at {stored}",
+        )
+        require(
+            case_id,
+            stat.S_IMODE(stored.stat().st_mode) == 0o600,
+            f"{label}'s {type_name} archive is mode "
+            f"{oct(stat.S_IMODE(stored.stat().st_mode))} instead of 0o600",
+        )
+        archive_names.append(Path(archive).name)
+        evidence["roles"][role] = {
+            "volume": name,
+            "volume_mode": "0o700",
+            "filesystem": facts.get("target_type"),
+            "root_filesystem": facts.get("root_type"),
+            "owner": facts.get("owner"),
+            "directory_mode": facts.get("mode"),
+            "archive": archive,
+            "archive_mode": "0o600",
+            "archive_on_volume": True,
+        }
+
+    leaks = artifact_leaks(artifacts, archive_names)
+    require(
+        case_id,
+        not leaks["gzip_files"],
+        f"the artifact tree holds gzip files, so an archive reached it: {leaks['gzip_files']}",
+    )
+    require(
+        case_id,
+        not leaks["archive_names"] and not leaks["archive_suffixes"],
+        f"the artifact tree holds an archive by name: {leaks['archive_names'] + leaks['archive_suffixes']}",
+    )
+    require(
+        case_id,
+        not leaks["secret_markers"],
+        "the artifact tree holds a line a probe would only write by printing a "
+        f"protected value: {leaks['secret_markers']}",
+    )
+    evidence["artifacts"] = leaks
+    evidence["cleanup"] = {"labelled_volumes": sorted(owned)}
+    return evidence
+
+
+def master_state_probe_script() -> str:
+    """What a refused restore must leave exactly as it found it.
+
+    The service, its NGINX in front of it, the two files a panel archive replaces
+    and the count of recovery snapshots: a restore that rejects its input before
+    preflight changes none of them, and one that half-applies an archive changes
+    at least one.
+    """
+    return (
+        "set -u\n"
+        "unit=$(systemctl is-active gowave.service 2>/dev/null || true)\n"
+        "nginx=$(systemctl is-active nginx 2>/dev/null || true)\n"
+        "env=$(sha256sum /opt/gowave/.env 2>/dev/null | cut -d' ' -f1 || true)\n"
+        "db=$(sha256sum /opt/gowave/gowave.db 2>/dev/null | cut -d' ' -f1 || true)\n"
+        "snapshots=$(find /var/lib/gowave-auto-nginx/recovery -maxdepth 1 -name 'restore-*' "
+        "2>/dev/null | wc -l)\n"
+        "printf 'unit=%s nginx=%s env=%s db=%s snapshots=%s\\n' "
+        '"${unit}" "${nginx}" "${env}" "${db}" "${snapshots}"\n'
+    )
+
+
+def restore_command(archive: str, type_name: str) -> str:
+    """The operator's own restore verb, on an archive the case chose."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh restore "
+        f"{shlex.quote(archive)} --type {shlex.quote(type_name)}\n"
+    )
+
+
+def rewrite_archive(
+    source: Path,
+    target: Path,
+    drop: Sequence[str] = (),
+    replace: Optional[Dict[str, bytes]] = None,
+    manifest_drop: Sequence[str] = (),
+    rehash: Sequence[str] = (),
+) -> Path:
+    """Copy a real archive while breaking exactly one thing about it.
+
+    Members keep their type, mode and link target, so the only difference the
+    validator can see is the one the case asked for: a removed member, a rewritten
+    payload under an unchanged checksum, or a manifest that no longer declares it.
+    ``rehash`` is the other direction — the payload is rewritten and the manifest
+    is made to agree with it, which leaves the corruption for whatever reads the
+    content instead of the container.
+    """
+    replaced = dict(replace or {})
+    dropped = set(drop)
+    with tarfile.open(source, "r:gz") as src:
+        members = src.getmembers()
+        payloads = {
+            member.name: (src.extractfile(member).read() if member.isreg() else None)
+            for member in members
+        }
+    manifest_name = next(
+        (name for name in payloads if name in ("meta.json", "./meta.json")), "",
+    )
+    if not manifest_name:
+        raise AssertionError(f"{source} carries no manifest to rewrite")
+    manifest = json.loads((payloads[manifest_name] or b"{}").decode("utf-8"))
+    if manifest_drop:
+        manifest["files"] = [
+            entry for entry in manifest.get("files") or []
+            if entry.get("path") not in set(manifest_drop)
+        ]
+    for entry in manifest.get("files") or []:
+        path = entry.get("path")
+        if path not in set(rehash):
+            continue
+        payload = replaced.get(f"files/{path}")
+        if payload is None:
+            raise AssertionError(f"{path} is asked to be rehashed without being replaced")
+        entry["sha256"] = hashlib.sha256(payload).hexdigest()
+    with tarfile.open(target, "w:gz") as dst:
+        for member in members:
+            clean = member.name[2:] if member.name.startswith("./") else member.name
+            if clean in dropped or clean == "meta.json":
+                continue
+            data = payloads[member.name]
+            if member.isreg() and clean in replaced:
+                data = replaced[clean]
+            info = copy.copy(member)
+            if data is not None:
+                info.size = len(data)
+            dst.addfile(info, io.BytesIO(data) if data is not None else None)
+        blob = json.dumps(manifest).encode("utf-8")
+        info = tarfile.TarInfo(manifest_name)
+        info.size = len(blob)
+        info.mode = 0o600
+        dst.addfile(info, io.BytesIO(blob))
+    target.chmod(0o600)
+    return target
+
+
+def rejected_archives(
+    store: Path, panel: str, worker_store: Path, node: str,
+) -> Dict[str, Path]:
+    """One broken archive per promise of the format, all written beside the real one."""
+    panel_source = store / Path(panel).name
+    node_source = worker_store / Path(node).name
+    created: Dict[str, Path] = {}
+
+    truncated = store / "rejected-truncated.tar.gz"
+    content = panel_source.read_bytes()
+    truncated.write_bytes(content[: max(1, len(content) // 3)])
+    truncated.chmod(0o600)
+    created["truncated"] = truncated
+
+    garbage = store / "rejected-garbage.tar.gz"
+    garbage.write_bytes(b"not a Format v1 archive\n")
+    garbage.chmod(0o600)
+    created["garbage"] = garbage
+
+    created["checksum"] = rewrite_archive(
+        panel_source, store / "rejected-checksum.tar.gz",
+        replace={"files/opt/gowave/.env": b"APP_SECRET=replaced-by-the-case\n"},
+    )
+    created["incomplete"] = rewrite_archive(
+        panel_source, store / "rejected-incomplete.tar.gz",
+        drop=("files/opt/gowave/.env",),
+    )
+    created["no-database"] = rewrite_archive(
+        panel_source, store / "rejected-no-database.tar.gz",
+        drop=("files/opt/gowave/gowave.db",),
+        manifest_drop=("opt/gowave/gowave.db",),
+    )
+    wrong_type = store / "rejected-wrong-type.tar.gz"
+    wrong_type.write_bytes(node_source.read_bytes())
+    wrong_type.chmod(0o600)
+    created["wrong-type"] = wrong_type
+
+    # NEG-12's corruption is the one the manifest cannot catch: the archive is
+    # well formed, the member is still a SQLite file with its header intact, and
+    # the manifest names the digest of exactly these bytes. Half a database keeps
+    # the format readable and fails `PRAGMA integrity_check` with
+    # `database disk image is malformed`, so the refusal has to come from the
+    # product's own check of the copy it staged.
+    with tarfile.open(panel_source, "r:gz") as panel_tar:
+        member = panel_tar.extractfile(REJECT_DATABASE_MEMBER)
+        if member is None:
+            raise AssertionError(
+                f"{panel_source} carries no regular {REJECT_DATABASE_MEMBER} to corrupt"
+            )
+        database = member.read()
+    created["sqlite"] = rewrite_archive(
+        panel_source, store / "rejected-sqlite.tar.gz",
+        replace={REJECT_DATABASE_MEMBER: database[: max(1, len(database) // 2)]},
+        rehash=(REJECT_DATABASE_PATH,),
+    )
+    return created
+
+
+def case_backup_rejected(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-BACKUP-BAD: an archive that cannot deliver its contract is refused, untouched.
+
+    A restore of a corrupt archive must not be a partial restore. Each variant below
+    breaks exactly one promise the format makes — the stream reads, the manifest
+    names every member, the manifest's checksums hold, the mandatory member is
+    there, the archive is the type it is applied as, and the database it carries is
+    the database the product can still open — and each attempt has to be refused
+    with a message naming that promise while the Master's service, its NGINX, its
+    database, its environment and the recovery snapshot count stay exactly as they
+    were.
+    """
+    case_id = REJECT_CASE_ID
+    host = product.require_worker()
+    volumes = getattr(host, "backup_volumes", None) or {}
+    require(
+        case_id,
+        {"master", "worker"} <= set(volumes),
+        f"the roles do not each carry an archive volume: {sorted(volumes)}",
+    )
+    stores = {role: Path(str(volumes[role].get("mountpoint") or "")) for role in ("master", "worker")}
+
+    archives: Dict[str, str] = {}
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False,
+            timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"{container} could not write the {type_name} archive this case corrupts: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            archive.startswith(topology.BACKUP_STORE.rstrip("/") + "/"),
+            f"{container} wrote its {type_name} archive to {archive!r}, which is not "
+            f"inside {topology.BACKUP_STORE}",
+        )
+        archives[role] = archive
+
+    # The control: the archives the variants come from are accepted by the same
+    # validator, so a rejection below is the corruption and not a broken fixture.
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        verified = product.podman.exec_bash(
+            container, backup_verify_script(archives[role], type_name), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            verified.returncode == 0
+            and "15-point preflight archive validation PASSED" in (verified.stdout or ""),
+            f"the product's own validator refuses the untouched {type_name} archive, so "
+            f"a rejection below would prove nothing: {(verified.stderr or '').strip()[-400:]}",
+        )
+
+    before = product.podman.exec_bash(
+        host.target_name, master_state_probe_script(), check=False,
+        timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        before.returncode == 0,
+        f"the Master state probe exited {before.returncode}: {(before.stderr or '').strip()[-400:]}",
+    )
+    before_facts = parse_key_value_fields(before.stdout or "")
+    require(
+        case_id,
+        before_facts.get("unit") == "active",
+        f"gowave.service is {before_facts.get('unit')!r} before the first rejection, so a "
+        "service that stays up afterwards would prove nothing",
+    )
+
+    variants = rejected_archives(stores["master"], archives["master"],
+                                 stores["worker"], archives["worker"])
+    evidence: Dict[str, Any] = {"refused": []}
+    for name, fragments in REJECT_VARIANTS:
+        path = variants[name]
+        inside = f"{topology.BACKUP_STORE}/{path.name}"
+        result = product.podman.exec_bash(
+            host.target_name, restore_command(inside, "panel"), check=False,
+            timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        require(
+            case_id,
+            result.returncode != 0,
+            f"the {name} archive was not refused: restore exited 0 with "
+            f"{output.strip()[-400:]}",
+        )
+        require(
+            case_id,
+            "Restore completed and verified successfully." not in output,
+            f"the {name} archive was refused and still reported success: "
+            f"{output.strip()[-400:]}",
+        )
+        require(
+            case_id,
+            any(fragment in output for fragment in fragments),
+            f"the {name} archive was refused for another reason than {fragments}: "
+            f"{output.strip()[-400:]}",
+        )
+        require(
+            case_id,
+            "Traceback" not in output,
+            f"the {name} archive crashed the validator instead of being refused: "
+            f"{output.strip()[-400:]}",
+        )
+        after = product.podman.exec_bash(
+            host.target_name, master_state_probe_script(), check=False,
+            timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+        )
+        after_facts = parse_key_value_fields(after.stdout or "")
+        require(
+            case_id,
+            after_facts == before_facts,
+            f"the refused {name} archive changed the Master: it was {before_facts} and "
+            f"is now {after_facts}",
+        )
+        message = next(
+            (line.strip() for line in output.splitlines()
+             if "Validation Error:" in line or line.startswith("[FAIL]")),
+            output.strip().splitlines()[-1] if output.strip() else "",
+        )
+        evidence["refused"].append({
+            "variant": name,
+            "archive": inside,
+            "returncode": result.returncode,
+            "message": message,
+            "state": after_facts,
+        })
+
+    # The Worker path is refused the same way, before its own unit is touched.
+    node_before = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    node_before_facts = parse_node_env_probe(node_before.stdout or "")
+    require(
+        case_id,
+        node_before_facts.get("active") == "active" and bool(node_before_facts.get("digest")),
+        f"the Worker is not healthy enough for a refusal to mean anything: {node_before_facts}",
+    )
+    node_variant = stores["worker"] / "rejected-node-truncated.tar.gz"
+    node_content = (stores["worker"] / Path(archives["worker"]).name).read_bytes()
+    node_variant.write_bytes(node_content[: max(1, len(node_content) // 3)])
+    node_variant.chmod(0o600)
+    refused_node = product.podman.exec_bash(
+        host.worker_name,
+        restore_command(f"{topology.BACKUP_STORE}/{node_variant.name}", "node"),
+        check=False, timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    node_output = (refused_node.stdout or "") + (refused_node.stderr or "")
+    require(
+        case_id,
+        refused_node.returncode != 0,
+        f"the truncated Worker archive was not refused: {node_output.strip()[-400:]}",
+    )
+    require(
+        case_id,
+        "not a readable Format v1 tar.gz" in node_output
+        or "could not be read back" in node_output,
+        f"the truncated Worker archive was refused for another reason: {node_output.strip()[-400:]}",
+    )
+    node_after = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    require_node_env(case_id, "after a refused Worker restore",
+                     parse_node_env_probe(node_after.stdout or ""),
+                     node_before_facts.get("digest", ""))
+
+    evidence["node_refused"] = {
+        "archive": f"{topology.BACKUP_STORE}/{node_variant.name}",
+        "returncode": refused_node.returncode,
+        "unit": parse_node_env_probe(node_after.stdout or "").get("active"),
+        "environment_unchanged": True,
+    }
+    evidence["control"] = {
+        "panel": archives["master"],
+        "node": archives["worker"],
+        "validation": "15-point preflight archive validation PASSED.",
+    }
+    evidence["master_state"] = before_facts
+    return evidence
+
+
+def backup_probe_script(archive: str) -> str:
+    """Read an archive back without printing a single value it protects."""
+    return (
+        "set -u\n"
+        f"python3 - {shlex.quote(archive)} <<'PY'\n"
+        "import hashlib\n"
+        "import json\n"
+        "import os\n"
+        "import tarfile\n"
+        "import sys\n"
+        "\n"
+        "archive = sys.argv[1]\n"
+        "facts = {'path': archive}\n"
+        "stat = os.stat(archive)\n"
+        "facts['mode'] = oct(stat.st_mode & 0o777)\n"
+        "facts['size'] = stat.st_size\n"
+        "digest = hashlib.sha256()\n"
+        "with open(archive, 'rb') as handle:\n"
+        "    for block in iter(lambda: handle.read(65536), b''):\n"
+        "        digest.update(block)\n"
+        "facts['sha256'] = digest.hexdigest()\n"
+        "facts['paths'] = []\n"
+        "facts['declared'] = []\n"
+        "facts['env_keys'] = {}\n"
+        "facts['private_key_members'] = []\n"
+        "facts['sqlite_header'] = False\n"
+        "with tarfile.open(archive, 'r:gz') as tar:\n"
+        "    members = tar.getmembers()\n"
+        "    meta_name = next(\n"
+        "        m.name for m in members if m.name in ('meta.json', './meta.json')\n"
+        "    )\n"
+        "    meta = json.load(tar.extractfile(meta_name))\n"
+        "    facts['format_version'] = meta.get('format_version')\n"
+        "    facts['type'] = meta.get('backup_type')\n"
+        "    facts['declared'] = sorted(\n"
+        "        entry.get('path', '') for entry in meta.get('files', []) if isinstance(entry, dict)\n"
+        "    )\n"
+        "    for member in members:\n"
+        "        name = member.name\n"
+        "        if member.isdir() or name in ('meta.json', './meta.json'):\n"
+        "            continue\n"
+        "        rel = name[6:] if name.startswith('files/') else name\n"
+        "        facts['paths'].append(rel)\n"
+        "        # The live/ members are symlinks into archive/; a link is counted\n"
+        "        # where it sits and is never resolved, so a dangling one cannot\n"
+        "        # turn a readable archive into a probe failure.\n"
+        "        if member.issym() or member.islnk():\n"
+        "            continue\n"
+        "        payload = tar.extractfile(member)\n"
+        "        if payload is None:\n"
+        "            continue\n"
+        "        if rel.endswith('/.env'):\n"
+        "            text = payload.read().decode('utf-8', 'replace')\n"
+        "            facts['env_keys'][rel] = sorted(\n"
+        "                line.split('=', 1)[0].strip() for line in text.splitlines()\n"
+        "                if '=' in line and not line.lstrip().startswith('#')\n"
+        "            )\n"
+        "        elif rel.endswith('gowave.db'):\n"
+        "            facts['sqlite_header'] = payload.read(16).startswith(b'SQLite format 3')\n"
+        "        elif rel.startswith('etc/letsencrypt/archive/') and rel.endswith('.pem'):\n"
+        "            if b'PRIVATE KEY' in payload.read():\n"
+        "                facts['private_key_members'].append(rel)\n"
+        "facts['paths'] = sorted(facts['paths'])\n"
+        "print(json.dumps(facts))\n"
+        "PY\n"
+    )
+
+
+def parse_backup_archive(stdout: str) -> str:
+    """The path the product reports for the archive it just wrote.
+
+    Both archive types end with `... backup created successfully: <path>
+    (mode 0600).`, and nothing else on stdout carries an absolute path, so the
+    last such line names the archive that has to be read back.
+    """
+    for line in reversed(stdout.splitlines()):
+        if "created successfully:" not in line:
+            continue
+        _, _, rest = line.partition("created successfully:")
+        candidate = rest.strip().split(" ")[0]
+        return candidate if candidate.startswith("/") else ""
+    return ""
+
+
+def require_backup_archive(case_id: str, role: str, facts: Dict[str, Any],
+                           type_name: str) -> None:
+    """One archive type carries exactly what its restore contract promises."""
+    require(
+        case_id,
+        facts.get("format_version") == 1,
+        f"{role}'s archive declares format version {facts.get('format_version')!r}, "
+        "so it is not the Backup & Restore Format v1 the product documents",
+    )
+    require(
+        case_id,
+        facts.get("type") == type_name,
+        f"{role}'s archive declares backup_type {facts.get('type')!r} instead of "
+        f"{type_name!r}, so a restore would apply the wrong contract",
+    )
+    require(
+        case_id,
+        facts.get("mode") == "0o600",
+        f"{role}'s archive is mode {facts.get('mode')} instead of 0600, so the "
+        "credentials it carries are not root-only",
+    )
+    paths = set(facts.get("paths") or ())
+    declared = set(facts.get("declared") or ())
+    require(
+        case_id,
+        paths and declared,
+        f"{role}'s archive lists its members as {sorted(paths)} and declares "
+        f"{sorted(declared)}, so there is nothing to compare",
+    )
+    require(
+        case_id,
+        declared <= paths,
+        f"{role}'s meta.json declares checksums for members the archive does not "
+        f"carry: {sorted(declared - paths)}",
+    )
+    if type_name == "panel":
+        missing = [path for path in BACKUP_PANEL_REQUIRED_PATHS if path not in paths]
+        require(
+            case_id,
+            not missing,
+            f"{role}'s Panel archive is missing {missing}, so a restore would not "
+            "bring back that part of the installation",
+        )
+        for prefix in BACKUP_PANEL_REQUIRED_PREFIXES:
+            require(
+                case_id,
+                any(path.startswith(prefix) for path in paths),
+                f"{role}'s Panel archive carries no {prefix}* member, so a restore "
+                "would lose that part of the installation",
+            )
+        require(
+            case_id,
+            facts.get("sqlite_header") is True,
+            f"{role}'s opt/gowave/gowave.db is not a SQLite database, so the Panel "
+            "archive holds no usable database",
+        )
+        require(
+            case_id,
+            facts.get("private_key_members"),
+            f"{role}'s Panel archive carries no TLS private key, so it could not "
+            "restore a lineage",
+        )
+        require(
+            case_id,
+            "opt/gowave/gowave-server" not in paths,
+            "the Panel archive carries the Panel binary, which the archive format "
+            "forbids and a restore would overwrite",
+        )
+        require(
+            case_id,
+            not any(path.startswith("opt/gowave-node/") for path in paths),
+            "the Panel archive carries the Worker's credentials, so the two role "
+            "archives are mixed",
+        )
+    else:
+        require(
+            case_id,
+            paths == set(BACKUP_NODE_PATHS),
+            f"{role}'s Worker archive carries {sorted(paths)} instead of exactly "
+            f"{list(BACKUP_NODE_PATHS)}, so it is not the documented "
+            "credentials-only archive",
+        )
+    secret_keys = facts.get("env_keys") or {}
+    required_key = BACKUP_SECRET_KEYS[type_name]
+    require(
+        case_id,
+        any(required_key in names for names in secret_keys.values()),
+        f"{role}'s archive carries no {required_key} in any environment file "
+        f"({sorted(secret_keys)}), so it does not hold the credential its own "
+        "restore contract promises",
+    )
+
+
+def case_backup_types(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-BACKUP: both archive types come out of the operator's own interface.
+
+    The archives are unencrypted and secret-bearing, so the evidence keeps the
+    inventory -- member paths, declared checksums, environment key names, where
+    private keys sit -- and the archive's own digest, and never a value.
+    """
+    case_id = BACKUP_CASE_ID
+    host = product.require_worker()
+    evidence: Dict[str, Any] = {"roles": {}}
+    for role, container, label in (
+        ("master", host.target_name, "the Master"),
+        ("worker", host.worker_name, "the Worker"),
+    ):
+        type_name = BACKUP_TYPES[role]
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False, timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"{label} could not create a {type_name} archive: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            bool(archive),
+            f"{label}'s {type_name} backup did not name the archive it wrote: "
+            f"{(created.stdout or '').strip()[-400:]}",
+        )
+        read = product.podman.exec_bash(
+            container, backup_probe_script(archive), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            read.returncode == 0,
+            f"{label} could not read its own {type_name} archive {archive}: "
+            f"{(read.stderr or '').strip()[-400:]}",
+        )
+        try:
+            facts = json.loads(read.stdout or "")
+        except json.JSONDecodeError:
+            raise AssertionError(
+                f"{case_id}: {label} did not describe its {type_name} archive: "
+                f"{(read.stdout or '').strip()[-400:]}"
+            )
+        require_backup_archive(case_id, label, facts, type_name)
+        verified = product.podman.exec_bash(
+            container, backup_verify_script(archive, type_name), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            verified.returncode == 0 and "PASSED" in (verified.stdout or ""),
+            f"{label}'s own validator refused its {type_name} archive "
+            f"{(verified.stderr or verified.stdout or '').strip()[-400:]}",
+        )
+        evidence["roles"][role] = {
+            "type": type_name,
+            "path": archive,
+            "mode": facts["mode"],
+            "size": facts["size"],
+            "sha256": facts["sha256"],
+            "members": facts["paths"],
+            "declared": facts["declared"],
+            "secret_keys": facts["env_keys"],
+            "private_key_members": facts["private_key_members"],
+            "validation": (verified.stdout or "").strip().splitlines()[-1:],
+        }
+    return evidence
+
+
+def restore_step_script(step: str) -> str:
+    """One Panel-side restore step, run where the loopback API lives."""
+    return (
+        f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope restore --step {step} "
+        f"--payload-dir {topology.PAYLOAD_MOUNT}\n"
+    )
+
+
+def node_env_probe_script() -> str:
+    """The Worker environment's fingerprint, and nothing out of the file itself."""
+    return (
+        "set -u\n"
+        f"digest=$(sha256sum {RESTORE_NODE_ENV} 2>/dev/null | awk '{{print $1}}')\n"
+        f"sentinel=$(grep -c '^{RESTORE_SENTINEL_KEY}=' {RESTORE_NODE_ENV} 2>/dev/null || true)\n"
+        "active=$(systemctl is-active gowave-node.service 2>/dev/null || true)\n"
+        'printf \'digest=%s sentinel=%s active=%s\\n\' '
+        '"${digest:-}" "${sentinel:-0}" "${active:-unknown}"\n'
+    )
+
+
+def parse_key_value_fields(output: str) -> Dict[str, str]:
+    """The key=value fields a role-side probe prints, however it lays them out.
+
+    Role probes print their facts as ``key=value`` tokens, either one per line or
+    all on one line, so the report is read as a token stream; a token without a
+    value carries no fact and is dropped.
+    """
+    values: Dict[str, str] = {}
+    for token in (output or "").split():
+        key, separator, value = token.partition("=")
+        if separator:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def parse_node_env_probe(output: str) -> Dict[str, str]:
+    return parse_key_value_fields(output)
+
+
+def require_node_env(
+    case_id: str, label: str, facts: Dict[str, str], digest: str,
+) -> None:
+    """The Worker environment is back to the exact bytes the archive captured."""
+    require(
+        case_id,
+        facts.get("digest") == digest and bool(digest),
+        f"{label}: the Worker environment hashes to {facts.get('digest')!r} instead of "
+        f"the captured {digest!r}, so the restore did not restore its credentials",
+    )
+    require(
+        case_id,
+        facts.get("sentinel", "0") == "0",
+        f"{label}: the Worker environment still carries the injected "
+        f"{RESTORE_SENTINEL_KEY} marker, so the restore did not replace the file",
+    )
+    require(
+        case_id,
+        facts.get("active") == "active",
+        f"{label}: gowave-node.service is {facts.get('active')!r} after the restore",
+    )
+
+
+def case_backup_restore(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-RESTORE: the product restores what a backup captured, on both roles.
+
+    The targets are the ones this run provisioned through the operator, so a
+    restore is asked to put back state those very commands created. What the
+    restore has to undo is chosen to be observable without reading a secret: a
+    client created through the Panel API and then deleted, and a Worker
+    environment file with one marker appended. Each archive is written by the
+    product, each restore is the product's own command, and the verdict comes
+    from the Panel's API, the Worker's own unit, and every served outbound
+    carrying a payload again.
+    """
+    case_id = RESTORE_CASE_ID
+    host = product.require_worker()
+    evidence: Dict[str, Any] = {"roles": {}}
+
+    # ---------------------------------------------------------------- capture
+    captured = product.podman.exec_bash(
+        host.target_name, restore_step_script("capture"), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        captured.returncode == 0,
+        f"the Panel probe could not capture a client before the backup: "
+        f"{(captured.stderr or captured.stdout or '').strip()[-400:]}",
+    )
+    try:
+        capture_facts = (json.loads(captured.stdout or "") or {}).get("restore") or {}
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"{case_id}: the capture step did not print a JSON object: "
+            f"{(captured.stdout or '')[:400]}"
+        )
+    require(
+        case_id,
+        capture_facts.get("create_status") == 201,
+        f"POST /api/users returned {capture_facts.get('create_status')!r} instead of 201, "
+        "so there is no client for the restore to bring back",
+    )
+    require(
+        case_id,
+        capture_facts.get("readback_username_matches") is True,
+        "the Panel did not read back the client it had just created",
+    )
+    served = {
+        name: entry
+        for name, entry in (capture_facts.get("representations") or {}).items()
+        if isinstance(entry, dict)
+    }
+    require(
+        case_id,
+        served and all(entry.get("status") == 200 for entry in served.values()),
+        f"the captured client was not served every representation: {served}",
+    )
+    evidence["roles"]["master"] = {
+        "users_in_archive": capture_facts.get("users_in_archive"),
+        "create_status": capture_facts.get("create_status"),
+        "representations": served,
+    }
+
+    # ------------------------------------------------------------- the Worker
+    before = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        before.returncode == 0,
+        f"the Worker environment probe exited {before.returncode}: "
+        f"{(before.stderr or '').strip()[-400:]}",
+    )
+    env_before = parse_node_env_probe(before.stdout or "")
+    require(
+        case_id,
+        bool(env_before.get("digest")),
+        f"the Worker environment probe reported no digest: {(before.stdout or '').strip()[:200]}",
+    )
+    require(
+        case_id,
+        env_before.get("sentinel", "0") == "0",
+        "the Worker environment already carries the restore marker, so the case cannot "
+        "tell whether the restore replaced the file",
+    )
+
+    # ---------------------------------------------------------------- backups
+    archives: Dict[str, str] = {}
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False,
+            timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"the {type_name} backup this restore needs exited {created.returncode}: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            bool(archive),
+            f"the {type_name} backup did not name the archive it wrote: "
+            f"{(created.stdout or '').strip()[-400:]}",
+        )
+        archives[role] = archive
+
+    # ----------------------------------------------------------- destroy state
+    mutated = product.podman.exec_bash(
+        host.target_name, restore_step_script("mutate"), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        mutated.returncode == 0,
+        f"the Panel probe could not delete the captured client: "
+        f"{(mutated.stderr or mutated.stdout or '').strip()[-400:]}",
+    )
+    try:
+        mutate_facts = (json.loads(mutated.stdout or "") or {}).get("restore") or {}
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"{case_id}: the mutate step did not print a JSON object: "
+            f"{(mutated.stdout or '')[:400]}"
+        )
+    require(
+        case_id,
+        mutate_facts.get("delete_status") == 204,
+        f"DELETE /api/users/{{id}} returned {mutate_facts.get('delete_status')!r} instead of 204",
+    )
+    require(
+        case_id,
+        mutate_facts.get("user_present_after_delete") is False,
+        "the Panel still lists the client after deleting it, so the restore has "
+        "nothing to prove",
+    )
+    require(
+        case_id,
+        mutate_facts.get("subscription_after_delete_status") != 200,
+        "the deleted client's subscription route still answered 200, so the Panel's "
+        "own change never reached it",
+    )
+
+    marked = product.podman.exec_bash(
+        host.worker_name,
+        f"printf '%s\\n' '{RESTORE_SENTINEL_KEY}=1' >> {RESTORE_NODE_ENV}\n",
+        check=False, timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        marked.returncode == 0,
+        f"the case could not mark the Worker environment: {(marked.stderr or '').strip()[-400:]}",
+    )
+    edited = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    env_edited = parse_node_env_probe(edited.stdout or "")
+    require(
+        case_id,
+        env_edited.get("sentinel") == "1" and env_edited.get("digest") != env_before["digest"],
+        f"the Worker environment did not change after the injected marker: {env_edited}",
+    )
+
+    # --------------------------------------------------------------- restores
+    restored: Dict[str, Any] = {}
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        result = product.podman.exec_bash(
+            container,
+            f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh restore "
+            f"{shlex.quote(archives[role])} --type {type_name}\n",
+            check=False, timeout=RESTORE_COMMAND_TIMEOUT_SECONDS,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        require(
+            case_id,
+            result.returncode == 0,
+            f"the {type_name} restore exited {result.returncode}: {output.strip()[-800:]}",
+        )
+        require(
+            case_id,
+            "Restore completed and verified successfully." in output,
+            f"the {type_name} restore did not report its own success: {output.strip()[-800:]}",
+        )
+        restored[role] = {
+            "type": type_name,
+            "archive": archives[role],
+            "returncode": result.returncode,
+            "tail": output.strip().splitlines()[-3:],
+        }
+
+    # ---------------------------------------------------------------- verify
+    verify = product.podman.exec_bash(
+        host.target_name, restore_step_script("verify"), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        verify.returncode == 0,
+        f"the Panel probe could not verify the restored state: "
+        f"{(verify.stderr or verify.stdout or '').strip()[-400:]}",
+    )
+    try:
+        verify_facts = (json.loads(verify.stdout or "") or {}).get("restore") or {}
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"{case_id}: the verify step did not print a JSON object: "
+            f"{(verify.stdout or '')[:400]}"
+        )
+    require(
+        case_id,
+        verify_facts.get("readback_status") == 200,
+        f"GET /api/users/{{id}} returned {verify_facts.get('readback_status')!r} after the "
+        "restore, so the deleted client did not come back",
+    )
+    require(
+        case_id,
+        verify_facts.get("username_restored") is True
+        and verify_facts.get("short_uuid_restored") is True,
+        f"the restored client is {verify_facts.get('username_restored')!r}/"
+        f"{verify_facts.get('short_uuid_restored')!r} rather than the captured identity",
+    )
+    require(
+        case_id,
+        verify_facts.get("inventory_restored") is True,
+        f"the Panel lists {verify_facts.get('users_restored')!r} clients after the "
+        "restore instead of the inventory the archive captured",
+    )
+    identical = verify_facts.get("representations_identical") or {}
+    require(
+        case_id,
+        identical and all(identical.values()),
+        f"the restored client is not served the bytes it was served before the restore: {identical}",
+    )
+
+    after = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require_node_env(case_id, "after the restore", parse_node_env_probe(after.stdout or ""),
+                     env_before["digest"])
+
+    # The engines are only ready when a payload really leaves: the client's
+    # payloads are fetched here so the readiness wait has something to send.
+    product.master.subscription_payloads(case_id)
+    nodes = product.wait_for_nodes(case_id, expected=2)
+    traffic = product.master.wait_tunnel_ready(case_id)
+
+    after_facts = parse_node_env_probe(after.stdout or "")
+    evidence["roles"]["worker"] = {
+        "environment_sha256": env_before["digest"],
+        "environment_restored": after_facts.get("digest") == env_before["digest"],
+        "unit": after_facts.get("active"),
+    }
+    evidence.update({
+        "restore": restored,
+        "panel": {
+            "users_in_archive": capture_facts.get("users_in_archive"),
+            "users_restored": verify_facts.get("users_restored"),
+            "identity_restored": verify_facts.get("readback_status") == 200
+            and verify_facts.get("username_restored") is True
+            and verify_facts.get("short_uuid_restored") is True,
+            "representations_identical": identical,
+        },
+        "nodes": nodes,
+        "data_plane": traffic.get("delivered"),
+    })
     return evidence
 
 
@@ -5849,12 +9740,89 @@ def data_plane_case(
     that left from the Master's address is caught by name instead of passing on
     the strength of a 200.
     """
-    evidence = aio._data_plane_case(product.master, inbound, client, node=node)
+    # A Worker tuple is served by the Worker's core, not the Master's: passing it
+    # in keeps the client/server core comparison about the host that carried the
+    # payload.
     case_id = matrix_data.case_id(
         product.matrix, matrix_data.MULTI_NODE, str(inbound["id"]), client, node=node,
     )
+    deployed_core = product.worker_core_version(case_id) if node == "worker" else ""
+    evidence = aio._data_plane_case(
+        product.master, inbound, client, node=node, deployed_core=deployed_core,
+    )
     product.record_data_plane_source(case_id, str(evidence.get("source_ip") or ""))
     return evidence
+
+
+PKT_WRONG_HOST_CASE_ID = "MN-PKT-03"
+PKT_WRONG_HOST_TIMEOUT_SECONDS = aio.DATA_PLANE_TIMEOUT_SECONDS + 300
+
+
+def case_packet_wrong_host(product: MultiNodeProduct) -> Dict[str, Any]:
+    """PKT-03: a packet at the other node fails the case, whatever the egress says.
+
+    The sentence is short and absolute: if the VPS that was *not* supposed to serve
+    the request captured matching inbound packets, the case is FAIL even though
+    the payload left from the address the endpoint expected. Both nodes here serve
+    the same transport, so the only thing standing between a Worker tuple and a
+    Master one is which host the packets reached — and a runner that never
+    compared the two captures would still report a 200, the right SNI, and the
+    right egress address.
+
+    The case produces that confusion the way the live runner would have suffered
+    it: a real Worker request, bracketed by both captures, judged as if the Master
+    had carried it. Everything about the payload is correct, so a FAIL here can
+    only come from the packet evidence, and the case requires both — the verdict
+    and the harness assertion a failing case raises.
+    """
+    host = product.master.require_installed()
+    inbound = matrix_data.inbound(product.matrix, "REALITY")
+    worker_tuple = matrix_data.case_id(
+        product.matrix, matrix_data.MULTI_NODE, str(inbound["id"]), "xray", node="worker",
+    )
+
+    measurement = product.master.bracket_request(
+        lambda: product.master.transfer_facts(
+            PKT_WRONG_HOST_CASE_ID, str(inbound["id"]), "xray", node="worker",
+        ),
+        inbound, "worker", intended="master",
+    )
+    facts = ingress.evaluate(measurement)
+    payload = measurement.request or {}
+
+    require(PKT_WRONG_HOST_CASE_ID, payload.get("status") == 200,
+            f"the {worker_tuple} payload returned {payload.get('status')!r}, so this case would "
+            "be reporting a broken transfer rather than a misplaced one")
+    require(PKT_WRONG_HOST_CASE_ID, payload.get("source_ip") == str(host.plan.data_worker_ip),
+            f"the payload left from {payload.get('source_ip')!r} instead of the Worker's "
+            f"{host.plan.data_worker_ip}, so the egress half of the sentence is not met")
+    require(PKT_WRONG_HOST_CASE_ID, facts["verdict"] == ingress.FAIL,
+            f"a request the {facts['intended']} host did not carry came back "
+            f"{facts['verdict']} instead of FAIL")
+    require(PKT_WRONG_HOST_CASE_ID, facts["intended_matched"] == 0,
+            f"the {facts['intended']} host captured {facts['intended_matched']} segment(s) from "
+            "the client, so the request was not the mislabelled one this case needs")
+
+    refused = False
+    try:
+        ingress.require(PKT_WRONG_HOST_CASE_ID, facts)
+    except AssertionError:
+        refused = True
+    require(PKT_WRONG_HOST_CASE_ID, refused,
+            "the bracket returned FAIL but the case body was not stopped, so a misplaced request "
+            "would have been recorded as a pass")
+
+    return {
+        "worker_tuple": worker_tuple,
+        "intended_host": facts["intended"],
+        "capturing_host": facts["other"],
+        "capturing_matched": facts["other_matched"],
+        "intended_matched": facts["intended_matched"],
+        "egress_source_ip": payload.get("source_ip"),
+        "egress_expected": str(host.plan.data_worker_ip),
+        "verdict": facts["verdict"],
+        "reason": facts["reason"],
+    }
 
 
 def data_plane_cases(product: MultiNodeProduct) -> List[Tuple[str, Dict[str, Any], str, str]]:
@@ -5892,10 +9860,63 @@ def cases(
         # runs: a wrong pin and a rotated host key must both stop the controller.
         Case(SSH_KEY_CASE_ID, "multi-node", lambda context: case_ssh_host_key(product),
              timeout_seconds=SSH_TRUST_TIMEOUT_SECONDS),
+        # Two dispatches: the deployment the case is about, and the control that
+        # repeats it on a disposable host with the pin opted out.
         Case(NODE_ADD_CASE_ID, "multi-node", lambda context: case_worker_registration(product),
+             timeout_seconds=2 * topology.NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # The environment contract: a Worker onboarded via environment variables
+        # instead of positional arguments is registered correctly.
+        Case(ENV_CONTRACT_CASE_ID, "multi-node", lambda context: case_env_contract(product),
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # Partial success: one Worker fails, another succeeds, Panel continues.
+        Case(PARTIAL_SUCCESS_CASE_ID, "multi-node", lambda context: case_partial_success(product),
+             timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
+        # The composed wizard above the same boundary: a plan card that refuses
+        # one duplicate field, a batch that mixes a real registration with a
+        # failed node, the retry of that node, and the menu it returns to.
+        Case(WIZARD_FLOW_CASE_ID, "multi-node", lambda context: case_wizard_flow(product),
+             timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
+        # Add-node refused by Panel API verification failure.
+        Case(ADD_NODE_REFUSED_CASE_ID, "multi-node", lambda context: case_add_node_refused(product),
+             timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
+        # The dispatch that case just ran was traced; this case reads the trace,
+        # proves the observer can see a sentinel whole, and removes the file.
+        Case(ARGV_OBSERVER_CASE_ID, "multi-node", lambda context: case_argv_observer(product),
+             timeout_seconds=argv_probe.FIXTURE_TIMEOUT_SECONDS + argv_probe.SCAN_TIMEOUT_SECONDS),
+        # The registration above is committed, so the same verb run again is the
+        # duplicate the product must refuse from `state.json` alone. It runs here,
+        # before the lock cases take the canonical path and before anything that
+        # rewrites the journal, so "unchanged" is read against a healthy pair.
+        Case(DUPLICATE_ADD_CASE_ID, "multi-node", lambda context: case_duplicate_add(product),
+             timeout_seconds=DUPLICATE_ADD_CASE_TIMEOUT_SECONDS),
         Case(MASTER_ADDRESS_CASE_ID, "multi-node", lambda context: case_master_address(product),
              timeout_seconds=300),
+        # The pair-wide lock every mutating command on these two hosts competes
+        # for. The holder is the product's own program, started over real SSH into
+        # both containers, so the case needs a python3 on each of them: the Master
+        # gets one from its install and the Worker from `node add` above, which is
+        # why these run after the provisioning instead of beside it.
+        # `MN-LOCK-PATH` replaces the canonical lock path for the length of one
+        # acquisition and restores it, and `MN-LOCK-LOSS` terminates its own
+        # holder, so neither is run beside another case.
+        Case(lock_cases.LOCK_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_pair_lock(product),
+             timeout_seconds=LOCK_TIMEOUT_SECONDS),
+        Case(lock_cases.LOCK_LOSS_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_lock_loss(product),
+             timeout_seconds=LOCK_TIMEOUT_SECONDS),
+        Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_lock_path(product),
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
+        # The lock's other side: the shipped commands an operator would run on
+        # these hosts, each refused by the same canonical path, and the nested
+        # command the run itself is allowed to hand its own lease to.
+        Case(lock_cases.CLI_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_cli_entry_points(product),
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
+        Case(lock_cases.NESTED_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_nested_lease(product),
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
         Case("MTLS-01", "multi-node", lambda context: case_mtls_verifier(product),
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
         Case("MTLS-02", "multi-node", lambda context: case_mtls_http_classification(product),
@@ -5956,13 +9977,42 @@ def cases(
         MATRIX_CASE_ID, "multi-node", lambda context: case_matrix(product),
         timeout_seconds=MATRIX_TIMEOUT_SECONDS,
     ))
+    # The misplaced-request control runs after the count so a FAIL it produces on
+    # purpose cannot be read as a matrix tuple's own verdict, and before any
+    # lifecycle case revokes the client whose packets it captures.
+    suite.append(Case(
+        PKT_WRONG_HOST_CASE_ID, "multi-node",
+        lambda context: case_packet_wrong_host(product),
+        timeout_seconds=PKT_WRONG_HOST_TIMEOUT_SECONDS,
+    ))
     # Attribution reads what the tuples left behind, so it belongs immediately
     # after the count and before any lifecycle case revokes a client.
     suite.append(Case(
         EGRESS_CASE_ID, "multi-node", lambda context: case_egress(product),
         timeout_seconds=EGRESS_TIMEOUT_SECONDS,
     ))
+    # Losing the Worker's daemon is the same trust question as SSHKEY asked from
+    # the other side. It cannot run before the Worker is registered: its baseline
+    # payload has to traverse the Worker, which only the provisioned cluster
+    # carries. It runs here because the matrix above has warmed both nodes' data
+    # planes, and it restores the unit itself before returning.
+    suite.append(Case(
+        SSH_DOWN_CASE_ID, "multi-node", lambda context: case_ssh_service_down(product),
+        timeout_seconds=SSH_DOWN_TIMEOUT_SECONDS,
+    ))
     suite.extend([
+        # The Master's own TLS/SNI probe, asked what decides its answer: the
+        # per-run bundle, and not what the host trusts without one. It reloads
+        # nothing, so it runs here, before the cases that change the tree.
+        Case(aio.TLS_CA_CASE_ID, "multi-node", lambda context: aio.case_tls_ca_bundle(product.master),
+             timeout_seconds=aio.TLS_CA_TIMEOUT_SECONDS),
+        # Both nodes' Vision contours, read from the running configuration and
+        # from the traffic each name receives, before the cases below change the
+        # tree. A node without a delegated name owes its absence, which is read
+        # by the same contract rather than assumed.
+        Case(aio.VISION_ROUTE_CASE_ID, "multi-node",
+             lambda context: case_vision_route(product),
+             timeout_seconds=2 * aio.VISION_ROUTE_TIMEOUT_SECONDS),
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
         Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),
@@ -5999,6 +10049,261 @@ def cases(
         Case(COVER_UNRESOLVED_CASE_ID, "multi-node",
              lambda context: case_cover_unresolved(product),
              timeout_seconds=COVER_UNRESOLVED_TIMEOUT_SECONDS),
+        # Both archive types are read while the cluster is healthy and before the
+        # lifecycle cases revoke a client or fault a role: the credentials and the
+        # lineages they carry are install-time state of exactly those roles.
+        Case(BACKUP_CASE_ID, "multi-node", lambda context: case_backup_types(product),
+             timeout_seconds=BACKUP_TIMEOUT_SECONDS),
+        # The volume case writes one archive per role into the store, so it runs
+        # immediately after the archive contracts and while both roles are whole.
+        Case(BACKUP_VOLUME_CASE_ID, "multi-node", lambda context: case_backup_volume(product),
+             timeout_seconds=BACKUP_VOLUME_TIMEOUT_SECONDS),
+        # Every refusal below is proven against the same live Master, so it runs
+        # before the restore changes what that state is, and after the archive
+        # formats it corrupts have been read.
+        Case(REJECT_CASE_ID, "multi-node", lambda context: case_backup_rejected(product),
+             timeout_seconds=REJECT_CASE_TIMEOUT_SECONDS),
+        # The restore runs beside the backup it depends on being possible, and
+        # before the lifecycle cases: it puts the cluster back the way the
+        # operator built it instead of reading what a fault left behind.
+        Case(RESTORE_CASE_ID, "multi-node", lambda context: case_backup_restore(product),
+             timeout_seconds=RESTORE_CASE_TIMEOUT_SECONDS),
+        # Before the lifecycle cases, because it reads no clock and starts no
+        # container: it produces the report an overall PASS is read from and
+        # asserts what a red one must name. Its eighteen- and twenty-case clauses
+        # run here because this is the contour whose count the per-node Vision
+        # configuration changes.
+        Case(status.STATUS_CASE_ID, "multi-node", status.case_status_semantics,
+             timeout_seconds=120),
+        # The Panel this contour installed is the same Panel the All-in-One
+        # contour asks, so the case is one body read from the Master: four
+        # credentials it did not issue are refused and its own still reads. It
+        # mutates nothing, so it runs beside the other reads of a healthy pair.
+        Case(aio.AUTH_NEGATIVE_CASE_ID, "multi-node",
+             lambda context: aio.case_panel_auth_negative(product.master),
+             timeout_seconds=300),
+        # The controller reaches the Master's Panel over the same public name and
+        # the same run bundle whichever contour installed it, so the client's
+        # trust is asked here too rather than only where the Panel was installed
+        # beside its Node.
+        Case(aio.PANEL_API_CLIENT_CASE_ID, "multi-node",
+             lambda context: aio.case_panel_api_client_trust(product.master),
+             timeout_seconds=300),
+        # The redaction contract is one filter and one writer, so the Master asks
+        # the same two questions the All-in-One contour asks: its credentials file
+        # reaches an artifact as names only, and the bundle covers every container
+        # this run owns — the Workers included — because the collector discovers
+        # them from the run label rather than from the products.
+        Case(aio.REDACTION_CASE_ID, "multi-node",
+             lambda context: aio.case_redacted_credentials(product.master),
+             timeout_seconds=300),
+        Case(aio.DIAGNOSTICS_CASE_ID, "multi-node",
+             lambda context: aio.case_diagnostic_artifacts(product.master),
+             timeout_seconds=aio.DIAGNOSTICS_TIMEOUT_SECONDS),
+        # Beside it and before the lifecycle cases: the teardown policy a cluster
+        # run ends in is decided by a configuration file and a hook, not by the
+        # cluster, so the case reads it here rather than after the cases that
+        # fault the Worker.
+        Case(teardown.TEARDOWN_CASE_ID, "multi-node", teardown.case_teardown_policy,
+             timeout_seconds=120),
+        # Beside them: both decide a configuration file and a host's own port
+        # baseline, so neither starts a container and neither can be blamed for the
+        # state the lifecycle cases below leave behind.
+        Case(vision_policy.CONFIG_CASE_ID, "multi-node", vision_policy.case_config_contract,
+             timeout_seconds=120),
+        Case(vision_policy.GATE_CASE_ID, "multi-node", vision_policy.case_port_gate,
+             timeout_seconds=120),
+        # The eight questions a run decides before it may touch a VPS, read here
+        # for the reason the single-node contour reads them: none starts a
+        # container, and the cluster this contour has already installed is not an
+        # input to any of them. They run before the lifecycle cases, which fault
+        # the Worker, so a resolver pair that cannot bind :53 is reported as the
+        # host's own state rather than as damage those cases caused.
+        Case(preflight_cases.SSH_TRUST_CASE_ID, "multi-node", preflight_cases.case_ssh_trust,
+             timeout_seconds=120),
+        Case(preflight_cases.DNS_MISMATCH_CASE_ID, "multi-node",
+             preflight_cases.case_dns_address_mismatch, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITHOUT_IPV6_CASE_ID, "multi-node",
+             preflight_cases.case_aaaa_rejected_without_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITH_IPV6_CASE_ID, "multi-node",
+             preflight_cases.case_aaaa_verified_with_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_BYPASS_CASE_ID, "multi-node",
+             preflight_cases.case_aaaa_cannot_bypass, timeout_seconds=240),
+        Case(preflight_cases.DISTINCT_TARGETS_CASE_ID, "multi-node",
+             preflight_cases.case_distinct_targets, timeout_seconds=120),
+        Case(preflight_cases.DISTINCT_DOMAINS_CASE_ID, "multi-node",
+             preflight_cases.case_distinct_domains, timeout_seconds=120),
+        Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "multi-node",
+             preflight_cases.case_root_identity, timeout_seconds=120),
+        # A target address the suite must not be pointed at: every class the
+        # sentence names is refused by the product's own validator, and the two
+        # harness addresses the rest of the run uses are read back as global so
+        # the refusals above are not the rule rejecting everything.
+        Case(preflight_cases.PRIVATE_ADDRESS_CASE_ID, "multi-node",
+             preflight_cases.case_private_address_rejected, timeout_seconds=240),
+        # None of these reads the cluster: the two environment cases start their
+        # own clean container from the run's own image and network, the trust case
+        # reads the product's bundle builder, the skip case reads a policy, the CI
+        # case runs the repository's own unit discovery, and the rest read files
+        # the controller would have written. They therefore run before the
+        # lifecycle cases below, which are the last to touch a healthy cluster.
+        Case(environment_gate.CLEAN_CASE_ID, "multi-node",
+             lambda context: environment_gate.case_clean_baseline_passes_gate(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(environment_gate.CONTAMINATED_CASE_ID, "multi-node",
+             lambda context: environment_gate.case_contaminated_host_is_refused(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(trust_bundle.DP12_CASE_ID, "multi-node",
+             lambda context: trust_bundle.case_production_bundle_excludes_staging(product, context),
+             timeout_seconds=180),
+        Case(staging_trust.DP11_CASE_ID, "multi-node",
+             lambda context: staging_trust.case_staging_roots_are_pinned(product, context),
+             timeout_seconds=240),
+        Case(staging_trust.DP10_CASE_ID, "multi-node",
+             lambda context: staging_trust.case_xray_outbounds_carry_anchors(product, context),
+             timeout_seconds=180),
+        Case(staging_trust.DP09_CASE_ID, "multi-node",
+             lambda context: staging_trust.case_staging_and_public_chains_are_trusted(product, context),
+             timeout_seconds=240),
+        Case(skip_policy.DP14_CASE_ID, "multi-node",
+             lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
+             timeout_seconds=180),
+        Case(local_ci.LOCAL_CASE_ID, "multi-node",
+             lambda context: local_ci.case_ci_needs_no_credentials(product, context),
+             timeout_seconds=local_ci.DISCOVERY_TIMEOUT_SECONDS + 60),
+        # The operator's own controller, read whole. It dials nothing and starts
+        # nothing: the transport is a model of a host, so the sequence the six
+        # sentences describe is the thing under test rather than a remote's word.
+        Case(operator_access.OP_CASE_ID, "multi-node",
+             lambda context: operator_access.case_domain_input_is_validated_before_network(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.PASSWORD_CASE_ID, "multi-node",
+             lambda context: operator_access.case_password_is_hidden_and_unpersisted(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_CONFIRMED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_confirmed_host_key_is_pinned(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_DECLINED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_unconfirmed_host_key_aborts(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.BOUNDED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_temporary_key_is_bounded(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.FALLBACK_CASE_ID, "multi-node",
+             lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
+        # What happens to the access after the run, on both hosts: the key and the
+        # timer are withdrawn, and a host that keeps them is recorded as
+        # INCOMPLETE instead of passing.
+        Case(operator_access.REVOKED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_temporary_access_is_revoked(
+                 product, context),
+             timeout_seconds=300),
+        # The deploy hook of whichever target the transaction wrote, driven the
+        # same way on both hosts: the manifest, the digest and the teardown
+        # verdicts are the product's, and no cluster is involved.
+        Case(hook_ownership.CASE_ID, "multi-node",
+             lambda context: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it(
+                 product, context),
+             timeout_seconds=300),
+        # The shape of whatever already sits at the managed hook path, on either
+        # target: the preflight is one shell function, so both hosts read it.
+        Case(hook_ownership.HOOK_01, "multi-node",
+             lambda context: hook_ownership.case_preexisting_hook_is_never_adopted(
+                 product, context),
+             timeout_seconds=300),
+        # The Worker's own sysctl file: the payload's writer is run on the worker
+        # container against a path the case owns, so a foreign file, an empty
+        # file and a symlink are refused rather than truncated, and only a file
+        # this run created is marked for the rollback to remove.
+        Case(ownership.CASE_ID, "multi-node",
+             lambda context: ownership.case_worker_sysctl_is_not_adopted(product, context),
+             timeout_seconds=300),
+        # The Worker paths this install would remove on rollback: the payload's
+        # preflight runs here, on the host an install would run it on, so a unit
+        # file, a binary directory and a symlink this install did not write are
+        # refused before the first managed path is touched.
+        Case(ownership_targets.CASE_ID, "multi-node",
+             lambda context: ownership_targets.case_worker_mutation_targets_are_not_adopted(
+                 product, context),
+             timeout_seconds=300),
+        # The firewall the Worker payload reconfigures: the before-image and the
+        # restore run on the Worker with ufw and iptables answered by shims, so
+        # the same policy comes back with the transaction that changed it.
+        Case(firewall_image.CASE_ID, "multi-node",
+             lambda context: firewall_image.case_worker_firewall_policy_is_preserved(
+                 product, context),
+             timeout_seconds=300),
+        # The same baseline on the Worker: the payload's own before-image, its
+        # ownership record and its restore, over the same real tree.
+        Case(mutation_baseline.CASE_ID, "multi-node",
+             lambda context: mutation_baseline.case_worker_mutation_targets_are_restored(
+                 product, context),
+             timeout_seconds=300),
+        # The same journal on the Worker: the install that was killed leaves the
+        # record, and the reconcile restores from the before-image or refuses and
+        # retains it — one implementation read by both entrypoints.
+        Case(worker_journal.CASE_ID, "multi-node",
+             lambda context: worker_journal.case_worker_journal_is_reconciled(
+                 product, context),
+             timeout_seconds=300),
+        # The same package record on the Worker: the payload's own baseline and
+        # delta, read by the same teardown report the Master's run hands them to.
+        Case(package_residual.CASE_ID, "multi-node",
+             lambda context: package_residual.case_worker_package_residuals(
+                 product, context),
+             timeout_seconds=300),
+        # The same signal block on the Worker, driven over a scratch host root:
+        # one compensation per interruption, the before-image put back and
+        # verified, the journal left for the next entrypoint and a nonzero exit.
+        Case(signal_compensation.CASE_ID, "multi-node",
+             lambda context: signal_compensation.case_worker_signal_is_compensated_once(
+                 product, context),
+             timeout_seconds=300),
+        # The same journal and the same boot recovery as the All-in-One: the
+        # recovery is per host, so both contours read one implementation.
+        Case(transaction_recovery.CASE_ID, "multi-node",
+             lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
+                 product, context),
+             timeout_seconds=300),
+        # The same two-sided record on the Master: a Worker restore that failed
+        # and a Panel rollback that succeeded is not a rolled-back transaction.
+        Case(rollback_sides.CASE_ID, "multi-node",
+             lambda context: rollback_sides.case_worker_and_api_rollback_are_both_required(
+                 product, context),
+             timeout_seconds=300),
+        # The same transaction from the other end, and on the Master the cluster
+        # already owns: an unreachable address is registered and then recovered,
+        # and neither the cluster's node list nor its Panel inventory may keep a
+        # trace of the attempt afterwards.
+        Case(negative_journal.CASE_ID, "multi-node",
+             lambda context: negative_journal.case_partial_worker_install_leaves_no_committed_journal(
+                 product, context),
+             timeout_seconds=900),
+        # Revocation is per target, so the two hosts read one controller: the
+        # stuck host fails the run and the pass still records it.
+        Case(revocation.REV_01, "multi-node",
+             lambda context: revocation.case_revocation_succeeds(product, context),
+             timeout_seconds=300),
+        Case(revocation.REV_02, "multi-node",
+             lambda context: revocation.case_revocation_cannot_be_verified(product, context),
+             timeout_seconds=300),
+        # The negative matrix itself: fifteen rows the spec prints, each with the
+        # case that stops at its boundary and the contour able to produce it. The
+        # witnesses are read out of the suite's own registry, so a witness deleted
+        # from the code fails here instead of quietly emptying a catalog entry.
+        Case(negative_matrix.MATRIX_CASE_ID, "multi-node",
+             lambda context: negative_matrix.case_fifteen_rows_are_witnessed(product, context),
+             timeout_seconds=120),
+        Case(negative_matrix.TEN_CASE_ID, "multi-node",
+             lambda context: negative_matrix.case_ten_rows_are_witnessed(product, context),
+             timeout_seconds=120),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.
@@ -6007,7 +10312,10 @@ def cases(
                  product.master, REVOCATION_CASE_ID,
                  expected_sources=product.expected_egress_sources(),
              ),
-             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS),
+             # Same body as AIO-REVOKE, so the same window on top of the two probe
+             # budgets: the positive matrix is re-run when the probe reported nothing.
+             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS
+             + aio.REVOCATION_TRANSFER_TIMEOUT_SECONDS),
         Case(OUTAGE_CASE_ID, "multi-node", lambda context: case_worker_outage(product),
              timeout_seconds=OUTAGE_CASE_TIMEOUT_SECONDS),
         Case(RESTART_CASE_ID, "multi-node", lambda context: case_worker_restart(product),
@@ -6017,5 +10325,50 @@ def cases(
         # nothing after it may be blamed for the domains it installs.
         Case(ACME80_CASE_ID, "multi-node", lambda context: case_acme80(product),
              timeout_seconds=ACME80_TIMEOUT_SECONDS),
+        # The last case that provisions anything, and the only one that
+        # deliberately leaves the cluster incomplete: the Worker it provisions is
+        # torn down by the very compensation this case observes. It therefore
+        # runs after ACME80, which needs that Worker whole, and nothing that reads
+        # a healthy cluster may follow it.
+        Case(VIS_COMPENSATION_CASE_ID, "multi-node",
+             lambda context: case_vision_incomplete_compensation(product),
+             timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # The run's own record, read without a host and without a clock: a run id
+        # names a directory below the artifact root or nothing, and a partial
+        # phase resumes only the run that wrote the state it was handed. Both call
+        # the product's own helpers, so they read neither the cluster nor the
+        # names ACME80 installed.
+        Case(runstate_cases.RUN_ID_CASE_ID, "multi-node",
+             runstate_cases.case_run_id_root, timeout_seconds=120),
+        Case(runstate_cases.RESUME_CASE_ID, "multi-node",
+             runstate_cases.case_resume_gate, timeout_seconds=120),
+        # Both read the shipped tree rather than a host: the ACME refusal table
+        # lives in the Master's module and in two payload copies, and the trust
+        # anchor is placed by the helper the pair's data-plane cases call.
+        Case(acme_mode.CASE_ID, "multi-node",
+             lambda context: acme_mode.case_arbitrary_directory_is_refused(product, context),
+             timeout_seconds=300),
+        Case(tls_anchors.CASE_ID, "multi-node",
+             lambda context: tls_anchors.case_every_tls_outbound_carries_the_fixture_ca(
+                 product, context),
+             timeout_seconds=300),
+        # The same three gates the All-in-One suite runs, read from the same
+        # manifests: the pair topology is the one the pre-push gate spends the
+        # larger half of its tier budget on, and both audits judge the catalog
+        # rather than a container, so running them here costs no host.
+        Case(gate_tiers.PREPUSH_CASE_ID, "multi-node",
+             lambda context: gate_tiers.case_pre_push_gate(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.COVERAGE_CASE_ID, "multi-node",
+             lambda context: gate_tiers.case_coverage_audit(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.DIVERGENCE_CASE_ID, "multi-node",
+             lambda context: gate_tiers.case_divergence_guard(product, context),
+             timeout_seconds=600),
+        # Last: the deadline it proves is this topology's own, and the elapsed
+        # clock it reads is the two hosts' install and transfer, not a single
+        # container's. It starts no container and reads no cluster, so it cannot
+        # be blamed for the names ACME80 installed or for the compensation above.
+        Case(budget.BUDGET_CASE_ID, "multi-node", budget.case_budget, timeout_seconds=120),
     ])
     return suite

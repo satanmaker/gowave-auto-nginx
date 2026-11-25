@@ -148,15 +148,25 @@ class TestOSDetection(unittest.TestCase):
             conf = (apt_dir / "99zz-gowave-auto-nginx").read_text()
             self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', conf)
 
-    def test_install_bootstraps_tools_before_validating_arguments(self):
-        """cmd_install validates arguments and probes the cover apex before prerequisites."""
+    def test_install_validates_inputs_before_touching_the_host(self):
+        """The input contract is pure shell, so it precedes bootstrap and every mutation."""
         script = OPERATOR_PATH.read_text(encoding="utf-8")
         start = script.index("cmd_install() {")
-        body = script[start:start + 4000]
+        # The whole function, not a fixed character window: the window ended
+        # before the cover probe once the install-mode branches grew, and a
+        # guard that can no longer see the line it names is not a guard.
+        body = script[start:script.index("\n}\n", start)]
+        contract = body.index("preflight_require_inputs install")
         bootstrap = body.index("bootstrap_early_tools || return 1")
-        validator = body.index("python3 - \"$panel_domain\"")
-        cover = body.index("server_ip=$(resolve_panel_ipv4)")
-        self.assertLess(bootstrap, validator)
+        cover = body.index("cover_server_ip=$(resolve_panel_ipv4)")
+        self.assertLess(contract, bootstrap)
+        self.assertLess(contract, body.index("check_os"))
+        self.assertLess(contract, body.index("systemctl stop nginx"))
+        self.assertLess(contract, body.index("run_preflight_panel"))
+        # The call, not the word: the comment above the contract names the step
+        # it is compared against, and a bare substring search reads that mention
+        # as the call it is meant to precede.
+        self.assertLess(contract, body.index("\n    install_prerequisites\n"))
         self.assertLess(bootstrap, cover)
 
     def test_bootstrap_packages_are_part_of_the_prerequisite_inventory(self):

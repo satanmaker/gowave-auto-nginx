@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from live_vps.dns import DNSCheckResult
 from live_vps.ssh import SSHResult
 from live_vps.negative import (
+    run_neg_05_acme_install_failure,
     run_neg_10_mtls_forged_certificate,
     run_negative_suite,
     run_neg_01_ssh_host_key_absent,
@@ -27,12 +28,25 @@ from live_vps.negative import (
 class FakeSSH:
     """Minimal SSH stand-in that answers by matching the remote command text."""
 
-    def __init__(self, handler):
+    def __init__(self, handler, holder_pids=("4242",)):
         self._handler = handler
+        #: What the run's own lock holder published, in reading order; the last
+        #: entry repeats once the list is exhausted. A scenario reads it twice:
+        #: before its mutation and after it.
+        self._holder_pids = list(holder_pids)
+        self._holder_reads = 0
         self.calls = []
+        self.inputs = []
 
     def run(self, remote_cmd, input_data=None, timeout=60):
         self.calls.append(remote_cmd)
+        self.inputs.append((remote_cmd, input_data))
+        if "['holder_pid']" in remote_cmd:
+            if not self._holder_pids:
+                return SSHResult(1, "", "")
+            value = self._holder_pids[min(self._holder_reads, len(self._holder_pids) - 1)]
+            self._holder_reads += 1
+            return SSHResult(0, f"{value}\n", "")
         return self._handler(remote_cmd)
 
 
@@ -215,7 +229,7 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["post_kill_journal_state"], "NODE_ADD_VERIFYING")
         self.assertTrue(result["state_restored"])
-        self.assertTrue(result["lock_released"])
+        self.assertTrue(result["lock_kept_by_the_run"])
         self.assertEqual(result["rollback_journal_state"], "NODE_ADD_ROLLED_BACK")
 
     def test_neg_13_dispatch_without_verifying_state_is_incomplete(self):
@@ -309,8 +323,7 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertFalse(result["state_restored"])
         self.assertEqual(result["status"], "INCOMPLETE")
 
-    @patch("live_vps.negative.MUTATION_LOCK_WAIT_SECONDS", 0)
-    def test_neg_13_held_mutation_lock_is_incomplete(self):
+    def test_neg_13_a_dispatch_that_moves_the_runs_holder_is_incomplete(self):
         from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
 
         journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
@@ -319,8 +332,6 @@ class TestNegativeScenarios(unittest.TestCase):
         def handler(cmd):
             if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
                 return SSHResult(0, json.dumps({"nodes": []}), "")
-            if "flock -n /run/lock/gowave-managed-mutation.lock" in cmd:
-                return SSHResult(1, "", "")
             if "nohup setsid" in cmd:
                 return SSHResult(0, "PID:4242\n", "")
             if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
@@ -337,26 +348,22 @@ class TestNegativeScenarios(unittest.TestCase):
             return SSHResult(0, "", "")
 
         config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
-        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
-        self.assertFalse(result["lock_released"])
+        result = run_neg_13_worker_deploy_interrupted_journal(
+            FakeSSH(handler, holder_pids=("4242", "9999")), config
+        )
+        self.assertFalse(result["lock_kept_by_the_run"])
         self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertIn("changed the host mutation lock holder", result["message"])
 
-    @patch("live_vps.negative.MUTATION_LOCK_WAIT_SECONDS", 0)
-    def test_neg_13_reaps_the_orphaned_dispatch_and_passes(self):
+    def test_neg_13_a_dispatch_that_leaves_the_runs_holder_passes(self):
         from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
 
         journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
         journal_reads = []
-        reaped = []
 
         def handler(cmd):
             if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
                 return SSHResult(0, json.dumps({"nodes": []}), "")
-            if "readlink -f" in cmd:
-                reaped.append(True)
-                return SSHResult(0, "", "")
-            if "flock -n /run/lock/gowave-managed-mutation.lock" in cmd:
-                return SSHResult(0 if reaped else 1, "", "")
             if "nohup setsid" in cmd:
                 return SSHResult(0, "PID:4242\n", "")
             if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
@@ -374,27 +381,28 @@ class TestNegativeScenarios(unittest.TestCase):
 
         config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
         result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
-        self.assertTrue(result["lock_released"])
-        self.assertTrue(result["lock_released_after_reap"])
+        self.assertTrue(result["lock_kept_by_the_run"])
         self.assertEqual(result["status"], "PASS")
 
-    @patch("live_vps.negative.MUTATION_LOCK_WAIT_SECONDS", 0)
-    def test_neg_11_held_mutation_lock_skips_the_restore(self):
+    def test_neg_11_a_restore_the_lock_refuses_is_incomplete(self):
         from live_vps.negative import run_neg_11_backup_corrupted_tar
 
         def handler(cmd):
-            if "flock -n /run/lock/gowave-managed-mutation.lock" in cmd:
-                return SSHResult(1, "", "")
             if "sha256sum -- /opt/gowave/gowave.db" in cmd:
                 return SSHResult(0, "dbhash  -\n", "")
             if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
                 return SSHResult(0, "journalhash  -\n", "")
+            if " restore " in cmd:
+                return SSHResult(1, "", "Could not acquire host mutation lock")
             return SSHResult(0, "", "")
 
         fake = FakeSSH(handler)
         result = run_neg_11_backup_corrupted_tar(fake, MagicMock(restore_timeout=120))
         self.assertEqual(result["status"], "INCOMPLETE")
-        self.assertFalse(any(" restore " in call for call in fake.calls))
+        self.assertFalse(result["lease_presented"])
+        # The lock refusal is the product's answer to a restore it was handed,
+        # not a reason to stop before handing it one.
+        self.assertTrue(any(" restore " in call for call in fake.calls))
 
     def test_neg_13_committed_after_interruption_is_fail(self):
         from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
@@ -469,6 +477,316 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertEqual(len(res["scenarios"]), 15)
         for s in res["scenarios"]:
             self.assertEqual(s["status"], "SKIP")
+
+
+class LeaseRecordingSSH:
+    """Records the stdin handed to each remote command, which FakeSSH drops."""
+
+    host = "198.51.100.10"
+
+    def __init__(self, result):
+        self._result = result
+        self.calls = []
+
+    def run(self, remote_cmd, input_data=None, timeout=60):
+        self.calls.append({"cmd": remote_cmd, "input_data": input_data})
+        return self._result
+
+
+ACME_REFUSAL = SSHResult(
+    returncode=1,
+    stdout="",
+    stderr=(
+        "Error: Invalid GOWAVE_ACME_SERVER: "
+        "'https://invalid-acme-directory.example.com/directory'. Only "
+        "'https://acme-staging-v02.api.letsencrypt.org/directory' or "
+        "'https://acme-v02.api.letsencrypt.org/directory' are supported.\n"
+    ),
+)
+
+LOCK_REFUSAL = SSHResult(
+    returncode=1,
+    stdout="",
+    stderr=(
+        "Error: Another process currently holds the mutation lock "
+        "(/run/lock/gowave-managed-mutation.lock).\n"
+        "Refusing concurrent mutation without an authorized re-entrant lease.\n"
+    ),
+)
+
+
+class TestNeg05PresentsTheRunsLease(unittest.TestCase):
+    def test_the_probe_hands_the_runs_lease_to_the_install_over_stdin(self):
+        ssh = LeaseRecordingSSH(ACME_REFUSAL)
+
+        result = run_neg_05_acme_install_failure(
+            ssh,
+            lease_token="token-of-this-run",
+            panel_domain="panel.gowave.test",
+            reality_domain="reality.gowave.test",
+        )
+
+        self.assertEqual(len(ssh.calls), 1)
+        self.assertEqual(ssh.calls[0]["input_data"], "GOWAVE_LEASE: token-of-this-run\n")
+        self.assertIn("gowave-auto.sh install", ssh.calls[0]["cmd"])
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["lease_presented"])
+        self.assertEqual(result["exit_code"], 1)
+
+    def test_the_install_is_given_the_runs_own_domains_not_an_unresolvable_placeholder(self):
+        ssh = LeaseRecordingSSH(ACME_REFUSAL)
+
+        result = run_neg_05_acme_install_failure(
+            ssh, panel_domain="panel.gowave.test", reality_domain="reality.gowave.test"
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("install panel.gowave.test reality.gowave.test", ssh.calls[0]["cmd"])
+        self.assertNotIn("invalid.example.com", ssh.calls[0]["cmd"])
+
+    def test_a_lock_refusal_is_reported_as_a_failure_not_as_the_acme_rejection(self):
+        ssh = LeaseRecordingSSH(LOCK_REFUSAL)
+
+        result = run_neg_05_acme_install_failure(
+            ssh, panel_domain="panel.gowave.test", reality_domain="reality.gowave.test"
+        )
+
+        self.assertIsNone(ssh.calls[0]["input_data"])
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(result["lease_presented"])
+        self.assertIn("Another process currently holds the mutation lock", result["message"])
+
+    @patch("live_vps.negative.run_neg_05_acme_install_failure", return_value={"status": "FAIL"})
+    @patch("live_vps.negative.run_neg_04_dns_missing_aaaa", return_value={"status": "PASS"})
+    @patch("live_vps.negative.run_neg_03_dns_wrong_ip", return_value={"status": "PASS"})
+    @patch("live_vps.negative.run_neg_02_ssh_port_unreachable", return_value={"status": "PASS"})
+    @patch("live_vps.negative.run_neg_01_ssh_host_key_absent", return_value={"status": "PASS"})
+    def test_the_negative_suite_passes_the_masters_lease_to_the_acme_probe(
+        self, neg01, neg02, neg03, neg04, neg05
+    ):
+        config = MagicMock()
+        config.test_negative_suite = True
+        config.master_panel_domain = "panel.gowave.test"
+        config.master_reality_domain = "reality.gowave.test"
+        master_ssh = MagicMock()
+
+        run_negative_suite(
+            config, master_ssh=master_ssh, master_lease_token="lease-of-this-run"
+        )
+
+        neg05.assert_called_once_with(
+            master_ssh,
+            lease_token="lease-of-this-run",
+            panel_domain="panel.gowave.test",
+            reality_domain="reality.gowave.test",
+        )
+
+
+class TestMutatingScenariosStageTheRunsLease(unittest.TestCase):
+    """A mutating case runs under the run's own lock, so it hands that lease over."""
+
+    TOKEN = "lease-of-this-run-8f3c"
+
+    def assert_the_token_travelled_as_stdin_only(self, fake):
+        self.assertNotIn(
+            self.TOKEN,
+            "\n".join(fake.calls),
+            "the lease token must reach the host over stdin, not on a command line",
+        )
+        staged = [
+            input_data
+            for cmd, input_data in fake.inputs
+            if cmd.startswith("umask 077 && cat > /run/gowave-negative-lease")
+        ]
+        self.assertEqual(staged, [f"{self.TOKEN}\n"])
+
+    def test_neg_11_stages_the_lease_for_the_restore_and_removes_it(self):
+        from live_vps.negative import run_neg_11_backup_corrupted_tar
+
+        def handler(cmd):
+            if "sha256sum -- /opt/gowave/gowave.db" in cmd:
+                return SSHResult(0, "dbhash  -\n", "")
+            if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                return SSHResult(0, "journalhash  -\n", "")
+            if "systemctl is-active" in cmd:
+                return SSHResult(0, "", "")
+            if " restore " in cmd:
+                return SSHResult(1, "", "Validation Error: truncated header")
+            return SSHResult(0, "", "")
+
+        fake = FakeSSH(handler)
+        result = run_neg_11_backup_corrupted_tar(
+            fake, MagicMock(restore_timeout=120), lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["lease_presented"])
+        self.assert_the_token_travelled_as_stdin_only(fake)
+        restore = [call for call in fake.calls if " restore " in call]
+        self.assertEqual(len(restore), 1)
+        self.assertIn("printf 'GOWAVE_LEASE: %s\\n'", restore[0])
+        self.assertIn("cat /run/gowave-negative-lease", restore[0])
+        self.assertEqual(fake.calls[-1], "rm -f -- /run/gowave-negative-lease")
+
+    def test_neg_14_claims_the_registered_name_for_a_second_address(self):
+        from live_vps.negative import (
+            NEG14_DUPLICATE_REFUSAL,
+            NEG14_SECOND_ADDRESS,
+            run_neg_14_duplicate_worker_registration,
+        )
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  /var/lib/gowave-auto-nginx/state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                return SSHResult(0, "kh-before\n", "")
+            if "node add" in cmd:
+                return SSHResult(
+                    1,
+                    "",
+                    f"Error: {NEG14_DUPLICATE_REFUSAL} worker-1 for the node at "
+                    "203.0.113.30; choose another name or remove that entry first.\n",
+                )
+            return SSHResult(0, "", "")
+
+        fake = FakeSSH(handler)
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        result = run_neg_14_duplicate_worker_registration(
+            fake, "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["recorded_address"], "203.0.113.30")
+        self.assertEqual(result["attempted_address"], NEG14_SECOND_ADDRESS)
+        self.assertTrue(result["known_hosts_restored"])
+        self.assertTrue(result["lease_presented"])
+        self.assert_the_token_travelled_as_stdin_only(fake)
+        add = [call for call in fake.calls if "node add" in call]
+        self.assertEqual(len(add), 1)
+        self.assertIn(NEG14_SECOND_ADDRESS, add[0])
+        self.assertNotIn(" 203.0.113.30 ", add[0])
+        self.assertIn("cat /run/gowave-negative-lease", add[0])
+        pinned = [call for call in fake.calls if "neg14-dummy-ed25519" in call and "ssh-keygen" in call]
+        self.assertEqual(len(pinned), 1)
+        self.assertIn(">> /root/.ssh/known_hosts", pinned[0])
+        restore = [
+            index for index, call in enumerate(fake.calls)
+            if "cat /tmp/neg14-known-hosts.bak > /root/.ssh/known_hosts" in call
+        ]
+        self.assertEqual(len(restore), 1)
+        lease_removed = [
+            index for index, call in enumerate(fake.calls)
+            if "rm -f -- /run/gowave-negative-lease" in call
+        ]
+        self.assertEqual(len(lease_removed), 1)
+        self.assertLess(lease_removed[0], restore[0])
+
+    def test_neg_14_a_refusal_that_does_not_name_the_recorded_address_fails(self):
+        from live_vps.negative import run_neg_14_duplicate_worker_registration
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                return SSHResult(0, "kh-before\n", "")
+            if "node add" in cmd:
+                return SSHResult(
+                    1, "",
+                    "Error: state.json already registers the name worker-1 for the node at "
+                    "198.51.100.7; choose another name or remove that entry first.\n",
+                )
+            return SSHResult(0, "", "")
+
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        result = run_neg_14_duplicate_worker_registration(
+            FakeSSH(handler), "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(result["explicit_duplicate_rejection"])
+
+    def test_neg_14_a_known_hosts_left_changed_fails(self):
+        from live_vps.negative import run_neg_14_duplicate_worker_registration
+
+        reads = []
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                reads.append(cmd)
+                return SSHResult(0, f"kh-{len(reads)}\n", "")
+            if "node add" in cmd:
+                return SSHResult(
+                    1, "",
+                    "Error: state.json already registers the name worker-1 for the node at "
+                    "203.0.113.30; choose another name or remove that entry first.\n",
+                )
+            return SSHResult(0, "", "")
+
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        result = run_neg_14_duplicate_worker_registration(
+            FakeSSH(handler), "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(result["explicit_duplicate_rejection"])
+        self.assertFalse(result["known_hosts_restored"])
+
+    def test_neg_14_a_pin_that_cannot_be_written_leaves_known_hosts_alone(self):
+        from live_vps.negative import run_neg_14_duplicate_worker_registration
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                return SSHResult(0, "kh-before\n", "")
+            if "neg14-dummy-ed25519" in cmd and "ssh-keygen" in cmd:
+                return SSHResult(1, "", "ssh-keygen: permission denied\n")
+            return SSHResult(0, "", "")
+
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        fake = FakeSSH(handler)
+        result = run_neg_14_duplicate_worker_registration(
+            fake, "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse([call for call in fake.calls if "node add" in call])
+        restore = [call for call in fake.calls if "neg14-known-hosts.bak" in call and "cat" in call]
+        self.assertTrue(restore, "a pin that never landed was left in known_hosts")
 
 
 if __name__ == "__main__":

@@ -16,17 +16,53 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from modules.api_client import REALITY_DEFAULT_FINGERPRINT
+
 from .panel_api import E2EPanelClient
 from .redaction import register_secret
 
+# The pinned Panel answers 403 for a missing and for an explicitly blank
+# User-Agent (`internal/subscription/serve.go`, whose own test asserts it), and
+# that is the code the container contour requires. A range here would excuse a
+# Panel that started answering 400, which is a weaker claim about one product.
+SUBSCRIPTION_UA_REFUSAL_STATUS = 403
 
-def expected_proxy_count(has_vision: bool = False, vision_count: Optional[int] = None) -> int:
-    """Return the expected number of core plus independently configured Vision proxies."""
+
+#: Core endpoints a single traffic plane delivers (REALITY, TLS, XHTTP and the
+#: XHTTP/TLS pair's plain counterpart); each node adds its own set, and each
+#: Vision domain adds one more on top of its node.
+CORE_ENDPOINTS_PER_NODE = 4
+
+
+def expected_proxy_count(
+    has_vision: bool = False,
+    vision_count: Optional[int] = None,
+    node_count: int = 2,
+) -> int:
+    """Return the expected number of core plus independently configured Vision proxies.
+
+    A Panel-only install deploys no traffic plane on the Master, so its
+    subscription carries the Worker's endpoints only: four per node instead of
+    eight for the two-node all-in-one topology.
+    """
+    if type(node_count) is not int or node_count not in (1, 2):
+        raise ValueError("node_count must be an integer 1 or 2")
     if vision_count is None:
-        return 10 if has_vision else 8
+        vision_count = node_count if has_vision else 0
     if type(vision_count) is not int or vision_count not in (0, 1, 2):
         raise ValueError("vision_count must be an integer from 0 through 2")
-    return 8 + vision_count
+    if vision_count > node_count:
+        raise ValueError("vision_count cannot exceed node_count")
+    return CORE_ENDPOINTS_PER_NODE * node_count + vision_count
+
+
+def installed_node_count(install_mode: str) -> int:
+    """Number of traffic planes an install mode deploys."""
+    if install_mode == "panel-only":
+        return 1
+    if install_mode == "all-in-one":
+        return 2
+    raise ValueError(f"Unsupported install mode: {install_mode}")
 
 
 def get_default_user_short_uuid(panel_client: E2EPanelClient) -> str:
@@ -91,8 +127,8 @@ def verify_user_agent_policy(
     except Exception as exc:
         blank_error = f"{type(exc).__name__}: {exc}"
 
-    absent_rejected = absent_code in (400, 403)
-    blank_rejected = blank_code in (400, 403)
+    absent_rejected = absent_code == SUBSCRIPTION_UA_REFUSAL_STATUS
+    blank_rejected = blank_code == SUBSCRIPTION_UA_REFUSAL_STATUS
 
     # 2. Valid Xray User-Agent
     xray_accepted = False
@@ -160,8 +196,9 @@ def fetch_and_validate_xray_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
-    reality_fingerprint: str = "firefox",
+    reality_fingerprint: str = REALITY_DEFAULT_FINGERPRINT,
     vision_count: Optional[int] = None,
+    node_count: int = 2,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Xray JSON subscription and validate schema, proxy outbounds, and xray run -test."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
@@ -220,7 +257,7 @@ def fetch_and_validate_xray_subscription(
             if protocol.lower() in ("vless", "trojan", "vmess", "shadowsocks"):
                 proxy_outbounds.append(outbound)
 
-    expected_count = expected_proxy_count(has_vision, vision_count)
+    expected_count = expected_proxy_count(has_vision, vision_count, node_count)
     if len(proxy_outbounds) != expected_count:
         return False, {
             "error": f"Expected {expected_count} proxy outbounds, found {len(proxy_outbounds)}",
@@ -305,8 +342,9 @@ def fetch_and_validate_mihomo_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
-    reality_fingerprint: str = "firefox",
+    reality_fingerprint: str = REALITY_DEFAULT_FINGERPRINT,
     vision_count: Optional[int] = None,
+    node_count: int = 2,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/mihomo"
@@ -334,7 +372,7 @@ def fetch_and_validate_mihomo_subscription(
     if not isinstance(proxies, list):
         return False, {"error": "Mihomo subscription proxies must be a list"}
     try:
-        expected_count = expected_proxy_count(has_vision, vision_count)
+        expected_count = expected_proxy_count(has_vision, vision_count, node_count)
     except ValueError as exc:
         return False, {"error": str(exc)}
     if len(proxies) != expected_count:

@@ -3,13 +3,24 @@ import base64
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NODE_SH = REPO_ROOT / "modules" / "node.sh"
+XRAY_CORE_SH = REPO_ROOT / "modules" / "xray_core.sh"
+OS_SH = REPO_ROOT / "modules" / "os.sh"
+PANEL_SH = REPO_ROOT / "modules" / "panel.sh"
+ARTIFACT_SH = REPO_ROOT / "modules" / "artifact.sh"
+PREFLIGHT_SH = REPO_ROOT / "modules" / "preflight.sh"
+NODE_AUTO_SH = REPO_ROOT / "gowave-node-auto.sh"
+MATRIX_YAML = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
 
 
 def node_sh_without_bundle(directory: Path) -> Path:
@@ -18,6 +29,109 @@ def node_sh_without_bundle(directory: Path) -> Path:
     copy.parent.mkdir(parents=True)
     copy.write_bytes(NODE_SH.read_bytes())
     return copy
+
+
+def capture_remote_script(directory, *command, extra_env=None) -> str:
+    """Run a remote-* subcommand against a mock ssh and return the streamed script."""
+    directory = Path(directory)
+    known_hosts = directory / "known_hosts"
+    known_hosts.write_text(
+        "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n"
+    )
+    bin_dir = directory / "bin"
+    bin_dir.mkdir()
+    capture = directory / "payload.sh"
+    mock_ssh = bin_dir / "ssh"
+    mock_ssh.write_text(f'#!/bin/sh\ncat > "{capture}"\nexit 0\n')
+    mock_ssh.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+    env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(
+        [str(REPO_ROOT / "gowave-node-auto.sh"), *command],
+        env=env, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"stdout: {result.stdout}, stderr: {result.stderr}")
+    return capture.read_text()
+
+
+#: Takes the Worker's mutation lock the way the live runner's `RemotePairLock`
+#: does — an exclusive `flock` with the lease naming the holder published beside
+#: the lock — and then runs the finalizer in a process of its own. The holder
+#: stays the finalizer's parent so both live in one user namespace: a process in
+#: a child namespace cannot read the descriptor targets of one outside it, which
+#: would make the validator's own check fail for a reason the Worker never sees.
+LOCK_HOLDER_DRIVER = """
+import fcntl, json, os, subprocess, sys
+lock_path, lease_path, holder_token, finalizer, result_path = sys.argv[1:6]
+fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(lease_path, "w", encoding="utf-8") as stream:
+    json.dump({"run_id": "run-test", "host": "127.0.0.1",
+               "holder_pid": os.getpid(), "lease_token": holder_token}, stream)
+result = subprocess.run(["bash", finalizer], capture_output=True, text=True)
+with open(result_path, "w", encoding="utf-8") as stream:
+    json.dump({"returncode": result.returncode, "stdout": result.stdout,
+               "stderr": result.stderr}, stream)
+"""
+
+
+def run_rendered_finalizer(directory, transaction, lease_token, holder_token=None):
+    """Run the finalize script the product streams while a real holder owns the lock.
+
+    `lease_token` is what the rendered script presents; `holder_token` is what the
+    live lease names, so the two differ when another run's lease is borrowed.
+    """
+    directory = Path(directory)
+    render_dir = directory / "render"
+    render_dir.mkdir()
+    script = capture_remote_script(
+        render_dir, "remote_finalize", "127.0.0.1", "22", "root",
+        extra_env={
+            "ACME_TX_ID": transaction.name,
+            "GOWAVE_WORKER_LEASE_TOKEN": lease_token,
+        },
+    )
+    root_line = 'recovery_root="/var/lib/gowave-auto-nginx/recovery"'
+    if script.count(root_line) != 1:
+        raise AssertionError("the streamed finalizer no longer names one recovery root")
+    finalizer = render_dir / "finalize.sh"
+    finalizer.write_text(
+        script.replace(root_line, f'recovery_root="{transaction.parent}"'), encoding="utf-8"
+    )
+
+    lock = directory / "gowave-managed-mutation.lock"
+    lease = directory / "gowave-mutation-lease.json"
+    result_path = directory / "finalizer-result.json"
+    env = os.environ.copy()
+    env["MUTATION_LOCK_FILE"] = str(lock)
+    env["MUTATION_LEASE_FILE"] = str(lease)
+    command = [
+        sys.executable, "-c", LOCK_HOLDER_DRIVER,
+        str(lock), str(lease), holder_token or lease_token, str(finalizer), str(result_path),
+    ]
+    if os.geteuid() != 0:
+        # The root guard is part of what the Worker runs, so the script is not
+        # relaxed for the test: holder and finalizer both run as uid 0 in a user
+        # namespace, which keeps the validator's owner, liveness and descriptor
+        # checks meaningful.
+        unshare = shutil.which("unshare")
+        if not unshare or subprocess.run(
+            [unshare, "-r", "true"], capture_output=True
+        ).returncode != 0:
+            raise unittest.SkipTest("this host cannot grant the finalizer its root guard")
+        command = [unshare, "-r", "--", *command]
+    driver = subprocess.run(command, env=env, capture_output=True, text=True)
+    if not result_path.exists():
+        raise AssertionError(f"the finalizer never ran: {driver.stdout}{driver.stderr}")
+    recorded = json.loads(result_path.read_text(encoding="utf-8"))
+    return subprocess.CompletedProcess(command, recorded["returncode"],
+                                       recorded["stdout"], recorded["stderr"])
 
 
 class TestNodeIntegration(unittest.TestCase):
@@ -254,9 +368,23 @@ class TestNodeIntegration(unittest.TestCase):
         """Worker deployment must include automated compensating rollback on error."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         self.assertIn("compensate_remote_worker", worker_script)
-        self.assertIn("trap 'exit_code=$?; compensate_remote_worker \"$exit_code\"; exit \"$exit_code\"' ERR", worker_script)
-        self.assertIn("systemctl stop gowave-node.service", worker_script)
-        self.assertIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
+        # The ERR trap is the same guarded handler as a signal, because the
+        # compensator returns the exit code it was given: called straight from
+        # the trap it would re-enter and roll the host back twice.
+        self.assertIn("trap 'handle_error \"$?\"' ERR", worker_script)
+        # Both units are cleaned up by name from a loop that skips a unit the host
+        # does not have, so the assertion names the loop rather than one stop line.
+        self.assertIn("for unit in gowave-node.service xray.service; do", worker_script)
+        self.assertIn('systemctl stop "$unit" 2>/dev/null || rollback_failed=1', worker_script)
+        # The service directory is no longer removed by a blanket rm: it comes
+        # back from the transaction's before-image, so a path this install did
+        # not write is not deleted by a rollback that never owned it.
+        self.assertIn('restore_worker_targets_before_image \\\n'
+                      '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                      '"$_ACME_TX_ID")" ||\n'
+                      '        rollback_failed=1\n',
+                      worker_script)
+        self.assertNotIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
         self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
         self.assertIn("ufw delete allow proto tcp from \"$PANEL_IP\"", worker_script)
@@ -266,7 +394,11 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('active_swaps=$(swapon --noheadings --raw --output NAME 2>/dev/null)', worker_script)
 
         self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
-        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1', worker_script)
+        self.assertIn(
+            'restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" "$state_root/recovery" '
+            '"$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1',
+            worker_script,
+        )
 
     def test_worker_keeps_port_80_acme_vhost_for_renewal(self):
         """Worker port-80 ACME vhost must survive issuance; deleting it makes renewal 404."""
@@ -285,8 +417,15 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotIn(f"rm -f {vhost}", body)
         self.assertIn("return 301 https://\\$host\\$request_uri;", body)
 
+        inventory_start = payload.index("worker_mutation_targets() {")
+        inventory_end = payload.index("\n}\n", inventory_start) + len("\n}\n")
+        self.assertIn(vhost, payload[inventory_start:inventory_end])
         rollback_start = payload.index("compensate_remote_worker() {")
-        self.assertIn(vhost, payload[rollback_start:])
+        self.assertIn('restore_worker_targets_before_image \\\n'
+                      '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                      '"$_ACME_TX_ID")" ||\n'
+                      '        rollback_failed=1\n',
+                      payload[rollback_start:])
 
         uninstall_start = script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
         uninstall = script[uninstall_start:script.index("\nROLLBACK_REMOTE_SCRIPT", uninstall_start)]
@@ -329,7 +468,22 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn(') || {', rollback_script)
         self.assertIn("nginx -t >/dev/null 2>&1", rollback_script)
         self.assertIn('systemctl reload nginx 2>/dev/null || rollback_failed=1', rollback_script)
-        self.assertIn('rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1', rollback_script)
+        # A file the install did not write is not removed by its rollback: the
+        # drop-in goes only when it carries the marker that says this install
+        # wrote it, and never on an unguarded ``rm -f``.
+        self.assertIn(
+            "if [[ -f /etc/sysctl.d/99-gowave-node.conf ]] &&\n"
+            "    grep -qxF '# Managed by GoWave Auto NGINX' "
+            "/etc/sysctl.d/99-gowave-node.conf; then\n"
+            "    rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1\n"
+            "fi\n",
+            rollback_script,
+        )
+        self.assertNotIn(
+            "# 5. Clean sysctl, project-owned DNS drop-in and scratch\n"
+            "rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1\n",
+            rollback_script,
+        )
         self.assertIn('sysctl --system 2>/dev/null || rollback_failed=1', rollback_script)
         self.assertIn("one or more cleanup or restoration operations failed", rollback_script)
         self.assertIn('ufw status numbered 2>/dev/null', rollback_script)
@@ -494,6 +648,9 @@ class TestNodeIntegration(unittest.TestCase):
                 declaration.write_text("# configured by the distribution\nIPV6=yes\n")
                 exports = (
                     "kernel_has_ipv6() { return %d; }\n"
+                    # The before-image is taken by a helper outside this slice; the
+                    # subject here is the IPv6 branch the function renders.
+                    "record_firewall_before_image() { return 0; }\n"
                     'export PANEL_IP="10.89.0.10"\nexport SSH_PORT=22\nexport NODE_PORT=3002\n'
                     % decision
                 )
@@ -638,11 +795,39 @@ class TestNodeIntegration(unittest.TestCase):
             auto_script.index('client.provision_config_profile(f"GoWave Worker {name} Profile"', callback_at),
         )
 
+    def test_node_add_refuses_a_foreign_name_before_the_first_panel_write(self):
+        """A name another server holds is refused before the journal, not adopted."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        guard_at = script.index("for held in client.list_nodes():")
+        login_at = script.rindex("client.login(admin_user, admin_password)", 0, guard_at)
+        journal_at = script.index('"state": "NODE_ADD_PREPARED"', guard_at)
+        profile_at = script.index(
+            'client.provision_config_profile(f"GoWave Worker {name} Profile"', journal_at
+        )
+        self.assertLess(login_at, guard_at)
+        self.assertLess(guard_at, journal_at, "the inventory check must precede the journal")
+        self.assertLess(journal_at, profile_at)
+        guard = script[guard_at:journal_at]
+        # The retry of this very node is not a collision; a different address is.
+        self.assertIn('str(held.get("address") or "") == address', guard)
+        self.assertIn("raise SystemExit(3)", guard)
+
+    def test_a_refused_worker_name_returns_without_a_rollback(self):
+        """Exit 3 means nothing was written, so no rollback may be attempted."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        branch_at = script.index("if (( register_rc == 3 )); then")
+        returned_at = script.index("return 1", branch_at)
+        rollback_at = script.index("rollback_provisioning(", returned_at)
+        self.assertLess(returned_at, rollback_at, "a name refusal reached the rollback")
+        self.assertIn("not changed", script[branch_at:returned_at])
+
     def test_node_add_pre_dispatch_failures_stay_inside_api_rollback_boundary(self):
         """Resolve local prerequisites early and persist VERIFYING inside the guarded API transaction."""
         worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
         secret_index = worker_script.index('if ! secret_key=$(extract_secret_key "$GOWAVE_DIR")')
-        api_index = worker_script.index("if ! PYTHONPATH=", secret_index)
+        api_index = worker_script.index(
+            "# 2. Register the node using argv for data and FD 3 for the password.", secret_index
+        )
         dispatch_index = worker_script.index('if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
         self.assertLess(secret_index, api_index)
         self.assertLess(api_index, dispatch_index)
@@ -666,7 +851,7 @@ class TestNodeIntegration(unittest.TestCase):
         remote_end = worker_script.index("\nROLLBACK_REMOTE_SCRIPT", remote_start)
         rollback_script = worker_script[remote_start:remote_end]
         acme_start = rollback_script.index("# 3. Clean ACME certificates")
-        acme_end = rollback_script.index("# 4. Remove UFW rules", acme_start)
+        acme_end = rollback_script.index("# 4. Restore the UFW before-image", acme_start)
         acme_cleanup = rollback_script[acme_start:acme_end]
         self.assertIn('restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN"', acme_cleanup)
         self.assertIn("ACME_TX_ID missing; preserving unknown certificate lineage", acme_cleanup)
@@ -681,9 +866,76 @@ class TestNodeIntegration(unittest.TestCase):
         commit_block = worker_script[commit_start:commit_end]
         self.assertIn("if ! python3 -c", commit_block)
         self.assertIn('ACME_TX_ID="$acme_tx_id"', commit_block)
-        self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', commit_block)
-        self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", commit_block)
+        # Both sides are compensated by the one finalizer the two failure paths
+        # share, so the block names that call and the finalizer holds the two
+        # compensations: a copy here would be a second place to forget a side.
+        self.assertIn('finalize_failed_node_add "$name" "$ip" "$ssh_port"', commit_block)
+        finalizer_start = worker_script.index("finalize_failed_node_add() {")
+        finalizer = worker_script[finalizer_start:worker_script.index("\ncmd_node() {", finalizer_start)]
+        self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', finalizer)
+        self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", finalizer)
         self.assertIn("return 1", commit_block)
+
+    def test_the_rendered_finalizer_accepts_the_lock_lease_of_the_run_that_owns_it(self):
+        """The streamed finalize script honours the pair lock's lease.
+
+        Measured on the live pair: `remote_finalize` took `flock` directly while the
+        run that installed the Worker held that same lock through `RemotePairLock`,
+        so the finalizer answered "Another process currently holds the mutation
+        lock", the verified install kept its snapshot, and every later install on
+        the Worker was refused as an unfinalized transaction.
+
+        The script under test is the one the product renders (a mock `ssh` captures
+        the stream) with only its recovery root rewritten into a temporary
+        directory; the root guard, the lock paths and the lease check are what the
+        Worker receives. The lock is taken by a real holder that publishes a real
+        lease, so the validator's owner, liveness and descriptor checks all run
+        against a live process, and the finalizer still fails its own `flock`.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            token = "lease-token-of-the-owning-run"
+            transaction = root / "recovery" / "worker_install_test_1_1"
+            transaction.mkdir(parents=True)
+            result = run_rendered_finalizer(root, transaction, lease_token=token)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Worker ACME recovery snapshot finalized", result.stderr)
+            self.assertFalse(transaction.exists())
+
+    def test_the_rendered_finalizer_refuses_another_runs_lease(self):
+        """A lease that names a different run buys the finalizer nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            transaction = root / "recovery" / "worker_install_test_1_1"
+            transaction.mkdir(parents=True)
+            result = run_rendered_finalizer(
+                root, transaction,
+                lease_token="a-borrowed-token",
+                holder_token="the-owning-runs-token",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Another process currently holds the mutation lock", result.stderr)
+            self.assertTrue(transaction.exists())
+
+    def test_every_finalize_call_hands_over_the_runs_lease(self):
+        """A finalize call that drops the token is refused by the lock it must honour.
+
+        The Worker-side fix is only reachable if the controller passes the lease
+        into `remote_finalize`; `node add` and `node reapply` each hold a session
+        that already carries it, and an inherited environment is not a contract.
+        """
+        lines = (REPO_ROOT / "gowave-auto.sh").read_text().splitlines()
+        call_sites = [
+            index for index, line in enumerate(lines)
+            if 'gowave-node-auto.sh" remote_finalize' in line
+        ]
+        self.assertEqual(len(call_sites), 2, call_sites)
+        for index in call_sites:
+            handed = "\n".join(lines[max(0, index - 3):index + 1])
+            self.assertIn(
+                'GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}"', handed,
+                f"the finalize call at line {index + 1} does not pass the run's lease",
+            )
 
     def test_worker_acme_snapshot_is_retained_until_controller_commit(self):
         """The remote payload must preserve its ACME before-image until the controller commits."""
@@ -1048,6 +1300,114 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertTrue(restored_privkey.is_symlink())
             self.assertEqual(restored_fullchain.resolve(), (letsencrypt / "archive" / domain / "cert1.pem").resolve())
             self.assertEqual(restored_privkey.resolve(), (letsencrypt / "archive" / domain / "privkey1.pem").resolve())
+
+    def test_standalone_acme_restore_removes_a_lineage_that_did_not_exist_before(self):
+        """A snapshot of an absent lineage restores to "absent", not to a refused rollback."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        function_start = worker_script.index("restore_acme_lineage() {", remote_start)
+        lock_at = worker_script.index("\nacquire_mutation_lock\n", function_start)
+        function_end = worker_script.rindex("\n}", function_start, lock_at) + 2
+        restore_function = worker_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            domain = "worker-two.example.com"
+            snap_dir = recovery / "txn-1" / "acme" / domain
+            snap_dir.mkdir(parents=True)
+            # The snapshot writer records an absent lineage with an empty serial
+            # and fingerprint, which is what the live rollback reads back.
+            (snap_dir / "lineage-manifest.json").write_text(json.dumps({
+                "domain": domain,
+                "existed_before": False,
+                "serial": "",
+                "fingerprint": "",
+            }))
+            renewal_dir = letsencrypt / "renewal"
+            live_dir = letsencrypt / "live" / domain
+            archive_dir = letsencrypt / "archive" / domain
+            renewal_dir.mkdir(parents=True)
+            live_dir.mkdir(parents=True)
+            archive_dir.mkdir(parents=True)
+            renewal = renewal_dir / f"{domain}.conf"
+            renewal.write_text("transaction-created renewal configuration")
+            (live_dir / "fullchain.pem").write_text("transaction-created live certificate")
+            (archive_dir / "cert1.pem").write_text("transaction-created archived certificate")
+
+            command = (
+                restore_function
+                + "\nrestore_acme_lineage "
+                + '"txn-1" "'
+                + domain
+                + '" "'
+                + str(recovery)
+                + '" "'
+                + str(letsencrypt)
+                + '"'
+            )
+            result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("invalid field count", result.stderr)
+            self.assertFalse(renewal.exists(), "the transaction's own renewal configuration survived")
+            self.assertFalse(live_dir.exists(), "the transaction's own live directory survived")
+            self.assertFalse(archive_dir.exists(), "the transaction's own archive survived")
+
+    def test_worker_rollback_treats_an_absent_unit_as_clean_and_a_failed_stop_as_incomplete(self):
+        """Xray is supervised by gowave-node, so a host without xray.service is clean."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        payload_start = worker_script.index("cat <<'RUNNER_FUNCS'")
+        function_start = worker_script.index("compensate_remote_worker() {", payload_start)
+        loop_start = worker_script.index("        for unit in gowave-node.service xray.service; do", function_start)
+        loop_end = worker_script.index("\n        done\n", loop_start) + len("\n        done\n")
+        loop = worker_script[loop_start:loop_end]
+
+        def run_loop(stop_status):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                bin_dir = Path(tmpdir) / "bin"
+                bin_dir.mkdir()
+                systemctl = bin_dir / "systemctl"
+                # The stub owns the same unit table the host would: gowave-node is
+                # installed, xray is not, and stopping a unit that is not installed
+                # fails the way systemd fails it.
+                systemctl.write_text(f"""#!/bin/sh
+installed="gowave-node.service"
+case "$1" in
+    list-unit-files)
+        for unit in $installed; do
+            [ "$unit" = "$2" ] && echo "$2"
+        done
+        exit 0
+        ;;
+    is-active)
+        exit 3
+        ;;
+    stop|disable)
+        for unit in $installed; do
+            [ "$unit" = "$2" ] && exit {stop_status}
+        done
+        echo "Unit $2 not loaded." >&2
+        exit 5
+        ;;
+esac
+exit 0
+""")
+                systemctl.chmod(0o755)
+                script = "set -Eeuo pipefail\nrollback_failed=0\n" + loop + '\necho "rollback_failed=$rollback_failed"\n'
+                env = os.environ.copy()
+                env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+        clean = run_loop(0)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertIn("rollback_failed=0", clean.stdout,
+                      "an absent xray.service was counted as a failed cleanup")
+
+        failed = run_loop(1)
+        self.assertIn("rollback_failed=1", failed.stdout,
+                      "a unit that exists and cannot be stopped was not reported")
 
     def test_worker_remote_payload_serializes_acme_server(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1468,6 +1828,424 @@ class TestPinnedNodeInstaller(unittest.TestCase):
             self.assertFalse(dest.exists())
 
 
+class TestPinnedXrayCore(unittest.TestCase):
+    """The pinned core is the bytes the harness, the product and the payload name.
+
+    The pin names the release archive; the installed rw-core is the member
+    extracted from it and has no digest of its own. The arm64 digest is confirmed
+    against the release's published .dgst and has no second in-tree witness, so
+    the guard checks its shape there and does not pretend to compare it to one.
+    """
+
+    VERSION = "26.11.9"
+    MEMBER = "#!/bin/sh\nprintf 'Xray 26.11.9 (Xray, Penetration)\\n'\n"
+    OTHER_MEMBER = "#!/bin/sh\nprintf 'Xray 1.2.3 (Xray, Penetration)\\n'\n"
+
+    # -- fixtures ---------------------------------------------------------
+
+    def _archive(self, directory: Path, member: str = MEMBER) -> tuple[Path, str]:
+        archive = directory / "Xray.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            info = zipfile.ZipInfo("xray")
+            info.external_attr = 0o755 << 16
+            bundle.writestr(info, member)
+        return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    def _stub_curl(self, directory: Path, archive: Path | None, exit_code: int = 0):
+        bin_dir = directory / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        args_log = directory / "curl-args.txt"
+        lines = ["#!/bin/sh", f'printf \'%s\\n\' "$@" >> "{args_log}"']
+        if exit_code != 0:
+            lines.append(f"exit {exit_code}")
+        else:
+            lines += [
+                'while [ "$#" -gt 0 ]; do',
+                '  if [ "$1" = "-o" ]; then',
+                f'    cp "{archive}" "$2"',
+                "  fi",
+                "  shift",
+                "done",
+            ]
+        curl = bin_dir / "curl"
+        curl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        curl.chmod(0o755)
+        return bin_dir, args_log
+
+    def _install(self, directory: Path, bin_dir: Path, digest: str, *,
+                 version: str | None = None, install_dir: Path | None = None):
+        env = os.environ.copy()
+        env.pop("XRAY_SERVER_VERSION", None)
+        if version is not None:
+            env["XRAY_SERVER_VERSION"] = version
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        env["FIXTURE_URL"] = "https://fixture.invalid/Xray-linux-64.zip"
+        env["FIXTURE_SHA"] = digest
+        env["FIXTURE_DIR"] = str(install_dir or (directory / "install"))
+        script = (
+            f'source "{XRAY_CORE_SH}" && '
+            'GOWAVE_PINNED_XRAY_AMD64_URL="$FIXTURE_URL" '
+            'GOWAVE_PINNED_XRAY_AMD64_SHA256="$FIXTURE_SHA" '
+            'install_pinned_xray_core "$FIXTURE_DIR"'
+        )
+        return subprocess.run(["bash", "-c", script], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    @staticmethod
+    def _urls(args_log: Path) -> list[str]:
+        if not args_log.exists():
+            return []
+        return [line for line in args_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("https://")]
+
+    def _installed_core(self, directory: Path) -> Path:
+        return directory / "install" / "rw-core"
+
+    # -- delivery --------------------------------------------------------
+
+    def test_a_matching_core_is_not_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+            install = tmp / "install"
+            install.mkdir()
+            core = install / "rw-core"
+            core.write_text(self.MEMBER, encoding="utf-8")
+            core.chmod(0o755)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self._urls(args_log), [], "a satisfied pin must not download")
+            self.assertEqual(core.read_text(encoding="utf-8"), self.MEMBER)
+
+    def test_a_foreign_core_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+            install = tmp / "install"
+            install.mkdir()
+            core = install / "rw-core"
+            core.write_text(self.OTHER_MEMBER, encoding="utf-8")
+            core.chmod(0o755)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(core.read_text(encoding="utf-8"), self.MEMBER)
+            self.assertEqual(len(self._urls(args_log)), 1)
+            self.assertEqual(core.stat().st_mode & 0o777, 0o755)
+
+    def test_a_digest_mismatch_is_terminal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, _ = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+
+            result = self._install(tmp, bin_dir, "0" * 64)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not match the pinned SHA-256", result.stderr)
+            self.assertFalse(self._installed_core(tmp).exists())
+            self.assertEqual(len(self._urls(args_log)), 1,
+                             "a mismatch is terminal, so only one host may be tried")
+
+    def test_no_host_delivers_the_archive(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, _ = self._stub_curl(tmp, archive, exit_code=1)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no artifact host delivered the archive", result.stderr)
+            self.assertFalse(self._installed_core(tmp).exists())
+
+    def test_a_member_reporting_another_version_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp, member=self.OTHER_MEMBER)
+            bin_dir, _ = self._stub_curl(tmp, archive)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("the extracted core reports", result.stderr)
+            self.assertIn("Xray 1.2.3", result.stderr)
+            self.assertFalse(self._installed_core(tmp).exists())
+
+    def test_the_pin_and_its_aliases_are_delivered_once(self):
+        for version in (None, "26.11.9", "v26.11.9"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                archive, digest = self._archive(tmp)
+                bin_dir, args_log = self._stub_curl(tmp, archive)
+
+                result = self._install(tmp, bin_dir, digest, version=version)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._installed_core(tmp).read_text(encoding="utf-8"),
+                                 self.MEMBER)
+                self.assertEqual(len(self._urls(args_log)), 1)
+                self.assertIn(f"Installed pinned Xray core {self.VERSION}", result.stdout)
+                self.assertIn(digest, result.stdout)
+
+    def test_latest_and_foreign_versions_download_nothing(self):
+        for version in ("latest", "vlatest", "1.2.3", "v1.2.3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                archive, digest = self._archive(tmp)
+                bin_dir, args_log = self._stub_curl(tmp, archive)
+
+                result = self._install(tmp, bin_dir, digest, version=version)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._urls(args_log), [])
+                self.assertFalse(self._installed_core(tmp).exists())
+
+    def test_an_unsupported_architecture_abstains_and_names_the_opt_out(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+            uname = bin_dir / "uname"
+            uname.write_text("#!/bin/sh\necho riscv64\n", encoding="utf-8")
+            uname.chmod(0o755)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("riscv64", result.stderr)
+            self.assertIn("XRAY_SERVER_VERSION=latest", result.stderr)
+            self.assertNotIn("https://", result.stderr,
+                             "no artifact exists for this architecture, so none is named")
+            self.assertFalse(self._installed_core(tmp).exists())
+            self.assertEqual(self._urls(args_log), [])
+
+    # -- parity with the payload and the acceptance matrix ----------------
+
+    @staticmethod
+    def _assignments(text: str) -> dict[str, str]:
+        return dict(re.findall(r'^(GOWAVE_PINNED_XRAY_[A-Z0-9_]+)="([^"]*)"$', text, re.M))
+
+    @staticmethod
+    def _matrix_artifact(text: str) -> dict[str, str]:
+        start = text.index("- id: xray")
+        end = text.find("\n  - id:", start)
+        block = text[start:end if end != -1 else len(text)]
+        url = re.search(r"^\s+url: (\S+)$", block, re.M)
+        sha = re.search(r'^\s+sha256: "?([0-9a-f]{64})"?$', block, re.M)
+        if url is None or sha is None:
+            raise AssertionError("the matrix has no xray artifact url/sha256")
+        return {"url": url.group(1), "sha256": sha.group(1)}
+
+    def _parity_problems(self, module_text: str, payload_text: str,
+                         matrix_text: str) -> list[str]:
+        module = self._assignments(module_text)
+        payload = self._assignments(payload_text)
+        matrix = self._matrix_artifact(matrix_text)
+        problems = []
+
+        for arch in ("AMD64", "ARM64"):
+            for field in ("URL", "SHA256"):
+                key = f"GOWAVE_PINNED_XRAY_{arch}_{field}"
+                if module.get(key) != payload.get(key):
+                    problems.append(
+                        f"{key}: module={module.get(key)!r} payload={payload.get(key)!r}")
+        version = module.get("GOWAVE_PINNED_XRAY_VERSION")
+        if payload.get("GOWAVE_PINNED_XRAY_VERSION") != version:
+            problems.append("the pinned version differs between the product copies")
+        if not version or f"/v{version}/" not in matrix["url"]:
+            problems.append("the matrix url does not name the pinned version")
+        if matrix["url"] != module.get("GOWAVE_PINNED_XRAY_AMD64_URL"):
+            problems.append("the matrix url differs from the amd64 row")
+        if matrix["sha256"] != module.get("GOWAVE_PINNED_XRAY_AMD64_SHA256"):
+            problems.append("the matrix digest differs from the amd64 row")
+        if "arm64" not in module.get("GOWAVE_PINNED_XRAY_ARM64_URL", ""):
+            problems.append("the arm64 row does not name arm64")
+        if not re.fullmatch(r"[0-9a-f]{64}",
+                            module.get("GOWAVE_PINNED_XRAY_ARM64_SHA256", "")):
+            problems.append("the arm64 row has no 64-hex digest")
+        return problems
+
+    def test_the_product_and_the_matrix_name_the_same_amd64_bytes(self):
+        problems = self._parity_problems(
+            XRAY_CORE_SH.read_text(encoding="utf-8"),
+            NODE_AUTO_SH.read_text(encoding="utf-8"),
+            MATRIX_YAML.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(problems, [])
+
+    def test_the_parity_guard_fails_on_its_own_damage(self):
+        module_text = XRAY_CORE_SH.read_text(encoding="utf-8")
+        payload_text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        matrix_text = MATRIX_YAML.read_text(encoding="utf-8")
+        digest = self._assignments(module_text)["GOWAVE_PINNED_XRAY_AMD64_SHA256"]
+        matrix_sha = self._matrix_artifact(matrix_text)["sha256"]
+        flipped = ("0" if digest[0] != "0" else "1") + digest[1:]
+        matrix_flipped = ("0" if matrix_sha[0] != "0" else "1") + matrix_sha[1:]
+
+        damaged = {
+            "module": (module_text.replace(digest, flipped, 1), payload_text, matrix_text),
+            "payload": (module_text, payload_text.replace(digest, flipped, 1), matrix_text),
+            "matrix": (module_text, payload_text,
+                       matrix_text.replace(matrix_sha, matrix_flipped, 1)),
+        }
+        for name, texts in damaged.items():
+            with self.subTest(damaged=name):
+                self.assertNotEqual(self._parity_problems(*texts), [],
+                                    f"a one-character change in the {name} must be caught")
+
+    def test_detect_arch_lives_in_os_and_keeps_reaching_panel_callers(self):
+        os_text = OS_SH.read_text(encoding="utf-8")
+        panel_text = PANEL_SH.read_text(encoding="utf-8")
+        self.assertEqual(os_text.count("detect_arch() {"), 1)
+        self.assertIn("/os.sh", panel_text)
+        self.assertNotIn("detect_arch() {", panel_text)
+
+        for machine, expected in (("x86_64", "amd64"), ("aarch64", "arm64"),
+                                  ("arm64", "arm64")):
+            with self.subTest(machine=machine), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                bin_dir = tmp / "bin"
+                bin_dir.mkdir()
+                uname = bin_dir / "uname"
+                uname.write_text(f"#!/bin/sh\necho {machine}\n", encoding="utf-8")
+                uname.chmod(0o755)
+                env = os.environ.copy()
+                env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                result = subprocess.run(
+                    ["bash", "-c", f'source "{PANEL_SH}" && detect_arch'],
+                    env=env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            uname = bin_dir / "uname"
+            uname.write_text("#!/bin/sh\necho riscv64\n", encoding="utf-8")
+            uname.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", f'source "{PANEL_SH}" && detect_arch'],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("riscv64", result.stderr)
+
+    # -- source order ----------------------------------------------------
+
+    @staticmethod
+    def _function_slice(text: str, header: str) -> str:
+        start = text.index(header)
+        end = text.index("\n}\n", start) + len("\n}\n")
+        return text[start:end]
+
+    @staticmethod
+    def _order_problems(body: str, anchors: tuple[str, ...]) -> list[str]:
+        call = body.find("install_pinned_xray_core")
+        if call < 0:
+            return ["the pinned-core call is missing"]
+        problems = []
+        for anchor in anchors:
+            position = body.find(anchor)
+            if position < 0:
+                problems.append(f"anchor missing: {anchor}")
+            elif position < call:
+                problems.append(f"the pinned-core call follows {anchor}")
+        return problems
+
+    MODULE_ANCHORS = ("run_node_installer_with_retry",
+                      "raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh")
+    PAYLOAD_ANCHORS = ("run_node_installer_with_retry", "tmp_inst=$(mktemp")
+
+    def test_the_module_call_precedes_both_installers_inside_the_restart_branch(self):
+        body = self._function_slice(NODE_SH.read_text(encoding="utf-8"),
+                                    "install_local_node() {")
+        branch = body.index("if (( node_restart_required == 1 )); then")
+        call = body.index("install_pinned_xray_core")
+        self.assertLess(branch, call, "the call must sit inside the restart branch")
+        self.assertEqual(self._order_problems(body, self.MODULE_ANCHORS), [])
+        self.assertEqual(body.count("install_pinned_xray_core"), 1)
+
+    def test_the_payload_installs_python_before_the_step_can_run(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertLess(text.index("setup_system_prereqs </dev/null"),
+                        text.index("run_upstream_node_installer </dev/null"),
+                        "python3 must be installed before the pinned step unpacks the archive")
+
+    def test_the_payload_call_precedes_the_installer_and_appears_once(self):
+        body = self._function_slice(NODE_AUTO_SH.read_text(encoding="utf-8"),
+                                    "run_upstream_node_installer() {")
+        self.assertEqual(self._order_problems(body, self.PAYLOAD_ANCHORS), [])
+        self.assertEqual(body.count("install_pinned_xray_core"), 1)
+
+    def test_the_order_guard_fails_when_the_call_moves_after_its_anchor(self):
+        body = self._function_slice(NODE_SH.read_text(encoding="utf-8"),
+                                    "install_local_node() {")
+        moved = body.replace("install_pinned_xray_core", "# placeholder", 1)
+        moved += "\ninstall_pinned_xray_core \"$GOWAVE_NODE_INSTALL_DIR\"\n"
+        self.assertNotEqual(self._order_problems(moved, self.MODULE_ANCHORS), [])
+
+    # -- the helper the payload's pinned step calls ----------------------
+
+    @staticmethod
+    def _heredoc(text: str, marker: str) -> str:
+        start = text.index(f"cat <<'{marker}'\n") + len(f"cat <<'{marker}'\n")
+        return text[start:text.index(f"\n{marker}\n", start)]
+
+    def _composed_payload(self, with_artifact: bool = True) -> str:
+        """The streamed Worker payload, assembled the way ``remote_payload`` does.
+
+        The two modules travel as their own text and the runner functions and
+        the entrypoint travel as heredocs, so a function the pinned step calls
+        resolves only when every part of the composition is present.
+        """
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        parts = [PREFLIGHT_SH.read_text(encoding="utf-8")]
+        if with_artifact:
+            parts.append(ARTIFACT_SH.read_text(encoding="utf-8"))
+        parts += [self._heredoc(text, "RUNNER_FUNCS"), self._heredoc(text, "REMOTE_EOF")]
+        return "\n".join(parts).replace(
+            'main "$@" </dev/null',
+            "declare -F fetch_verified_artifact install_pinned_xray_core pinned_xray_deliver",
+        )
+
+    def test_the_payload_carries_the_artifact_helper_as_its_module(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertEqual(text.count("fetch_verified_artifact() {"), 0,
+                         "the payload must not carry its own copy of the helper")
+        self.assertIn('artifact_module="$SCRIPT_DIR/modules/artifact.sh"', text)
+        self.assertEqual(text.count('cat "$artifact_module"'), 1)
+
+    def test_the_artifact_helper_is_defined_before_the_functions_that_call_it(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertLess(text.index('cat "$artifact_module"'),
+                        text.index("cat <<'RUNNER_FUNCS'"))
+
+    def test_the_composed_payload_resolves_every_function_its_pinned_step_calls(self):
+        result = subprocess.run(["bash", "-s"], input=self._composed_payload(),
+                                capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("fetch_verified_artifact", "install_pinned_xray_core",
+                     "pinned_xray_deliver"):
+            self.assertIn(name, result.stdout.split())
+
+    def test_the_composition_guard_fails_without_the_helper(self):
+        result = subprocess.run(["bash", "-s"],
+                                input=self._composed_payload(with_artifact=False),
+                                capture_output=True, text=True, timeout=180)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("fetch_verified_artifact", result.stdout.split())
+
+
 class TestLocalNodeIdempotency(unittest.TestCase):
     """A repeated install must not restart a node that is already serving.
 
@@ -1561,9 +2339,112 @@ class TestLocalNodeIdempotency(unittest.TestCase):
         self.assertIn('if local_node_is_serving "$node_port" "$normalized_node_ver"; then', install)
         self.assertIn("node_restart_required=0", install)
         self.assertLess(install.index("if (( node_restart_required == 1 )); then"),
-                        install.index('bash "$upstream_installer" </dev/null'))
+                        install.index('run_node_installer_with_retry "$upstream_installer"'))
         self.assertIn("if (( node_restart_required == 1 )) && "
                       '[[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then', install)
+
+
+class TestNodeInstallerRetry(unittest.TestCase):
+    """One slow answer from api.github.com must not end a whole deployment.
+
+    gowave-node lists the Xray releases with a 10-second deadline and no retry of
+    its own, so the installer it runs behind is the only place a transient network
+    fault can be absorbed. The retry is bounded and applies to nothing else:
+    repeating a configuration error would only print it twice.
+    """
+
+    def write_installer(self, tmp: Path, name: str, body: str) -> Path:
+        path = tmp / f"{name}.sh"
+        path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+        path.chmod(0o700)
+        return path
+
+    def run_helper(self, tmp: Path, installer: Path):
+        # The delays are a module default, so the test shortens them by assignment
+        # rather than through a prefix, which bash would treat as a string value.
+        command = (
+            f'source "{NODE_SH}" && '
+            "NODE_INSTALLER_RETRY_DELAYS=(0 0)\n"
+            f'run_node_installer_with_retry "{installer}" hidden-secret 3002 latest'
+        )
+        return subprocess.run(["bash", "-c", command], capture_output=True, text=True, cwd=tmp)
+
+    def counting_installer(self, tmp: Path, failure: str, fail_until: int = 1) -> Path:
+        count = tmp / "attempts"
+        body = (
+            f'count=$(cat "{count}" 2>/dev/null || echo 0)\n'
+            "count=$(( count + 1 ))\n"
+            f'printf "%s\\n" "$count" > "{count}"\n'
+            'echo "attempt $count"\n'
+            f"if (( count <= {fail_until} )); then {failure}; fi\n"
+            "exit 0\n"
+        )
+        return self.write_installer(tmp, "counting", body)
+
+    def test_a_network_fault_is_retried_and_the_second_attempt_decides(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            installer = self.counting_installer(
+                tmp,
+                "echo '[ERROR] Failed to fetch releases: Get "
+                '"https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100": '
+                "context deadline exceeded' >&2 && exit 1",
+            )
+            res = self.run_helper(tmp, installer)
+            attempts = (tmp / "attempts").read_text().strip()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(attempts, "2")
+        self.assertIn("attempt 1", res.stdout, "the failed attempt's own output is still shown")
+        self.assertIn("context deadline exceeded", res.stderr, "its stderr is replayed")
+        self.assertIn("retrying in 0s (attempt 2 of 3)", res.stdout)
+
+    def test_a_failure_that_is_not_a_network_fault_is_reported_at_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            installer = self.counting_installer(
+                tmp, "echo 'Error: unsupported architecture: riscv64' >&2 && exit 4", fail_until=99,
+            )
+            res = self.run_helper(tmp, installer)
+            attempts = (tmp / "attempts").read_text().strip()
+        self.assertEqual(res.returncode, 4, "the installer's own exit code is preserved")
+        self.assertEqual(attempts, "1", "a configuration error is not worth repeating")
+        self.assertIn("unsupported architecture", res.stderr)
+        self.assertNotIn("retrying", res.stdout)
+
+    def test_repeated_network_faults_stop_at_the_declared_attempt_count(self):
+        before = set(Path(tempfile.gettempdir()).glob("gowave-node-installer-*"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            installer = self.counting_installer(
+                tmp, "echo '[ERROR] Failed to fetch releases: i/o timeout' >&2 && exit 1",
+                fail_until=99,
+            )
+            res = self.run_helper(tmp, installer)
+            attempts = (tmp / "attempts").read_text().strip()
+        after = set(Path(tempfile.gettempdir()).glob("gowave-node-installer-*"))
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(attempts, "3")
+        self.assertEqual(res.stderr.count("i/o timeout"), 3, "every attempt's evidence survives")
+        self.assertEqual(after, before, "the attempt logs live in a directory the helper removes")
+
+    def test_the_secret_travels_in_the_environment_and_never_in_the_arguments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            seen = tmp / "env"
+            argv = tmp / "argv"
+            installer = self.write_installer(
+                tmp,
+                "env",
+                f'printf "%s %s %s\\n" "$SECRET_KEY" "$NODE_PORT" "$GOWAVE_NODE_VERSION" > "{seen}"\n'
+                f'tr "\\0" " " < /proc/$$/cmdline > "{argv}"\n',
+            )
+            res = self.run_helper(tmp, installer)
+            environment = seen.read_text().strip()
+            arguments = argv.read_text()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(environment, "hidden-secret 3002 latest")
+        self.assertNotIn("hidden-secret", arguments)
+        self.assertNotIn("hidden-secret", res.stdout + res.stderr)
 
 
 class TestWorkerPayloadBootstrap(unittest.TestCase):
@@ -1576,28 +2457,7 @@ class TestWorkerPayloadBootstrap(unittest.TestCase):
     """
 
     def capture(self, tmp, *command):
-        tmp = Path(tmp)
-        known_hosts = tmp / "known_hosts"
-        known_hosts.write_text(
-            "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n"
-        )
-        bin_dir = tmp / "bin"
-        bin_dir.mkdir()
-        capture = tmp / "payload.sh"
-        mock_ssh = bin_dir / "ssh"
-        mock_ssh.write_text(f'#!/bin/sh\ncat > "{capture}"\nexit 0\n')
-        mock_ssh.chmod(0o755)
-
-        env = os.environ.copy()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        env["SSH_KNOWN_HOSTS"] = str(known_hosts)
-        env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
-        result = subprocess.run(
-            [str(REPO_ROOT / "gowave-node-auto.sh"), *command],
-            env=env, capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
-        return capture.read_text()
+        return capture_remote_script(tmp, *command)
 
     def payload(self, tmp):
         return self.capture(tmp, "remote_payload", "127.0.0.1", "22",
@@ -1678,6 +2538,66 @@ class TestWorkerPayloadBootstrap(unittest.TestCase):
             self.assertNotIn("python3", only_openssl)
 
 
+class TestWorkerInstallerRetry(unittest.TestCase):
+    """The Worker payload absorbs the same transient fault before it rolls back.
+
+    The payload cannot source ``modules/``, so it carries its own copy of the
+    retry; running the streamed script's functions proves that copy, not the
+    module's.
+    """
+
+    def payload_functions(self, tmp: Path) -> Path:
+        payload = capture_remote_script(tmp, "remote_payload", "127.0.0.1", "22",
+                                        "worker.example.com", "reality.example.com", "root")
+        script = tmp / "payload-functions.sh"
+        script.write_text(
+            "\n".join(line for line in payload.splitlines() if not line.startswith('main "$@"')) + "\n",
+            encoding="utf-8",
+        )
+        return script
+
+    def test_a_network_fault_is_retried_inside_the_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            count = tmp / "attempts"
+            installer = tmp / "install.sh"
+            installer.write_text(
+                "#!/usr/bin/env bash\n"
+                f'count=$(cat "{count}" 2>/dev/null || echo 0)\n'
+                "count=$(( count + 1 ))\n"
+                f'printf "%s\\n" "$count" > "{count}"\n'
+                'echo "attempt $count"\n'
+                "if (( count == 1 )); then\n"
+                "    echo '[ERROR] Failed to fetch releases: i/o timeout' >&2\n"
+                "    exit 1\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            installer.chmod(0o700)
+            driver = (
+                f'source "{script}"\n'
+                "NODE_INSTALLER_RETRY_DELAYS=(0)\n"
+                f'run_node_installer_with_retry "{installer}" "" 3002 latest'
+            )
+            res = subprocess.run(["bash", "-c", driver], capture_output=True, text=True)
+            attempts = count.read_text().strip()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(attempts, "2")
+        self.assertIn("i/o timeout", res.stderr, "the failed attempt's stderr is replayed")
+        self.assertIn("retrying in 0s (attempt 2 of 3)", res.stdout)
+
+    def test_the_payload_installer_failure_still_reaches_the_rollback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = capture_remote_script(tmpdir, "remote_payload", "127.0.0.1", "22",
+                                            "worker.example.com", "reality.example.com", "root")
+        installer_body = payload.split("run_upstream_node_installer() {", 1)[1].split(
+            "\ncompensate_remote_worker() {", 1)[0]
+        self.assertIn("run_node_installer_with_retry", installer_body,
+                      "the payload's only installer invocation must be the retrying one")
+        self.assertIn('return "$installer_rc"', installer_body)
+
+
 class TestWorkerReapply(unittest.TestCase):
     """`node reapply` reconverges a registered Worker without re-registering it.
 
@@ -1699,6 +2619,15 @@ class TestWorkerReapply(unittest.TestCase):
         self.assertNotIn("associate_node", self.branch)
         self.assertNotIn("provision_config_profile", self.branch)
 
+    def test_the_identity_is_read_by_label_so_an_empty_name_survives(self):
+        # A Worker without Vision prints an empty fifth field, and command
+        # substitution strips trailing empty lines, so a positional read loses
+        # the name it was asked for and refuses a perfectly valid node.
+        self.assertIn("while IFS='=' read -r key value", self.branch)
+        self.assertIn('address) ip="$value"', self.branch)
+        self.assertIn('vision_domain) vision_domain="$value"', self.branch)
+        self.assertNotIn("mapfile", self.branch)
+
     def test_it_streams_the_shipped_payload_with_only_the_registered_identity(self):
         self.assertIn('"$SCRIPT_DIR/gowave-node-auto.sh" remote_payload', self.branch)
         call = [line for line in self.branch.splitlines() if "remote_payload" in line]
@@ -1718,6 +2647,79 @@ class TestWorkerReapply(unittest.TestCase):
 
     def test_the_cli_advertises_the_subcommand(self):
         self.assertIn("node {add|list|reapply|rollback}", self.text)
+
+
+class TestWorkerDeployHookOwnership(unittest.TestCase):
+    """The Worker payload must accept the deploy hook an earlier payload installed.
+
+    A reconfiguration streams the payload again under a new ACME transaction id,
+    and `remote_finalize` deletes that transaction directory once the install
+    commits, taking its `deploy-hook-manifest.json` with it. The hook itself stays
+    on the host on purpose, so ownership is recorded where the finalizer cannot
+    reach it; otherwise the second install refuses the Worker's own hook and the
+    whole reconfiguration fails.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = capture_remote_script(
+                tmpdir, "remote_payload", "127.0.0.1", "22",
+                "worker.example.com", "reality.example.com", "root",
+            )
+        start = payload.index("deploy_hook_ownership_record() {")
+        end = payload.index("\nsetup_system_prereqs() {", start)
+        assert end > start
+        cls.functions = payload[start:end]
+
+    def run_hook_functions(self, tmp, body):
+        script = Path(tmp) / "hook-functions.sh"
+        script.write_text(self.functions + "\n" + body, encoding="utf-8")
+        return subprocess.run(
+            ["bash", str(script), str(Path(tmp) / "renewal-hooks" / "deploy" / "gowave-nginx.sh"),
+             str(Path(tmp) / "recovery")],
+            capture_output=True, text=True,
+        )
+
+    def test_a_repeated_install_accepts_the_hook_after_the_snapshot_is_finalized(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_hook_functions(
+                tmpdir,
+                "\n".join((
+                    "hook=\"$1\"",
+                    "recovery=\"$2\"",
+                    'install_managed_deploy_hook "worker_install_one" "$hook" "$recovery" || exit 10',
+                    # This is what remote_finalize does once the install commits.
+                    'rm -rf -- "$recovery/worker_install_one" || exit 11',
+                    'install_managed_deploy_hook "worker_install_two" "$hook" "$recovery" || exit 12',
+                    'rollback_managed_deploy_hook "worker_install_two" "$hook" "$recovery" || exit 13',
+                )),
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
+            self.assertFalse((Path(tmpdir) / "renewal-hooks" / "deploy" / "gowave-nginx.sh").exists(),
+                             "the rolled-back hook must not survive the transaction")
+            self.assertFalse((Path(tmpdir) / "recovery" / "deploy-hook-ownership.json").exists(),
+                             "ownership must be cleared with the hook it described")
+
+    def test_the_record_names_the_file_so_an_operator_edit_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_hook_functions(
+                tmpdir,
+                "\n".join((
+                    "hook=\"$1\"",
+                    "recovery=\"$2\"",
+                    'install_managed_deploy_hook "worker_install_one" "$hook" "$recovery" || exit 10',
+                    'record="$recovery/deploy-hook-ownership.json"',
+                    '[[ -f "$record" && ! -L "$record" ]] || exit 11',
+                    '[[ "$(stat -c %a -- "$record")" == "600" ]] || exit 12',
+                    'rm -rf -- "$recovery/worker_install_one" || exit 13',
+                    "printf '#!/bin/sh\\necho hijacked\\n' > \"$hook\" || exit 14",
+                    'verify_deploy_hook_preflight "$hook" "worker_install_two" "$recovery" && exit 15',
+                    "exit 0",
+                )),
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
+            self.assertIn("Pre-existing unowned Certbot deploy hook found", result.stderr)
 
 
 if __name__ == "__main__":

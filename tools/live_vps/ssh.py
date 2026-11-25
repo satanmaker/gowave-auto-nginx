@@ -6,6 +6,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -27,6 +28,21 @@ class SSHResult:
         return self.returncode == 0
 
 
+#: A credential parameter written into an argument: a parameter name ending in one
+#: of these, followed by `=`, which hands it a value. `--admin_password=x`,
+#: `GOWAVE_LEASE_TOKEN=x` and `SECRET_KEY=x` all match, whatever the case and the
+#: leading dashes.
+CREDENTIAL_PARAMETER = re.compile(
+    r"(?:^|[\s;,|&])(?:--?)?(?:[A-Za-z_][\w-]*)?(?:password|secret_key|token)=",
+    re.IGNORECASE,
+)
+
+#: A value the shell reads at run time — `$(cat file)`, `${VAR}` — so the secret
+#: stays outside argv. This is the sanctioned way to hand one over, and refusing it
+#: would refuse the only leak-free form.
+INDIRECT_VALUE = re.compile(r"""^(?:"|')?\$(?:\(|\{)""")
+
+
 def assert_no_secrets_in_argv(args: List[str]) -> None:
     """Zero-leak argv validation: scan argv elements for known secrets or prohibited secret flags."""
     for arg in args:
@@ -37,18 +53,12 @@ def assert_no_secrets_in_argv(args: List[str]) -> None:
                     "Zero-leak violation: registered secret detected in command-line argument"
                 )
 
-        # Prohibit dangerous CLI flags that commonly accept passwords/tokens
-        lower = arg.lower()
-        if any(
-            flag in lower
-            for flag in [
-                "password=",
-                "secret_key=",
-                "admin_password=",
-                "scoped_api_token=",
-                "token=",
-            ]
-        ):
+        # Prohibit credential parameters that carry a literal value. The parameter
+        # name is matched, not the bare substring: `GOWAVE_WORKER_LEASE_TOKEN="$(cat
+        # /run/live_vps_worker_lease)"` names a token and reads it from a root-only
+        # file, which is what the staging path exists for.
+        match = CREDENTIAL_PARAMETER.search(arg)
+        if match and not INDIRECT_VALUE.match(arg[match.end():]):
             raise ValueError(
                 "Zero-leak violation: prohibited credential parameter detected in command-line argument"
             )

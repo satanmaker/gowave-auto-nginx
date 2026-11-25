@@ -3,7 +3,7 @@
 # GoWave Auto NGINX: Host-Wide Mutation Lock and Re-entrant Lease Helper
 # Implements D18 canonical mutation lock contract.
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
     MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/tmp/gowave-managed-mutation-$(id -u).lock}"

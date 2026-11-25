@@ -22,7 +22,7 @@ from .config import LiveVPSConfig
 from .preflight import check_ssh_trust
 from .dns import verify_domain_dns, verify_domain_no_aaaa
 from .nginx import verify_nginx_config_syntax
-from .subscriptions import request_subscription_status
+from .subscriptions import SUBSCRIPTION_UA_REFUSAL_STATUS, request_subscription_status
 from .mtls import run_mtls_negative_tests
 
 
@@ -103,17 +103,57 @@ def run_neg_04_dns_missing_aaaa() -> Dict[str, Any]:
     }
 
 
-def run_neg_05_acme_install_failure(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-05: ACME lineage guard / invalid ACME directory rejects installation before changing NGINX."""
+def run_neg_05_acme_install_failure(
+    master_ssh: SSHClient,
+    lease_token: Optional[str] = None,
+    *,
+    panel_domain: str,
+    reality_domain: str,
+) -> Dict[str, Any]:
+    """NEG-05: ACME lineage guard / invalid ACME directory rejects installation before changing NGINX.
+
+    The install under test is a mutation like any other, so it presents the
+    run's own lease: this suite holds the Master's mutation lock for the whole
+    run, and an install without the lease is refused by that lock before it ever
+    reads `GOWAVE_ACME_SERVER`. Measured in `run-20261120-112133-fb7bcb`: the
+    probe reported FAIL while the host was answering the lock sentence, and the
+    ACME refusal it was looking for appears only once the lock admits the call.
+
+    The domains are the run's own, and they have to be: `install` validates
+    direct DNS before it reads `GOWAVE_ACME_SERVER`, so a placeholder name is
+    refused for the wrong reason and the probe proves nothing about the ACME
+    guard. Measured in `run-20261123-135152-bc7b1786`, where
+    `invalid.example.com` stopped the run at "preflight could not resolve
+    invalid.example.com".
+    """
     # Call gowave-auto.sh install with invalid ACME directory URL
-    bad_cmd = "GOWAVE_ACME_SERVER=https://invalid-acme-directory.example.com/directory /opt/gowave-auto-nginx/gowave-auto.sh install invalid.example.com reality.example.com admin@example.com"
-    r = master_ssh.run(bad_cmd)
-    rejected = (not r.ok) and ("Invalid GOWAVE_ACME_SERVER" in r.stderr or "Invalid GOWAVE_ACME_SERVER" in r.stdout)
+    bad_cmd = (
+        "GOWAVE_ACME_SERVER=https://invalid-acme-directory.example.com/directory "
+        "/opt/gowave-auto-nginx/gowave-auto.sh install "
+        f"{shlex.quote(panel_domain)} {shlex.quote(reality_domain)} admin@example.com"
+    )
+    r = master_ssh.run(
+        bad_cmd,
+        input_data=f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None,
+    )
+    output = f"{r.stdout}\n{r.stderr}"
+    rejected = (not r.ok) and ("Invalid GOWAVE_ACME_SERVER" in output)
+    refusal = next(
+        (line.strip() for line in output.splitlines() if line.strip().startswith("Error:")),
+        "",
+    )
     return {
         "scenario": "NEG-05",
         "name": "ACME Install Invalid Directory Rejection",
         "status": "PASS" if rejected else "FAIL",
-        "message": "Installation aborted before modifying certificates or services",
+        "message": (
+            "Installation rejected the invalid ACME directory before modifying certificates or services"
+            if rejected else
+            f"Installation exited {r.returncode} without the ACME refusal: {refusal[:200]}"
+        ),
+        "exit_code": r.returncode,
+        "refusal": refusal[:200],
+        "lease_presented": bool(lease_token),
     }
 
 
@@ -232,7 +272,7 @@ def run_neg_09_subscription_absent_user_agent(panel_domain: str, short_uuid: str
             panel_domain, f"/api/sub/{short_uuid}/v2ray-json",
             ssl_context, user_agent=None, timeout=5,
         )
-        rejected = code in (400, 403)
+        rejected = code == SUBSCRIPTION_UA_REFUSAL_STATUS
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
 
@@ -272,8 +312,19 @@ PANEL_DB_PATH = "/opt/gowave/gowave.db"
 RECOVERY_JOURNAL_PATH = "/var/lib/gowave-auto-nginx/recovery/journal.json"
 STATE_FILE_PATH = "/var/lib/gowave-auto-nginx/state.json"
 MUTATION_LOCK_PATH = "/run/lock/gowave-managed-mutation.lock"
-MUTATION_LOCK_WAIT_SECONDS = 60.0
 NEG13_TARGET_IP = "10.255.255.1"
+
+# NEG-14 claims a registered name for a second address. The address never has
+# to answer: `node add` refuses the duplicate from `state.json` before it opens
+# any SSH session, so the only thing the address needs is a pin, which the case
+# writes itself and takes out again. Keeping it unroutable means a case that
+# somehow got past the refusal could still not reach a real host.
+NEG14_SECOND_ADDRESS = "10.255.255.2"
+NEG14_KNOWN_HOSTS = "/root/.ssh/known_hosts"
+NEG14_KNOWN_HOSTS_BACKUP = "/tmp/neg14-known-hosts.bak"
+NEG14_DUMMY_KEY = "/tmp/neg14-dummy-ed25519"
+# The refusal the product ships when a name already belongs to another address.
+NEG14_DUPLICATE_REFUSAL = "state.json already registers the name"
 
 
 def _remote_sha256(ssh: SSHClient, path: str) -> Optional[str]:
@@ -313,17 +364,50 @@ def _state_payload(state: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in state.items() if key not in {"lastUpdated", "schemaVersion"}}
 
 
-def _wait_for_mutation_lock(ssh: SSHClient, timeout_seconds: float = 60.0) -> bool:
-    """Wait until no lifecycle command holds the host-wide mutation lock."""
-    lock = shlex.quote(MUTATION_LOCK_PATH)
-    deadline = time.time() + timeout_seconds
-    while True:
-        probe = ssh.run(f"if [ -e {lock} ]; then flock -n {lock} true; fi")
-        if probe.ok:
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(2)
+#: Where a scenario stages the run's lease before handing it to the product. The
+#: token reaches the host over stdin, never over a command line, and the product
+#: reads it from this file's contents, so no `ps` on either side can show it.
+LEASE_STAGING_PATH = "/run/gowave-negative-lease"
+LEASE_FILE_PATH = "/run/lock/gowave-mutation-lease.json"
+
+
+def _stage_master_lease(ssh: SSHClient, lease_token: Optional[str]) -> Optional[str]:
+    """Put the run's own lease in a root-only file; return the path, or None."""
+    if not lease_token:
+        return None
+    staged = ssh.run(
+        f"umask 077 && cat > {shlex.quote(LEASE_STAGING_PATH)}",
+        input_data=f"{lease_token}\n",
+    )
+    return LEASE_STAGING_PATH if staged.ok else None
+
+
+def _with_staged_lease(command: str, staged: Optional[str]) -> str:
+    """Run a command with the staged lease as its first stdin line.
+
+    The suite holds the Master's mutation lock for the whole run, and a
+    lifecycle command that mutates the host is refused by that lock before it
+    reaches the guard the scenario is about. Presenting the run's own lease is
+    what lets the case observe the product instead of the lock.
+    """
+    if not staged:
+        return command
+    return f"printf 'GOWAVE_LEASE: %s\\n' \"$(cat {shlex.quote(staged)})\" | {command}"
+
+
+def _remove_staged_lease(ssh: SSHClient) -> None:
+    ssh.run(f"rm -f -- {shlex.quote(LEASE_STAGING_PATH)}")
+
+
+def _lease_holder_pid(ssh: SSHClient) -> Optional[int]:
+    """The pid the run's own lock holder published, read from the lease file."""
+    result = ssh.run(
+        "python3 -c \"import json;print(json.load(open("
+        f"{LEASE_FILE_PATH!r}"
+        "))['holder_pid'])\""
+    )
+    value = result.stdout.strip()
+    return int(value) if result.ok and value.isdigit() else None
 
 
 def _reap_stale_dispatch_holders(ssh: SSHClient) -> None:
@@ -354,11 +438,16 @@ true
     )
 
 
-def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient, config: LiveVPSConfig) -> Dict[str, Any]:
+def run_neg_11_backup_corrupted_tar(
+    master_ssh: SSHClient,
+    config: LiveVPSConfig,
+    lease_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """NEG-11: a corrupted archive header must be rejected before any live mutation."""
     ts = int(time.time())
     archive = f"/tmp/neg11-corrupt-header-{ts}.tar.gz"
     name = "Backup Restore Corrupted Header Rejection"
+    staged = _stage_master_lease(master_ssh, lease_token)
     try:
         created = master_ssh.run(
             f"{shlex.quote(BACKUP_SCRIPT)} backup --type panel {shlex.quote(archive)}",
@@ -387,16 +476,10 @@ def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient, config: LiveVPSConfig
         journal_before = _remote_sha256(master_ssh, RECOVERY_JOURNAL_PATH)
         service_before = _service_active(master_ssh, "gowave.service")
 
-        if not _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS):
-            return {
-                "scenario": "NEG-11",
-                "name": name,
-                "status": "INCOMPLETE",
-                "message": "Host mutation lock stayed held, so the corrupted-archive restore was never attempted",
-            }
-
         restore = master_ssh.run(
-            f"{shlex.quote(BACKUP_SCRIPT)} restore {shlex.quote(archive)}",
+            _with_staged_lease(
+                f"{shlex.quote(BACKUP_SCRIPT)} restore {shlex.quote(archive)}", staged
+            ),
             timeout=config.restore_timeout,
         )
 
@@ -420,9 +503,12 @@ def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient, config: LiveVPSConfig
         if passed:
             status = "PASS"
             message = "Corrupted archive header was rejected before stopping services or touching live data"
-        elif "Could not acquire host mutation lock" in output:
+        elif "Could not acquire host mutation lock" in output or "Invalid or stale mutation lock lease" in output:
             status = "INCOMPLETE"
-            message = "Restore was blocked by the host mutation lock instead of by archive validation"
+            message = (
+                "Restore was blocked by the host mutation lock instead of by archive validation"
+                + ("" if staged else " (no lease was staged for it)")
+            )
         elif db_before is None or journal_before is None:
             status = "INCOMPLETE"
             message = "Could not snapshot live state to prove the restore was rejected before mutation"
@@ -438,18 +524,25 @@ def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient, config: LiveVPSConfig
             "live_data_unchanged": live_data_unchanged,
             "service_kept_active": service_kept,
             "journal_untouched": journal_untouched,
+            "lease_presented": bool(staged),
             "message": message,
         }
     finally:
         master_ssh.run(f"rm -f -- {shlex.quote(archive)}")
+        _remove_staged_lease(master_ssh)
 
 
-def run_neg_12_backup_corrupted_sqlite(master_ssh: SSHClient, config: LiveVPSConfig) -> Dict[str, Any]:
+def run_neg_12_backup_corrupted_sqlite(
+    master_ssh: SSHClient,
+    config: LiveVPSConfig,
+    lease_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """NEG-12: a checksum-valid archive with a corrupted SQLite DB must fail the integrity gate."""
     ts = int(time.time())
     valid_archive = f"/tmp/neg12-valid-{ts}.tar.gz"
     corrupted_archive = f"/tmp/neg12-corrupt-db-{ts}.tar.gz"
     name = "Backup Restore Corrupted SQLite DB Integrity Check"
+    staged = _stage_master_lease(master_ssh, lease_token)
     try:
         created = master_ssh.run(
             f"{shlex.quote(BACKUP_SCRIPT)} backup --type panel {shlex.quote(valid_archive)}",
@@ -513,16 +606,10 @@ PY"""
         journal_before = _remote_sha256(master_ssh, RECOVERY_JOURNAL_PATH)
         service_before = _service_active(master_ssh, "gowave.service")
 
-        if not _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS):
-            return {
-                "scenario": "NEG-12",
-                "name": name,
-                "status": "INCOMPLETE",
-                "message": "Host mutation lock stayed held, so the corrupted-database restore was never attempted",
-            }
-
         restore = master_ssh.run(
-            f"{shlex.quote(BACKUP_SCRIPT)} restore {shlex.quote(corrupted_archive)}",
+            _with_staged_lease(
+                f"{shlex.quote(BACKUP_SCRIPT)} restore {shlex.quote(corrupted_archive)}", staged
+            ),
             timeout=config.restore_timeout,
         )
 
@@ -543,9 +630,12 @@ PY"""
         if passed:
             status = "PASS"
             message = "Staged SQLite integrity check rejected the corrupted database before stopping or replacing the live DB"
-        elif "Could not acquire host mutation lock" in output:
+        elif "Could not acquire host mutation lock" in output or "Invalid or stale mutation lock lease" in output:
             status = "INCOMPLETE"
-            message = "Restore was blocked by the host mutation lock instead of by the integrity gate"
+            message = (
+                "Restore was blocked by the host mutation lock instead of by the integrity gate"
+                + ("" if staged else " (no lease was staged for it)")
+            )
         elif db_before is None or journal_before is None:
             status = "INCOMPLETE"
             message = "Could not snapshot live state to prove the restore was rejected before mutation"
@@ -561,16 +651,19 @@ PY"""
             "live_data_unchanged": live_data_unchanged,
             "service_kept_active": service_kept,
             "journal_untouched": journal_untouched,
+            "lease_presented": bool(staged),
             "message": message,
         }
     finally:
         for path in (valid_archive, corrupted_archive):
             master_ssh.run(f"rm -f -- {shlex.quote(path)}")
+        _remove_staged_lease(master_ssh)
 
 
 def run_neg_13_worker_deploy_interrupted_journal(
     master_ssh: SSHClient,
     config: LiveVPSConfig,
+    lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """NEG-13: an interrupted Worker dispatch must leave a non-COMMITTED recovery journal."""
     name = "Interrupted SSH Deployment Journal Integrity"
@@ -579,6 +672,8 @@ def run_neg_13_worker_deploy_interrupted_journal(
     known_hosts_backup = "/tmp/neg13-known-hosts.bak"
     dummy_key = "/tmp/neg13-dummy-ed25519"
     log_path = "/tmp/neg13-node-add.log"
+    holder_before = _lease_holder_pid(master_ssh)
+    staged = _stage_master_lease(master_ssh, lease_token)
 
     state_before = _read_remote_state(master_ssh)
     if state_before is None:
@@ -619,8 +714,12 @@ def run_neg_13_worker_deploy_interrupted_journal(
         )
         start = master_ssh.run(
             f"cd {shlex.quote(GOWAVE_AUTO_DIR)} && "
-            f"nohup setsid ./gowave-auto.sh node add {add_args} "
-            f">{shlex.quote(log_path)} 2>&1 </dev/null & echo \"PID:$!\""
+            + _with_staged_lease(
+                f"nohup setsid ./gowave-auto.sh node add {add_args} "
+                f">{shlex.quote(log_path)} 2>&1",
+                staged,
+            )
+            + " & echo \"PID:$!\""
         )
         for token in (start.stdout or "").split():
             if token.startswith("PID:") and token[4:].isdigit():
@@ -665,12 +764,17 @@ def run_neg_13_worker_deploy_interrupted_journal(
             f"kill -TERM -{pid} 2>/dev/null || true; sleep 1; kill -KILL -{pid} 2>/dev/null || true"
         )
         group_alive = master_ssh.run(f"kill -0 -{pid} 2>/dev/null").ok
-        lock_released = _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS)
-        lock_released_after_reap = False
-        if not lock_released:
+        # The lock stays held for the whole run by design, so what this scenario
+        # has to show is that the killed dispatch left no holder of its own: the
+        # lease file still names the run's holder, and the dispatch group is gone.
+        holder_after = _lease_holder_pid(master_ssh)
+        lock_kept_by_the_run = (
+            holder_after is not None and holder_after == holder_before
+        )
+        if not lock_kept_by_the_run:
             _reap_stale_dispatch_holders(master_ssh)
-            lock_released = _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS)
-            lock_released_after_reap = lock_released
+            holder_after = _lease_holder_pid(master_ssh)
+            lock_kept_by_the_run = holder_after is not None and holder_after == holder_before
 
         journal_after = _read_remote_journal(master_ssh)
         post_kill_state = journal_after.get("state")
@@ -700,7 +804,7 @@ def run_neg_13_worker_deploy_interrupted_journal(
         api_rolled_back = rollback.ok and rolled_back_state in (
             "NODE_ADD_ROLLED_BACK", "NODE_ADD_ROLLBACK_REQUIRED",
         )
-        passed = interrupted and lock_released and journal_not_committed and state_restored and api_rolled_back
+        passed = interrupted and lock_kept_by_the_run and journal_not_committed and state_restored and api_rolled_back
 
         if passed:
             status = "PASS"
@@ -710,9 +814,9 @@ def run_neg_13_worker_deploy_interrupted_journal(
         elif post_kill_state == "NODE_ADD_COMMITTED":
             status = "FAIL"
             message = "Interrupted dispatch reached NODE_ADD_COMMITTED"
-        elif not lock_released:
+        elif not lock_kept_by_the_run:
             status = "INCOMPLETE"
-            message = "Killed dispatch kept the host mutation lock held, so later scenarios could not run"
+            message = "Killed dispatch changed the host mutation lock holder, so the run's own lock is not intact"
         else:
             status = "INCOMPLETE"
             message = "Interruption was observed but its journal/state evidence is incomplete"
@@ -725,8 +829,8 @@ def run_neg_13_worker_deploy_interrupted_journal(
             "post_kill_journal_state": post_kill_state,
             "journal_valid": journal_valid,
             "interruption_confirmed": interrupted,
-            "lock_released": lock_released,
-            "lock_released_after_reap": lock_released_after_reap,
+            "lock_kept_by_the_run": lock_kept_by_the_run,
+            "lease_presented": bool(staged),
             "state_restored": state_restored,
             "api_rollback": rollback.ok,
             "rollback_journal_state": rolled_back_state,
@@ -742,6 +846,7 @@ def run_neg_13_worker_deploy_interrupted_journal(
             f"rm -f {shlex.quote(dummy_key)} {shlex.quote(dummy_key)}.pub {shlex.quote(log_path)}"
         )
         _reap_stale_dispatch_holders(master_ssh)
+        _remove_staged_lease(master_ssh)
 
 
 def run_neg_14_duplicate_worker_registration(
@@ -749,9 +854,23 @@ def run_neg_14_duplicate_worker_registration(
     worker_ip: str,
     config: LiveVPSConfig,
     panel_client: E2EPanelClient,
+    lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """NEG-14: Duplicate node add must fail before any Panel API/state mutation."""
-    state_path = "/var/lib/gowave-auto-nginx/state.json"
+    """NEG-14: a registered name claimed for a second address is refused before any mutation.
+
+    The same name at the address `state.json` already holds is not a duplicate:
+    it is the same node answering again, the wizard's per-node retry re-enters
+    `node add` with exactly those inputs, and the product keeps that identity's
+    uuid and address. The refusal that remains is a name that belongs to one
+    address being claimed for another, and it is raised before `GoWaveClient`
+    exists, so no Panel object is created.
+
+    The second address is pinned with a throwaway key first, because `node add`
+    checks the pin before it reads `state.json`: without the pin that check
+    refuses the call instead, and the case would pass for the wrong reason. The
+    pin is removed in `finally`, so the Master's `known_hosts` is left as found.
+    """
+    state_path = STATE_FILE_PATH
     before_state = master_ssh.run(f"sha256sum {shlex.quote(state_path)}")
     if not before_state.ok or not before_state.stdout.strip():
         return {"scenario": "NEG-14", "status": "INCOMPLETE",
@@ -777,19 +896,54 @@ def run_neg_14_duplicate_worker_registration(
             identity[resource] = sorted(ids)
         return identity
 
+    # Read before the pin, so a Panel that cannot be inventoried leaves the
+    # Master's known_hosts untouched.
     try:
         before_api = api_identity()
     except Exception as exc:
         return {"scenario": "NEG-14", "status": "INCOMPLETE",
                 "message": f"Could not snapshot Panel API identities: {type(exc).__name__}"}
 
+    known_hosts_before = master_ssh.run(
+        f"sha256sum {shlex.quote(NEG14_KNOWN_HOSTS)} 2>/dev/null | awk '{{print $1}}'"
+    ).stdout.strip()
+
+    def restore_known_hosts() -> None:
+        """Put the Master's known_hosts back; idempotent, so any path may call it."""
+        master_ssh.run(
+            f"if [ -f {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)} ]; then "
+            f"cat {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)} > {shlex.quote(NEG14_KNOWN_HOSTS)}; "
+            f"rm -f {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)}; fi; "
+            f"rm -f {shlex.quote(NEG14_DUMMY_KEY)} {shlex.quote(NEG14_DUMMY_KEY)}.pub"
+        )
+
+    prepared = master_ssh.run(
+        f"cp -p {shlex.quote(NEG14_KNOWN_HOSTS)} {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)} && "
+        f"rm -f {shlex.quote(NEG14_DUMMY_KEY)} {shlex.quote(NEG14_DUMMY_KEY)}.pub && "
+        f"ssh-keygen -q -t ed25519 -N '' -f {shlex.quote(NEG14_DUMMY_KEY)} >/dev/null 2>&1 && "
+        f"awk '{{print \"{NEG14_SECOND_ADDRESS}\" \" \" $1 \" \" $2}}' "
+        f"{shlex.quote(NEG14_DUMMY_KEY)}.pub >> {shlex.quote(NEG14_KNOWN_HOSTS)}"
+    )
+    if not prepared.ok:
+        restore_known_hosts()
+        return {"scenario": "NEG-14", "status": "INCOMPLETE",
+                "message": "Could not pin a throwaway host key for the second address"}
+
     argv = [
         "/opt/gowave-auto-nginx/gowave-auto.sh", "node", "add", "worker-1",
-        worker_ip, config.worker_domain, config.worker_reality_domain,
+        NEG14_SECOND_ADDRESS, config.worker_domain, config.worker_reality_domain,
         config.worker_ssh_user, str(config.worker_ssh_port),
     ]
     add_cmd = " ".join(shlex.quote(value) for value in argv)
-    result = master_ssh.run(add_cmd, timeout=300)
+    staged = _stage_master_lease(master_ssh, lease_token)
+    try:
+        result = master_ssh.run(_with_staged_lease(add_cmd, staged), timeout=300)
+    finally:
+        _remove_staged_lease(master_ssh)
+        restore_known_hosts()
+    known_hosts_after = master_ssh.run(
+        f"sha256sum {shlex.quote(NEG14_KNOWN_HOSTS)} 2>/dev/null | awk '{{print $1}}'"
+    ).stdout.strip()
     after_state = master_ssh.run(f"sha256sum {shlex.quote(state_path)}")
     try:
         after_api = api_identity()
@@ -799,23 +953,35 @@ def run_neg_14_duplicate_worker_registration(
 
     combined_output = result.stdout + chr(10) + result.stderr
     explicit_duplicate_rejection = (
-        not result.ok and "already registered in state.json" in combined_output
+        not result.ok
+        and NEG14_DUPLICATE_REFUSAL in combined_output
+        # The refusal has to name the address the record holds, or an operator
+        # cannot tell which entry to remove and the sentence proves nothing.
+        and worker_ip in combined_output
+        and "Traceback" not in combined_output
     )
     state_unchanged = (
         after_state.ok and before_state.stdout.split()[0] == after_state.stdout.split()[0]
     )
     api_unchanged = before_api == after_api
-    passed = explicit_duplicate_rejection and state_unchanged and api_unchanged
+    known_hosts_restored = bool(known_hosts_before) and known_hosts_before == known_hosts_after
+    passed = (
+        explicit_duplicate_rejection and state_unchanged and api_unchanged and known_hosts_restored
+    )
 
     return {
         "scenario": "NEG-14",
         "name": "Duplicate Worker Registration Rejection Before API Mutation",
         "status": "PASS" if passed else "FAIL",
         "explicit_duplicate_rejection": explicit_duplicate_rejection,
+        "recorded_address": worker_ip,
+        "attempted_address": NEG14_SECOND_ADDRESS,
+        "known_hosts_restored": known_hosts_restored,
         "state_unchanged": state_unchanged,
         "api_ids_unchanged": api_unchanged,
-        "message": "Duplicate registration was rejected before Panel API operations and without state changes"
-                   if passed else "Duplicate registration did not prove fail-fast rejection with unchanged state and API IDs",
+        "lease_presented": bool(staged),
+        "message": "A second address claiming the registered name was rejected before Panel API operations, without state changes and with the throwaway pin removed"
+                   if passed else "The duplicate registration did not prove fail-fast rejection with unchanged state, API IDs and known_hosts",
     }
 
 def run_neg_15_panel_api_forged_jwt(panel_domain: str, ssl_context: ssl.SSLContext) -> Dict[str, Any]:
@@ -854,6 +1020,7 @@ def run_negative_suite(
     panel_client: Optional[E2EPanelClient] = None,
     short_uuid: Optional[str] = None,
     ssl_context: Optional[ssl.SSLContext] = None,
+    master_lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute all 15 negative scenarios in sequence.
     If TEST_NEGATIVE_SUITE is false, all cases are marked SKIP and overall status is INCOMPLETE.
@@ -885,7 +1052,12 @@ def run_negative_suite(
 
     # Execute live / mock scenarios
     if master_ssh:
-        neg05 = run_neg_05_acme_install_failure(master_ssh)
+        neg05 = run_neg_05_acme_install_failure(
+            master_ssh,
+            lease_token=master_lease_token,
+            panel_domain=config.master_panel_domain,
+            reality_domain=config.master_reality_domain,
+        )
         scenarios.append(neg05)
         if neg05.get("status") != "PASS":
             for index in range(6, 16):
@@ -944,15 +1116,24 @@ def run_negative_suite(
 
     if master_ssh:
         scenarios.append(run_neg_10_mtls_forged_certificate(master_ssh, config.worker_ip))
-        scenarios.append(run_neg_11_backup_corrupted_tar(master_ssh, config))
-        scenarios.append(run_neg_12_backup_corrupted_sqlite(master_ssh, config))
-        scenarios.append(run_neg_13_worker_deploy_interrupted_journal(master_ssh, config))
+        scenarios.append(run_neg_11_backup_corrupted_tar(master_ssh, config, lease_token=master_lease_token))
+        scenarios.append(run_neg_12_backup_corrupted_sqlite(master_ssh, config, lease_token=master_lease_token))
+        scenarios.append(
+            run_neg_13_worker_deploy_interrupted_journal(
+                master_ssh, config, lease_token=master_lease_token
+            )
+        )
     else:
         for sid in ("NEG-10", "NEG-11", "NEG-12", "NEG-13"):
             scenarios.append({"scenario": sid, "status": "SKIP", "message": "No Master SSH"})
 
     if master_ssh and panel_client:
-        scenarios.append(run_neg_14_duplicate_worker_registration(master_ssh, config.worker_ip, config, panel_client))
+        scenarios.append(
+            run_neg_14_duplicate_worker_registration(
+                master_ssh, config.worker_ip, config, panel_client,
+                lease_token=master_lease_token,
+            )
+        )
     else:
         scenarios.append({"scenario": "NEG-14", "status": "SKIP", "message": "No Master SSH / Panel"})
 

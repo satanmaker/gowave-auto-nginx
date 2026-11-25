@@ -309,9 +309,11 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
     Mihomo happily loads as the wrong size.
     """
     proxies: List[Dict[str, str]] = []
+    members: List[str] = []
     groups = 0
     rules = 0
     match_rule = False
+    rule_names: set = set()
     section = ""
     item_prefix: Optional[str] = None
     key_prefix: Optional[str] = None
@@ -332,6 +334,11 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
             if item_prefix is None:
                 item_prefix = prefix
             if prefix != item_prefix:
+                # A group lists the names it selects one level deeper. The Panel
+                # writes no member that is not a proxy, so a member a proxy does
+                # not define is a reference the client cannot resolve.
+                if section == "proxy-groups":
+                    members.append(stripped[2:].strip().strip("'\""))
                 continue
             header = stripped[2:].strip()
             if section == "proxies":
@@ -342,7 +349,9 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
                     groups += 1
             else:
                 rules += 1
-                match_rule = match_rule or header.partition(",")[0].strip().upper() == "MATCH"
+                head = header.partition(",")[0].strip().upper()
+                rule_names.add(head)
+                match_rule = match_rule or head == "MATCH"
             continue
         if section != "proxies" or not proxies:
             continue
@@ -352,12 +361,21 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
             continue
         key, _, value = stripped.partition(":")
         proxies[-1][key.strip()] = value.strip().strip("'\"")
+    names = [entry.get("name", "") for entry in proxies if entry.get("name")]
+    missing = sorted({member for member in members if member not in set(names)})
     return {
         "proxies": len(proxies),
         "proxy_types": sorted({entry.get("type", "") for entry in proxies if entry.get("type")}),
         "proxy_details": proxies,
+        "duplicate_names": len(names) - len(set(names)),
+        "group_members": len(members),
+        "missing_group_references": missing,
+        "client_fingerprints": sorted(
+            {entry.get("client-fingerprint", "") for entry in proxies if entry.get("client-fingerprint")}
+        ),
         "groups": groups,
         "rules": rules,
+        "rule_names": sorted(rule_names),
         "match_rule": match_rule,
     }
 
@@ -376,6 +394,7 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
         "decoded_bytes": len(decoded or ""),
         "link_count": len(links),
         "schemes": sorted({entry["protocol"] for entry in parsed if entry["protocol"]}),
+        "private_keys": private_key_markers(decoded or ""),
     }
 
     raw = read_payload(payload_dir, "xray-json")
@@ -393,17 +412,33 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
         if xray_test(entry, ca_file, workdir, f"xray-json-{index}"):
             wrapped += 1
 
+    # The transport a client must dial is the tuple the matrix declares per
+    # inbound, so it is read back from the served outbound rather than trusted
+    # from the protocol name alone.
+    identities = [
+        identity for identity in (outbound_identity(outbound) for outbound in proxy_outbounds(entries))
+        if identity is not None
+    ]
     facts["xray_json"] = {
         "shape": shape,
         "entries": len(entries),
         "wrapped": wrapped,
         "protocols": sorted(protocols),
+        "transports": sorted({f"{i[0]}/{i[6]}/{i[5]}" for i in identities}),
+        "fingerprints": sorted({i[4] for i in identities}),
+        "sni_missing": sum(1 for i in identities if not i[3]),
+        # What the client dials, and whether the document also carries the
+        # server's half of REALITY. The second is a count of key names, not a
+        # guess about values, because a Trojan password is legitimate here.
+        "dials": [dial for dial in (outbound_dials(o) for o in proxy_outbounds(entries)) if dial],
+        "private_keys": private_key_markers(raw),
     }
 
     for name in ("mihomo", "clash"):
         text = read_payload(payload_dir, name)
         scan = scan_mihomo(text)
         scan["exit"] = mihomo_test(text, workdir, name)
+        scan["private_keys"] = private_key_markers(text)
         facts[name] = scan
 
     singbox = read_payload(payload_dir, "singbox")
@@ -415,6 +450,7 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
     facts["singbox"] = {
         "parsed": outbounds is not None,
         "outbounds": len(outbounds or []),
+        "private_keys": private_key_markers(singbox),
     }
     return facts
 
@@ -444,6 +480,40 @@ def proxy_outbounds(profiles: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if protocol and protocol not in ("freedom", "blackhole"):
                 result.append(outbound)
     return result
+
+
+def outbound_dials(outbound: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The address tuple a client dials, kept apart from the transport it rides.
+
+    ``outbound_identity`` reduces an outbound to the tuple the matrix declares;
+    this keeps the fields a Host record also states, so the two can be compared
+    field by field instead of through a digest neither side explains.
+    """
+    identity = outbound_identity(outbound)
+    if identity is None:
+        return None
+    protocol, host, port, sni, _fingerprint, _security, network, path, service_name = identity
+    return {
+        "tag": str(outbound.get("tag") or ""),
+        "protocol": protocol,
+        "address": host,
+        "port": port,
+        "sni": sni,
+        "path": path,
+        "service_name": service_name,
+        "network": network,
+    }
+
+
+# A REALITY client is issued ``publicKey``; the private half is the server's and
+# has no reader on the client side. The markers are key names, so the same test
+# reads a served JSON and a served YAML.
+PRIVATE_KEY_MARKERS = ('"privateKey"', '"private_key"', "private-key", "private_key:")
+
+
+def private_key_markers(text: str) -> int:
+    """How many server-side key fields a served document carries."""
+    return sum(text.count(marker) for marker in PRIVATE_KEY_MARKERS)
 
 
 def json_shapes(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, Any]:

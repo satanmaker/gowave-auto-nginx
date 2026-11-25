@@ -3,3 +3,8 @@
 # developer-checkout installer fallback in modules/node.sh, but they are never
 # tracked by git and must not be indexed or read wholesale by the agent.
 /sources/
+
+# Evidence from finished E2E runs: result.json, junit.xml and per-case logs.
+# No file under it is tracked by git, and a six-megabyte dump of past runs
+# answers no question about the current tree.
+/artifacts/

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/nginx.sh - NGINX Stream SNI demultiplexing, TLS termination, and camouflage fallback
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "$SCRIPT_DIR/modules/os.sh" ]]; then
@@ -196,6 +196,7 @@ generate_stream_config() {
     local if_inet6="${4:-/proc/net/if_inet6}"
     local vision_domain="${5:-${VISION_DOMAIN:-}}"
     local cover_domain="${6:-}"
+    local install_mode="${7:-${GOWAVE_INSTALL_MODE:-all-in-one}}"
 
     mkdir -p "$(dirname "$out_file")"
 
@@ -204,9 +205,18 @@ generate_stream_config() {
         listen_v6="listen [::]:443 so_keepalive=on;"
     fi
 
-    local vision_entry=""
-    if [[ -n "$vision_domain" ]]; then
-        vision_entry="    $vision_domain 127.0.0.1:8444;"
+    # Panel-only has no traffic plane to route to: the Panel name keeps its
+    # listener, while the camouflage name and every unknown name reach the
+    # static decoy instead of a closed 8443/8444 port.
+    local vision_entry="" reality_entry="" default_backend="127.0.0.1:8443"
+    if [[ "$install_mode" == "panel-only" ]]; then
+        reality_entry="    $reality_domain 127.0.0.1:9443;"
+        default_backend="127.0.0.1:9443"
+    else
+        reality_entry="    $reality_domain 127.0.0.1:8443;"
+        if [[ -n "$vision_domain" ]]; then
+            vision_entry="    $vision_domain 127.0.0.1:8444;"
+        fi
     fi
 
     # The camouflage apex terminates on the decoy listener directly: no reason
@@ -222,10 +232,10 @@ generate_stream_config() {
 # Managed by GoWave Auto NGINX: Port 443 Stream SNI Router
 map \$ssl_preread_server_name \$sni_backend {
     $panel_domain 127.0.0.1:7443;
-    $reality_domain 127.0.0.1:8443;
+$reality_entry
 $vision_entry
 $cover_entry
-    default 127.0.0.1:8443;
+    default $default_backend;
 }
 
 server {
@@ -405,35 +415,100 @@ generate_panel_https_vhost() {
     local panel_domain="$1"
     local out_file="${2:-/etc/nginx/conf.d/gowave-panel.conf}"
     local nginx_bin="${3:-nginx}"
+    # The lineage directory is an argument, not a derivation: a host whose
+    # certificate name carries a suffix serves from that lineage, and the
+    # /etc/letsencrypt/live/<domain> this used to spell would not exist there.
+    local live_dir="${4:-/etc/letsencrypt/live/$panel_domain}"
 
     mkdir -p "$(dirname "$out_file")"
     local listen_directive
     listen_directive=$(render_nginx_listen_ssl_http2 "127.0.0.1:7443" "proxy_protocol" "$nginx_bin")
 
+    # The Panel reads a client address from any of these headers before it falls
+    # back to the socket (internal/httpx.ClientIP), and the first one it finds
+    # wins. Two are set from $remote_addr below; the rest have to be emptied,
+    # because a header NGINX forwards untouched is an address the client chose.
+    local client_ip_clears=""
+    local trusted_header
+    for trusted_header in X-Remnawave-Real-IP X-Client-IP CF-Connecting-IP \
+                          Fastly-Client-Ip True-Client-Ip X-Cluster-Client-IP \
+                          X-Forwarded Forwarded-For; do
+        client_ip_clears+="        proxy_set_header ${trusted_header} \"\";"$'\n'
+    done
+
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Panel HTTPS Listener & Transports
+# One classification for the subscription route: a messenger or crawler that
+# fetches a pasted link is answered empty, every other caller keeps the Panel's
+# own decision. An absent header stays on the default branch, so the Panel's own
+# refusal is still what the client observes.
+map \$http_user_agent \$gowave_sub_ua_class {
+    default                client;
+    ~*telegrambot          preview;
+    ~*whatsapp             preview;
+    ~*facebookexternalhit  preview;
+    ~*slackbot             preview;
+    ~*discordbot           preview;
+    ~*twitterbot           preview;
+    ~*googlebot            preview;
+    ~*bingbot              preview;
+    ~*yandex(bot|images)   preview;
+    ~*applebot             preview;
+    ~*ahrefsbot            preview;
+    ~*semrushbot           preview;
+}
+
+# Judged on the raw request target: \$uri is already normalised and decoded, so a
+# dot segment or an encoded separator cannot be observed there. First match wins.
+# The counted pattern is quoted because braces are block delimiters to the parser.
+# The first segment is the shortUuid, which the Panel issues from the base64url
+# alphabet: an upper-case letter or an underscore belongs to a real identifier, so
+# refusing it would close the edge to every subscription link the product prints.
+# Only the clientType segment is spelled in lower case.
+map \$request_uri \$gowave_sub_path_bad {
+    default                                            0;
+    "~^/api/sub/[A-Za-z0-9_-]+/[a-z0-9-]{17,}"         1;
+    ~^/api/sub/[A-Za-z0-9_-]*(/[a-z0-9-]+)?/?(\?.*)?\$ 0;
+    ~^/api/sub/                                        1;
+}
+
 server {
     $listen_directive
     server_name $panel_domain;
+    server_tokens off;
 
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
 
-    ssl_certificate /etc/letsencrypt/live/$panel_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$panel_domain/privkey.pem;
+    ssl_certificate $live_dir/fullchain.pem;
+    ssl_certificate_key $live_dir/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
 
-    # Subscriptions: headers preserved, User-Agent preserved, cache disabled
+    # Server level, so a raw target that normalises out of the prefix is still
+    # refused, and nothing reaches the Panel.
+    if (\$gowave_sub_path_bad) {
+        return 444;
+    }
+
+    # Subscriptions: the payload embeds credentials, so it is never cached and
+    # never indexed; the request line carries the shortUuid and stays out of the
+    # access log.
     location ^~ /api/sub/ {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header User-Agent \$http_user_agent;
-        add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+        add_header Cache-Control "no-store, private" always;
+        add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;
+        access_log off;
+        if (\$gowave_sub_ua_class = preview) {
+            return 204;
+        }
     }
 
     # GoWave REST API
@@ -442,8 +517,16 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Scanner targets: a closed, anchored set that no GoWave route and no
+    # dashboard asset occupies. A broad dotfile rule is deliberately avoided, so
+    # a future .well-known path or hashed asset is not shadowed.
+    location ~* ^/(?:\.env|\.git|\.ds_store|wp-login\.php|wp-admin|phpmyadmin|server-status|actuator)(/|\$) {
+        return 444;
     }
 
     # GoWave Web UI Frontend
@@ -452,7 +535,8 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         proxy_set_header X-Forwarded-Proto https;
     }
 
@@ -468,7 +552,8 @@ server {
         proxy_send_timeout 1h;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         access_log off;
     }
 
@@ -482,7 +567,8 @@ server {
         proxy_send_timeout 1h;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         access_log off;
     }
 
@@ -504,6 +590,9 @@ generate_decoy_vhost() {
     local nginx_bin="${3:-nginx}"
     local cover_root="${4:-$COVER_REALITY_ROOT}"
     local cover_domain="${5:-}"
+    # Same reason as the panel vhost: the camouflage certificate can live in a
+    # lineage named differently from the name it covers.
+    local live_dir="${6:-/etc/letsencrypt/live/$reality_domain}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]] || [[ -w "$(dirname "$cover_root")" ]] || [[ -d "$cover_root" && -w "$cover_root" ]]; then
@@ -523,13 +612,14 @@ generate_decoy_vhost() {
 server {
     $listen_directive
     server_name $reality_domain$cover_names;
+    server_tokens off;
 
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
 
     ssl_protocols TLSv1.3;
-    ssl_certificate /etc/letsencrypt/live/$reality_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$reality_domain/privkey.pem;
+    ssl_certificate $live_dir/fullchain.pem;
+    ssl_certificate_key $live_dir/privkey.pem;
 
     root $cover_root;
     index index.html;
@@ -577,6 +667,37 @@ EOF
     echo "Generated $out_file."
 }
 
+deploy_hook_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx/recovery}/deploy-hook-ownership.json"
+}
+
+deploy_hook_record_matches() {
+    local record="$1"
+    local hook_file="$2"
+    local digest="$3"
+
+    if [[ ! -f "$record" || -L "$record" ]]; then
+        return 1
+    fi
+    python3 - "$record" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+record_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(record_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+}
+
 deploy_hook_owned_by_prior_transaction() {
     local hook_file="$1"
     local recovery_root="$2"
@@ -592,29 +713,14 @@ deploy_hook_owned_by_prior_transaction() {
     if [[ -z "$digest" ]]; then
         return 1
     fi
+    # The record outside the transaction directories outlives snapshot purges and
+    # deletions, so a repeated install still recognises the hook it installed.
+    if deploy_hook_record_matches "$(deploy_hook_ownership_record "$recovery_root")" "$hook_file" "$digest"; then
+        return 0
+    fi
     local manifest
     for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
-        if [[ ! -f "$manifest" || -L "$manifest" ]]; then
-            continue
-        fi
-        if python3 - "$manifest" "$hook_file" "$digest" <<'PY'
-import json
-import sys
-
-manifest_path, hook_path, digest = sys.argv[1:4]
-try:
-    with open(manifest_path, "r", encoding="utf-8") as stream:
-        data = json.load(stream)
-except Exception:
-    raise SystemExit(1)
-raise SystemExit(0 if (
-    isinstance(data, dict)
-    and data.get("created_by_tx") is True
-    and data.get("path") == hook_path
-    and data.get("sha256") == digest
-) else 1)
-PY
-        then
+        if deploy_hook_record_matches "$manifest" "$hook_file" "$digest"; then
             return 0
         fi
     done
@@ -629,9 +735,14 @@ verify_deploy_hook_preflight() {
     if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then
         if [[ -n "$transaction_id" ]]; then
             local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-            if [[ -f "$manifest" ]]; then
+            # The manifest records that a transaction created a hook at this path;
+            # it does not say that what now sits there is that hook. A symlink, a
+            # directory or a FIFO is never adopted on the strength of the manifest
+            # alone, and neither is a file whose bytes or path differ from the
+            # recorded ones.
+            if [[ -f "$manifest" && ! -L "$manifest" && -f "$hook_file" && ! -L "$hook_file" ]]; then
                 local owned
-                owned=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+                owned=$(python3 -c 'import hashlib,json,sys; m,h=sys.argv[1:3]; d=json.load(open(m,"r",encoding="utf-8")); s=hashlib.sha256(open(h,"rb").read()).hexdigest(); print("1" if d.get("created_by_tx") is True and d.get("path")==h and d.get("sha256")==s else "0")' "$manifest" "$hook_file" 2>/dev/null || echo "0")
                 if [[ "$owned" == "1" ]]; then
                     return 0
                 fi
@@ -803,6 +914,20 @@ EOF
         echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
         return 1
     }
+    local ownership_record ownership_tmp
+    ownership_record=$(deploy_hook_ownership_record "$recovery_root")
+    ownership_tmp="${ownership_record}.tmp.$$"
+    python3 -c 'import json, os, sys; record, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0); fd = os.open(record, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$ownership_tmp" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not record deploy-hook ownership for later transactions." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$ownership_tmp" || ! sync "$ownership_tmp" ||
+        ! mv -f -- "$ownership_tmp" "$ownership_record" || ! sync "$recovery_root"; then
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not publish the deploy-hook ownership record." >&2
+        return 1
+    fi
     echo "Configured managed ACME renewal hook in $hook_file."
 }
 rollback_managed_deploy_hook() {
@@ -813,6 +938,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi
@@ -898,6 +1058,10 @@ PY
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
         return 1
     }
+    rm -f -- "$(deploy_hook_ownership_record "$recovery_root")" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -976,6 +1140,25 @@ validate_acme_server() {
     return 0
 }
 
+# renewal_directory CONF - print the ACME directory a renewal config was issued
+# against. An empty result means the file carries no readable `server` field, and
+# the caller has to fail closed: guessing the directory is what mixes staging and
+# production into one lineage.
+renewal_directory() {
+    local conf="$1"
+    local server=""
+    local key val
+    [[ -f "$conf" ]] || return 1
+    while IFS='=' read -r key val || [[ -n "$key" ]]; do
+        key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ "$key" == "server" ]]; then
+            server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            break
+        fi
+    done < "$conf"
+    printf '%s' "$server"
+}
+
 check_acme_lineage() {
     local domain="$1"
     local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
@@ -994,13 +1177,7 @@ check_acme_lineage() {
 
     if [[ -f "$renewal_conf" ]]; then
         local existing_server=""
-        while IFS='=' read -r key val || [[ -n "$key" ]]; do
-            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            if [[ "$key" == "server" ]]; then
-                existing_server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                break
-            fi
-        done < "$renewal_conf"
+        existing_server=$(renewal_directory "$renewal_conf")
 
         if [[ -z "$existing_server" ]]; then
             echo "Error: Existing renewal lineage for $domain has no readable 'server' field in $renewal_conf; failing closed to prevent cross-lineage staging/production reuse." >&2
@@ -1051,6 +1228,120 @@ check_acme_lineage() {
     fi
 
     return 0
+}
+
+# select_acme_lineage NAME TARGET_SERVER [LETSENCRYPT_ROOT]
+#
+# Print the live directory of a lineage that already covers NAME, or nothing when
+# the name has to be issued a lineage of its own. Adoption is what keeps a repeat
+# install from growing a second lineage beside the one the host already serves:
+# certbot names a lineage after `--cert-name`, and a host whose certificate name
+# carries a suffix (`example.com-0001`) would otherwise be issued `example.com`
+# and end up with two.
+#
+# A lineage qualifies only when all three hold, because each one is a way to serve
+# the wrong certificate:
+#   * its renewal config names TARGET_SERVER (the existing isolation, unchanged);
+#   * its certificate has not expired;
+#   * its certificate covers NAME.
+# Order is deterministic — the exact-name lineage first, then the rest by
+# directory name ascending — so the same tree always yields the same answer.
+select_acme_lineage() {
+    local name="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local letsencrypt_root="${3:-/etc/letsencrypt}"
+    local live_root="${letsencrypt_root}/live"
+    local renewal_root="${letsencrypt_root}/renewal"
+
+    # An empty or unreadable tree is not an error: it is a host that has to be
+    # issued its first lineage.
+    [[ -d "$live_root" ]] || return 0
+
+    local -a order=()
+    local entry candidate
+    if [[ -d "${live_root}/${name}" && ! -L "${live_root}/${name}" ]]; then
+        order+=("$name")
+    fi
+    # `-type d` already excludes a symlinked entry: it reports the link, not its
+    # target, and a lineage directory certbot created is never a symlink.
+    while IFS= read -r entry; do
+        candidate=$(basename -- "$entry")
+        [[ "$candidate" == "$name" ]] && continue
+        order+=("$candidate")
+    done < <(find "$live_root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
+
+    if (( ${#order[@]} == 0 )); then
+        return 0
+    fi
+
+    for candidate in "${order[@]}"; do
+        local live_dir="${live_root}/${candidate}"
+        local fullchain="${live_dir}/fullchain.pem"
+        local renewal_conf="${renewal_root}/${candidate}.conf"
+        [[ -s "$fullchain" && -f "$renewal_conf" ]] || continue
+
+        local issued_by
+        issued_by=$(renewal_directory "$renewal_conf")
+        if [[ "$issued_by" != "$target_server" ]]; then
+            echo "Not adopting the ACME lineage $candidate for $name: it was not issued by $target_server." >&2
+            continue
+        fi
+        if ! openssl x509 -checkend 0 -noout -in "$fullchain" >/dev/null 2>&1; then
+            echo "Not adopting the ACME lineage $candidate for $name: its certificate has expired." >&2
+            continue
+        fi
+        # OpenSSL builds differ in whether a mismatch reaches the exit status, so
+        # the explicit result text is inspected as well, exactly as
+        # verify_acme_certificate does.
+        local host_check
+        if ! host_check=$(openssl x509 -checkhost "$name" -noout -in "$fullchain" 2>&1); then
+            continue
+        fi
+        if [[ "$host_check" != "Hostname $name does match certificate" ]]; then
+            continue
+        fi
+
+        printf '%s\n' "$live_dir"
+        echo "Adopting the ACME lineage $candidate for $name: it covers the name and matches the ACME directory." >&2
+        return 0
+    done
+    return 0
+}
+
+# record_certificate_lineages STATE_FILE PANEL_LIVE_DIR REALITY_LIVE_DIR [VISION_LIVE_DIR]
+#
+# Record the directories the vhosts and the Vision inbound reference, so an
+# operator reading state.json sees which lineage serves which name and a later
+# re-render does not have to re-derive it. The file is written before issuance:
+# a run that dies mid-issuance still leaves the choice it made.
+record_certificate_lineages() {
+    local state_file="$1"
+    local panel_dir="$2"
+    local reality_dir="$3"
+    local vision_dir="${4:-}"
+
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "$state_file" "$panel_dir" "$reality_dir" "$vision_dir" <<'PY'
+import json
+import os
+import sys
+
+from modules.api_client import atomic_write_state
+
+state_path, panel_dir, reality_dir, vision_dir = sys.argv[1:5]
+state = {}
+if os.path.exists(state_path):
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+if not isinstance(state, dict):
+    raise SystemExit("state.json is not an object; refusing to record certificate lineages.")
+lineages = {"panel": panel_dir, "reality": reality_dir}
+if vision_dir:
+    lineages["vision"] = vision_dir
+state["certificateLineages"] = lineages
+atomic_write_state(state, state_path)
+PY
+    echo "Recorded the selected certificate lineages in $state_file."
 }
 
 snapshot_acme_lineage() {

@@ -24,13 +24,16 @@ import hashlib
 import ipaddress
 import json
 import os
+import shlex
 import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from tools.podman_e2e import acme_fixture, client_image, target_image
+from tools.podman_e2e import (
+    acme_fixture, argv_probe, client_image, ingress, matrix, target_image,
+)
 
 # Two networks, because one block cannot satisfy both ends of the run.
 #
@@ -73,12 +76,23 @@ ENGINE_CLIENT_OFFSET = 41
 # control and data-plane addresses: sharing the Master's would make the run
 # unable to tell which node a payload actually left from.
 WORKER_OFFSET = 11
+# The Panel keys a node record by its address (`uniqueIndex` on `nodes.address`),
+# so a second node that has to reach the same host needs a second address on it.
+# This one is an alias of the Worker's own interface, added by the case that
+# needs it: the host is one, the records the Panel holds are two.
+SECOND_NODE_OFFSET = 12
 UNTRUSTED_OFFSET = 44
 
 DNS_PORT = 53
 DNS_ZONE_TTL = 30
 DNS_ZONE_SUFFIX = "testbed.internal"
 HOST_RESOLV_CONF = Path("/etc/resolv.conf")
+# Where a stub-listener host keeps the servers it forwards to. Only consulted
+# when /etc/resolv.conf itself yields nothing usable.
+SYSTEMD_UPSTREAM_RESOLV_CONFS = (
+    Path("/run/systemd/resolve/resolv.conf"),
+    Path("/run/resolvconf/resolv.conf"),
+)
 
 FIXTURE_IMAGE = "fixture-echo"
 DNS_FIXTURE_SCRIPT = "/repo/tests/fixtures/dns_server.py"
@@ -154,11 +168,14 @@ TRAFFIC_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/traffic_probe.py"
 # role's own resolution path, so both vantages are measured with the same code.
 DNS_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/dns_probe.py"
 DNS_PROBE_TIMEOUT_SECONDS = 60
-# Payloads are fetched on the host (the subscription routes are loopback-only)
-# and mounted into the engine container; they are never printed or copied into
-# the artifact directory.
+# Payloads are fetched on the host — the shortUuid comes from the Panel's
+# loopback API — and mounted into the engine container; they are never printed
+# or copied into the artifact directory.
 PAYLOAD_MOUNT = "/payloads"
 SECRETS_MOUNT = "/secrets"
+# Where the product keeps its unencrypted archives: a run-owned volume, removed
+# by the same label the rest of the run's resources are removed by.
+BACKUP_STORE = "/var/backups/gowave"
 
 INSTALL_TIMEOUT_SECONDS = 5400
 
@@ -217,6 +234,10 @@ class NetworkPlan:
         return self._address(WORKER_OFFSET)
 
     @property
+    def second_node_ip(self) -> str:
+        return self._address(SECOND_NODE_OFFSET)
+
+    @property
     def data_worker_ip(self) -> str:
         return self._address(WORKER_OFFSET, self.data_subnet)
 
@@ -262,28 +283,38 @@ def allocate_plan(used_subnets: Sequence[str]) -> NetworkPlan:
     )
 
 
-def egress_resolvers(resolv_conf: Path = HOST_RESOLV_CONF) -> List[str]:
+def egress_resolvers(
+    resolv_conf: Path = HOST_RESOLV_CONF,
+    upstreams: Sequence[Path] = SYSTEMD_UPSTREAM_RESOLV_CONFS,
+) -> List[str]:
     """Real resolvers the disposable host may use for names outside the fixture zone.
 
     The fixture answers its own zone authoritatively and refuses everything else,
     so the target falls through to these servers for package mirrors and release
-    downloads exactly like a fresh VPS. Loopback entries are dropped: they point
-    at the workstation's stub resolver, which does not exist in the container.
+    downloads exactly like a fresh VPS. Loopback entries are dropped: a stub
+    listener such as systemd-resolved's 127.0.0.53 exists on the host and not
+    inside the container, so handing it over would leave the target unable to
+    resolve anything. A host that answers with nothing but stubs is therefore
+    followed to the upstream list kept beside them (`upstreams`); the file the
+    caller named is still read first, so a real address there wins.
     """
-    try:
-        text = resolv_conf.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    resolvers: List[str] = []
-    for line in text.splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and fields[0] == "nameserver":
-            address = fields[1]
-            if address.startswith("127.") or address.startswith("169.254.") or address == "::1":
-                continue
-            if address not in resolvers:
-                resolvers.append(address)
-    return resolvers
+    for candidate in (resolv_conf, *upstreams):
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        resolvers: List[str] = []
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] == "nameserver":
+                address = fields[1]
+                if address.startswith("127.") or address.startswith("169.254.") or address == "::1":
+                    continue
+                if address not in resolvers:
+                    resolvers.append(address)
+        if resolvers:
+            return resolvers
+    return []
 
 
 def free_loopback_port() -> int:
@@ -364,6 +395,22 @@ class AioTopology:
     # IPv6 case turns it on for the role it has to prove.
     ipv6_host: bool = False
     ipv6_address: str = field(default="", init=False)
+    # The name the installed host's archive volume is recorded under.
+    target_role: str = "aio"
+    # The role's archive volume: the archives carry install-time secrets, so they
+    # are kept on a run-owned volume the cleanup removes by its own label rather
+    # than in the container layer or anywhere an artifact could reach them.
+    backup_volumes: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+    def _backup_volume(self, role: str) -> str:
+        name = self.context.resource_name(f"backups-{role}")
+        self.podman.volume_create(name)
+        mountpoint = self.podman.volume_mountpoint(name)
+        # Podman leaves a fresh volume world-readable; the archives are not
+        # encrypted, so the volume itself is closed to everyone but root.
+        os.chmod(mountpoint, 0o700)
+        self.backup_volumes[role] = {"name": name, "mountpoint": str(mountpoint)}
+        return name
 
     def __post_init__(self) -> None:
         target_image.distribution(self.distribution)
@@ -389,8 +436,11 @@ class AioTopology:
 
     def create(self) -> "AioTopology":
         if not self.egress_resolvers:
+            consulted = ", ".join(
+                str(path) for path in (HOST_RESOLV_CONF, *SYSTEMD_UPSTREAM_RESOLV_CONFS)
+            )
             raise TopologyError(
-                f"no egress resolver found in {HOST_RESOLV_CONF}; the disposable host could not install packages"
+                f"no egress resolver found in {consulted}; the disposable host could not install packages"
             )
         self.payload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
@@ -527,9 +577,14 @@ class AioTopology:
             privileged=True,
             volumes=(
                 f"{self._ca_dir}:{CA_MOUNT}:ro,Z",
-                # The subscription routes are loopback-only, so the payloads are
-                # fetched on the host and handed to the engine client from here.
+                # The payloads are fetched on the host and handed to the engine
+                # client from here: the client's shortUuid is read from the
+                # Panel's loopback API, and the bytes stay in a run-owned secret
+                # directory rather than in an artifact.
                 f"{self.payload_dir}:{PAYLOAD_MOUNT}:Z",
+                # The product writes its archives here; a run-owned volume keeps
+                # them out of the container layer and out of every artifact.
+                f"{self._backup_volume(self.target_role)}:{BACKUP_STORE}:Z",
             ),
             environment=self.install_environment(),
             systemd="always",
@@ -715,6 +770,33 @@ class AioTopology:
         if node not in ("", "local"):
             raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
         return str(self.plan.data_target_ip)
+
+    def ingress_hosts(self) -> List["ingress.Host"]:
+        """Every host a proxy request could arrive at, and the name it answers to.
+
+        One host here: the node the client's names resolve to. The container is
+        that node itself, because the capture has to read the kernel the product
+        installed into rather than the vantage point the request was sent from.
+        """
+        return [ingress.Host(role="local", container=self.target_name, name=self.panel_domain)]
+
+    def ingress_role(self, node: str = "") -> str:
+        """The capture host a node's traffic belongs to, as the evidence names it."""
+        if node not in ("", "local"):
+            raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
+        return "local"
+
+    def ingress_engine(self) -> str:
+        """The container whose connections make each host report the client's address."""
+        return self.engine_client()
+
+    def ingress_backend(self) -> "ingress.Backend":
+        """How a probe is started inside a host: one ``podman exec`` per probe.
+
+        The pipe is the transport for both the readiness line and the summary, so
+        a capture has nothing to write down and nothing to delete afterwards.
+        """
+        return ingress.PodmanBackend(self.podman)
 
     def echo_allow_sources(self) -> List[str]:
         """The only node identities the endpoint accepts a payload from.
@@ -966,6 +1048,7 @@ class AioTopology:
     def install_environment(self) -> Dict[str, str]:
         ca_file = f"{CA_MOUNT}/{ACME_CA_BUNDLE_NAME}"
         bundle = self._ca_dir / ACME_CA_BUNDLE_NAME if self._ca_dir else None
+        pins = matrix.product(matrix.load())
         return {
             "GOWAVE_ACME_SERVER": acme_fixture.ACME_DIRECTORY_URL,
             "GOWAVE_ACME_TEST_MODE": "1",
@@ -977,13 +1060,26 @@ class AioTopology:
             "GOWAVE_PODMAN_TEST_MODE": "1",
             "GOWAVE_PODMAN_MASTER_ADDRESS": self.plan.target_ip,
             "GOWAVE_PODMAN_NETWORK_CIDR": self.plan.subnet,
+            # The versions this deployment configures. Passed to the install
+            # rather than only observed afterwards, so the case that compares the
+            # installed binaries is reading a configuration the operator gave
+            # instead of a value the harness wrote after the fact.
+            "GOWAVE_PANEL_VERSION": pins.get("panel_version", "latest"),
+            "GOWAVE_NODE_VERSION": pins.get("node_version", "latest"),
+            "XRAY_SERVER_VERSION": pins.get("xray_version", ""),
             "DEBIAN_FRONTEND": "noninteractive",
         }
 
-    def install_script(self) -> str:
+    def install_script(self, vision_domain: Optional[str] = None) -> str:
+        """The operator's install command, optionally asking for another Vision domain.
+
+        ``None`` keeps the domain this topology was built with; a case that has to
+        make the Vision stage fail passes the name it wants attempted instead.
+        """
+        domain = self.vision_domain if vision_domain is None else vision_domain
         arguments = [self.panel_domain, self.reality_domain, self.admin_email]
-        if self.vision_domain:
-            arguments.append(self.vision_domain)
+        if domain:
+            arguments.append(domain)
         quoted = " ".join(f"'{value}'" for value in arguments)
         return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh install {quoted}"
 
@@ -1000,8 +1096,17 @@ class AioTopology:
         """
         return self._install("aio-reinstall")
 
-    def _install(self, evidence_prefix: str) -> InstallOutcome:
-        script = self.install_script()
+    def install_vision_failure(self, vision_domain: str) -> InstallOutcome:
+        """Run the install once more asking for a Vision domain that cannot be issued.
+
+        The same operator command under its own evidence prefix: a failed attempt
+        is evidence in its own right, and it must not overwrite the log of the run
+        that installed the host.
+        """
+        return self._install("aio-vision-failure", vision_domain)
+
+    def _install(self, evidence_prefix: str, vision_domain: Optional[str] = None) -> InstallOutcome:
+        script = self.install_script(vision_domain)
         started = time.monotonic()
         proc = self.podman.exec_bash(
             self.target_name, script, check=False, timeout=INSTALL_TIMEOUT_SECONDS,
@@ -1096,11 +1201,20 @@ class MultiNodeTopology(AioTopology):
     # declared here rather than inherited from whatever the container runtime
     # happens to enable.
     ipv6_host: bool = True
+    target_role: str = "master"
+    # The prefix the registration's own two evidence files are named under. A
+    # topology that reuses this command names them after itself, so a run
+    # directory never files one contour's dispatch under another's name.
+    node_add_evidence_prefix: str = "mn-node-add"
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.worker_name = self.context.resource_name("worker")
         self.untrusted_name = self.context.resource_name("untrusted")
+        # What the Master's argv observer reported before the dispatch ran: the
+        # strace it found or installed, its version, the -s limit and any reason
+        # the observer was unusable. ``None`` means the dispatch never ran.
+        self.argv_observer: Optional[Dict[str, Any]] = None
 
     def zone(self) -> Dict[str, Any]:
         """The base zone plus the Worker's own names, which only this topology has."""
@@ -1166,6 +1280,27 @@ class MultiNodeTopology(AioTopology):
     def echo_allow_sources(self) -> List[str]:
         """Both node identities, and only those: the endpoint has two egress peers."""
         return [str(self.plan.data_target_ip), str(self.plan.data_worker_ip)]
+
+    def ingress_hosts(self) -> List["ingress.Host"]:
+        """Both nodes, each under the name a client dials to reach it.
+
+        A request is bracketed by a capture on *both* hosts, which is the whole
+        difference from the All-in-One contour: with one node there is no second
+        place the traffic could arrive, so "the other host saw nothing" is not a
+        fact that contour can produce.
+        """
+        return [
+            ingress.Host(role="master", container=self.target_name, name=self.panel_domain),
+            ingress.Host(role="worker", container=self.worker_name, name=self.worker_domain),
+        ]
+
+    def ingress_role(self, node: str = "") -> str:
+        """The capture host a node's traffic belongs to, as the evidence names it."""
+        if node in ("", "master"):
+            return "master"
+        if node == "worker":
+            return "worker"
+        raise TopologyError(f"the Multi-Node topology has a Master and a Worker, not {node!r}")
 
     def create(self) -> "MultiNodeTopology":
         super().create()
@@ -1259,6 +1394,9 @@ class MultiNodeTopology(AioTopology):
             network=self.network,
             aliases=(self.worker_domain,),
             privileged=True,
+            # The Worker's archives are as secret-bearing as the Master's, so they
+            # get their own run-owned volume and the same closed directory.
+            volumes=(f"{self._backup_volume('worker')}:{BACKUP_STORE}:Z",),
             # The Worker installs its own packages and manages its own units, so
             # it needs the same egress resolver path the Master has.
             environment={"DEBIAN_FRONTEND": "noninteractive"},
@@ -1310,14 +1448,12 @@ class MultiNodeTopology(AioTopology):
         self.started.append(self.untrusted_name)
 
     # ------------------------------------------------------------------- trust
-    def pin_worker_trust(self) -> Dict[str, Any]:
-        """Give the Master key access to the Worker and pin the Worker's host key.
+    def _master_public_key(self) -> str:
+        """The Master's own SSH identity, created once and reused by every pin.
 
-        The operator refuses an unpinned host key on purpose, so the run pins one:
-        the key is read from the Worker's own filesystem, which is the trusted
-        local control plane here, exactly as an operator would verify it out of
-        band before adding the node. Nothing is learned from an unauthenticated
-        ``ssh-keyscan``.
+        Key generation is idempotent on purpose: a host the run pins later must be
+        reached with the key the earlier pins already carry, not a fresh one that
+        replaces it.
         """
         self.podman.exec_bash(
             self.target_name,
@@ -1330,7 +1466,19 @@ class MultiNodeTopology(AioTopology):
             self.target_name, ["cat", "/root/.ssh/id_ed25519.pub"],
         ).stdout.strip()
         if not public_key:
-            raise TopologyError("the Master did not produce an SSH identity for the Worker")
+            raise TopologyError("the Master did not produce an SSH identity for the pins")
+        return public_key
+
+    def pin_worker_trust(self) -> Dict[str, Any]:
+        """Give the Master key access to the Worker and pin the Worker's host key.
+
+        The operator refuses an unpinned host key on purpose, so the run pins one:
+        the key is read from the Worker's own filesystem, which is the trusted
+        local control plane here, exactly as an operator would verify it out of
+        band before adding the node. Nothing is learned from an unauthenticated
+        ``ssh-keyscan``.
+        """
+        public_key = self._master_public_key()
         # The key travels over stdin: an argv copy would be visible in the
         # container's process list for as long as the exec lasts.
         self.podman.exec(
@@ -1378,6 +1526,134 @@ class MultiNodeTopology(AioTopology):
             "master_key_fingerprint": self._key_fingerprint(public_key),
         }
 
+    def pin_worker_address(self, address: str) -> str:
+        """Pin the Worker's own host key under a second address on the Master.
+
+        A second node record reaches the same host through its own address, and
+        the operator's rule that a key is verified out of band and pinned before
+        use applies to that address too. The key is read from the Worker's own
+        filesystem at the moment of the pin rather than reused from an earlier
+        read: the suite's own SSH host-key case rotates the Worker's keys, so a
+        key captured before it is a pin of a key the host no longer presents,
+        which OpenSSH refuses as a changed key instead of a new address.
+        """
+        worker_host_key = self.podman.exec(
+            self.worker_name, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
+        ).stdout.strip()
+        if not worker_host_key.startswith("ssh-ed25519 "):
+            raise TopologyError(
+                f"the Worker has no ed25519 host key to pin for {address}"
+            )
+        entry = f"{address} {worker_host_key}\n"
+        self.podman.exec(
+            self.target_name,
+            ["bash", "-c", "umask 077; mkdir -p /root/.ssh; cat >> /root/.ssh/known_hosts"],
+            input_text=entry,
+            timeout=120,
+        )
+        pinned = self.podman.exec(
+            self.target_name, ["cat", "/root/.ssh/known_hosts"], check=False,
+        ).stdout
+        if entry.strip() not in pinned:
+            raise TopologyError(
+                f"{address} with the Worker host key did not land in "
+                f"{self.target_name}:/root/.ssh/known_hosts"
+            )
+        self._worker_host_key = worker_host_key
+        return entry.strip()
+
+    # -------------------------------------------------- secondary Worker host
+    def start_secondary_worker(
+        self, container: str, address: str, domains: Sequence[str],
+    ) -> Dict[str, Any]:
+        """Start a clean systemd host beside the Worker, for a second registration.
+
+        ``MN-ENV-CONTRACT`` drives the product's own ``node add`` a second time, and
+        the Panel keys a node by its address, so that registration needs a host the
+        first one does not already hold. The container gets the run's image,
+        resolver and SSH preparation the Worker had — the product's preflight reads
+        both hosts the same way — but it is not one of the topology's declared
+        roles: the case that needs it creates it, and its own teardown removes it.
+        """
+        image_tag = target_image.build(self.podman, self.distribution)
+        self.podman.run(
+            name=container,
+            image_alias=image_tag,
+            network=self.network,
+            aliases=tuple(domains),
+            privileged=True,
+            environment={"DEBIAN_FRONTEND": "noninteractive"},
+            systemd="always",
+            extra_args=(
+                "--ip", address,
+                "--dns", self.plan.dns_ip,
+                *[option for resolver in self.egress_resolvers for option in ("--dns", resolver)],
+            ),
+        )
+        self.started.append(container)
+        self.podman.wait_systemd(container, timeout_seconds=180)
+        # The second Worker is IPv4-only like the first one, so the product takes
+        # the same branch on both hosts rather than one the runtime chose.
+        self.podman.exec_bash(container, DISABLE_IPV6_SCRIPT, timeout=120)
+        self.podman.exec_bash(container, WORKER_SSH_SETUP_SCRIPT, timeout=120)
+        return {
+            "container": container,
+            "address": address,
+            "domains": sorted(domains),
+            "systemd": "ready",
+        }
+
+    def pin_secondary_trust(self, container: str, address: str) -> Dict[str, str]:
+        """Give the Master access to a second Worker host and pin its host key.
+
+        The rule the first Worker is held to applies to every address the operator
+        provisions: the key is read from the host's own filesystem, pinned under
+        the address the registration will use, and read back — an append that never
+        arrived exits 0 and leaves an empty file.
+        """
+        public_key = self._master_public_key()
+        self.podman.exec(
+            container,
+            ["bash", "-c",
+             "umask 077; mkdir -p /root/.ssh; chmod 0700 /root/.ssh; "
+             "cat >> /root/.ssh/authorized_keys; chmod 0600 /root/.ssh/authorized_keys"],
+            input_text=public_key + "\n",
+            timeout=120,
+        )
+        authorized = self.podman.exec(
+            container, ["cat", "/root/.ssh/authorized_keys"], check=False,
+        ).stdout
+        if self._key_blob(public_key) not in authorized:
+            raise TopologyError(
+                f"the Master key did not land in {container}:/root/.ssh/authorized_keys"
+            )
+        host_key = self.podman.exec(
+            container, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
+        ).stdout.strip()
+        if not host_key.startswith("ssh-ed25519 "):
+            raise TopologyError(f"{container} has no ed25519 host key to pin for {address}")
+        entry = f"{address} {host_key}\n"
+        self.podman.exec(
+            self.target_name,
+            ["bash", "-c", "umask 077; mkdir -p /root/.ssh; cat >> /root/.ssh/known_hosts"],
+            input_text=entry,
+            timeout=120,
+        )
+        pinned = self.podman.exec(
+            self.target_name, ["cat", "/root/.ssh/known_hosts"], check=False,
+        ).stdout
+        if entry.strip() not in pinned:
+            raise TopologyError(
+                f"{address} with the {container} host key did not land in "
+                f"{self.target_name}:/root/.ssh/known_hosts"
+            )
+        return {
+            "container": container,
+            "address": address,
+            "host_key_fingerprint": self._key_fingerprint(host_key),
+            "master_key_fingerprint": self._key_fingerprint(public_key),
+        }
+
     @staticmethod
     def _key_fingerprint(public_key: str) -> str:
         """The SHA256 fingerprint of an OpenSSH public key, computed without a key file."""
@@ -1400,24 +1676,76 @@ class MultiNodeTopology(AioTopology):
     # the registered node must not be handed the container's name.
     worker_node_name = WORKER_NODE_NAME
 
-    def node_add_script(self, name: str = WORKER_NODE_NAME) -> str:
+    def node_add_script(
+        self, name: str = WORKER_NODE_NAME, environment: Optional[Dict[str, str]] = None,
+        address: Optional[str] = None, worker_domain: Optional[str] = None,
+        reality_domain: Optional[str] = None, vision_domain: Optional[str] = None,
+    ) -> str:
+        """The operator's ``node add`` for one Worker, with optional inputs.
+
+        The defaults address the topology's own Worker; a case that provisions a
+        disposable second host passes that host's address and names instead. An
+        ``environment`` mapping becomes a command prefix, because a variable set
+        in the container's creation environment never reaches the Worker: the
+        Master's own shell is what forwards these over the SSH stdin stream.
+        """
+        address = address or self.plan.worker_ip
+        worker_domain = worker_domain or self.worker_domain
+        reality_domain = reality_domain or self.worker_reality_domain
+        if vision_domain is None:
+            vision_domain = self.worker_vision_domain
         arguments = [
             f"'{name}'",
-            f"'{self.plan.worker_ip}'",
-            f"'{self.worker_domain}'",
-            f"'{self.worker_reality_domain}'",
+            f"'{address}'",
+            f"'{worker_domain}'",
+            f"'{reality_domain}'",
         ]
-        vision = f"--vision-domain '{self.worker_vision_domain}' " if self.worker_vision_domain else ""
-        return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add {vision}{' '.join(arguments)}"
+        vision = f"--vision-domain '{vision_domain}' " if vision_domain else ""
+        command = f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add {vision}{' '.join(arguments)}"
+        prefix = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in sorted((environment or {}).items())
+        )
+        return f"{prefix} {command}" if prefix else command
 
-    def node_add(self, name: str = WORKER_NODE_NAME) -> InstallOutcome:
+    def node_add(
+        self, name: str = WORKER_NODE_NAME, *,
+        environment: Optional[Dict[str, str]] = None,
+        address: Optional[str] = None, worker_domain: Optional[str] = None,
+        reality_domain: Optional[str] = None, vision_domain: Optional[str] = None,
+        observe: bool = True, evidence_prefix: Optional[str] = None,
+    ) -> InstallOutcome:
         """Provision the Worker through the operator's real ``node add`` path.
 
         The command runs on the Master, over the same SSH transport and Panel API
         registration an operator uses; the harness only supplies the trusted
         host-key pin and the SSH identity the operator would establish first.
+
+        The dispatch runs under the Master-side argv observer, so this is the
+        same observation the live runner makes: strace is installed on the
+        Master first, the trace is written there, and ``MN-ARGV-OBSERVER`` scans
+        and removes it there. ``envp`` therefore never leaves this host. An
+        observer that cannot be installed is recorded in the facts rather than
+        raised — an unobserved deployment is still a deployment — and the case
+        that needs the observation refuses without it.
+
+        ``observe=False`` runs the command without touching that trace, so a
+        dispatch that is not the deployment under observation cannot erase what
+        the deployment left behind.
         """
-        script = self.node_add_script(name)
+        script = self.node_add_script(
+            name, environment=environment, address=address,
+            worker_domain=worker_domain, reality_domain=reality_domain,
+            vision_domain=vision_domain,
+        )
+        if observe:
+            self.argv_observer = argv_probe.ensure_strace(self.podman, self.target_name)
+            if self.argv_observer["ok"]:
+                self.podman.exec_bash(
+                    self.target_name, argv_probe.trace_reset_script(), check=False,
+                )
+                script = argv_probe.strace_prefix(
+                    argv_probe.TRACE_PATH, self.argv_observer["limit"],
+                ) + script
         started = time.monotonic()
         proc = self.podman.exec_bash(
             self.target_name, script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
@@ -1429,8 +1757,9 @@ class MultiNodeTopology(AioTopology):
             duration=time.monotonic() - started,
             command=script,
         )
-        self.context.evidence_text("mn-node-add.stdout.log", outcome.stdout)
-        self.context.evidence_text("mn-node-add.stderr.log", outcome.stderr)
+        prefix = evidence_prefix or self.node_add_evidence_prefix
+        self.context.evidence_text(f"{prefix}.stdout.log", outcome.stdout)
+        self.context.evidence_text(f"{prefix}.stderr.log", outcome.stderr)
         return outcome
 
     def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:
@@ -1448,4 +1777,79 @@ class MultiNodeTopology(AioTopology):
             "roles_started": list(self.started),
             "pre_install_worker": getattr(self, "worker_clean_facts", {}),
         })
+        return record
+
+
+@dataclass
+class PanelOnlyTopology(MultiNodeTopology):
+    """The Panel and the static decoy on one host, its workers somewhere else.
+
+    ``gowave-auto.sh install --panel-only`` deploys the Panel, the decoy and
+    nothing that listens for tunnel traffic: no GoWave Node, no Xray, no inbound
+    port. A Panel-only deployment has no local node, so every worker it ever has
+    arrives through the operator's own ``node add`` — which is why this topology
+    starts the same clean Worker host the Multi-Node one does. A registration
+    that no host could receive cannot be proven, and the first registration after
+    this install is exactly what the squad fix has to answer for.
+
+    What it keeps from the Master contour is the Panel, the resolver, the ACME
+    fixture and the API; what it drops is the traffic plane and the Vision
+    lineage, which this mode has nowhere to terminate.
+    """
+
+    # The Master's IPv6 stack is not part of what this mode claims, so the host
+    # keeps the plain IPv4 shape the All-in-One contour installs.
+    ipv6_host: bool = False
+    target_role: str = "panel-only"
+    # The registration is the same product command the Multi-Node contour runs,
+    # and its evidence must not be filed under that contour's prefix.
+    node_add_evidence_prefix: str = "panel-only-node-add"
+
+    def __post_init__(self) -> None:
+        if self.vision_domain is not None or self.worker_vision_domain is not None:
+            raise ValueError(
+                "the Panel-only topology deploys no traffic plane, so it has no Vision domain"
+            )
+        super().__post_init__()
+        # The host is not an All-in-One one, and two topologies in one run
+        # directory must not share a container name.
+        self.target_name = self.context.resource_name("panel")
+
+    def roles(self) -> List[Dict[str, Any]]:
+        """The Multi-Node inventory with the Master described as what it now is."""
+        inventory = super().roles()
+        for role in inventory:
+            if role["role"] == "master":
+                role["role"] = "panel"
+                role["purpose"] = (
+                    "Panel-only host the operator installs: Panel, NGINX and the static decoy, "
+                    "with no Node, Xray or inbound listener."
+                )
+        return inventory
+
+    def install_script(self, vision_domain: Optional[str] = None) -> str:
+        """The operator's Panel-only command, which carries no Vision argument.
+
+        ``_install`` offers every topology a domain slot because the All-in-One
+        install can be re-run against a name that will fail to be issued; this
+        mode has nowhere to terminate one, so a request for it is refused here
+        instead of being dropped from the command line.
+        """
+        if vision_domain is not None:
+            raise ValueError(
+                "the Panel-only topology deploys no traffic plane, so it has no Vision domain"
+            )
+        arguments = [self.panel_domain, self.reality_domain, self.admin_email]
+        quoted = " ".join(f"'{value}'" for value in arguments)
+        return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh install --panel-only {quoted}"
+
+    def install(self) -> InstallOutcome:
+        return self._install("panel-only-install")
+
+    def reinstall(self) -> InstallOutcome:
+        return self._install("panel-only-reinstall")
+
+    def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:
+        record = super().evidence(outcome)
+        record["installation_mode"] = "panel-only"
         return record

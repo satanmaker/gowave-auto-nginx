@@ -106,6 +106,9 @@ def validate_journal(journal_data):
                         "profile": {"name", "config"},
                         "node": {"name", "address", "port", "configProfile"},
                         "squad": {"name", "inbounds"},
+                        # A user's only journalled update is joining a squad, so the
+                        # before-image is the squad list that attach is reversed against.
+                        "user": {"activeInternalSquads"},
                         "host": {
                             "inbound", "nodes", "remark", "address", "port", "sni",
                             "path", "host", "alpn", "fingerprint", "securityLayer",
@@ -157,6 +160,43 @@ def write_journal_atomically(journal_path, journal_data):
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+ROLLBACK_SIDES = ("ROLLED_BACK", "INCOMPLETE")
+
+
+def record_rollback_sides(journal_path, worker_status, api_status):
+    """Record both compensation sides and refuse to call a one-sided result rolled back.
+
+    The Panel API rollback writes this journal itself and finalizes it as
+    ROLLED_BACK; the Worker restore is a separate host whose verdict arrives
+    afterwards. Writing both outcomes here is what keeps the later, failing side
+    from being hidden behind the earlier side's success: the transaction reaches
+    ROLLED_BACK only when both sides are, and otherwise keeps the recovery record
+    with the side that is still open.
+    """
+    for label, value in (("Worker", worker_status), ("Panel API", api_status)):
+        if value not in ROLLBACK_SIDES:
+            raise JournalValidationError(f"Invalid {label} rollback status: {value}")
+
+    data = load_journal_file(journal_path)
+    validate_journal(data)
+    op = data["op"]
+    if op not in ("provision", "node_add"):
+        raise JournalValidationError(f"Refusing a rollback outcome for operation: {op}")
+    if data["state"] in ("PROVISION_COMMITTED", "NODE_ADD_COMMITTED"):
+        raise JournalValidationError("Refusing to rewrite a committed transaction as a rollback")
+
+    verified = worker_status == "ROLLED_BACK" and api_status == "ROLLED_BACK"
+    data["rollback_sides"] = {"worker": worker_status, "api": api_status}
+    data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if verified:
+        data["state"] = "PROVISION_ROLLED_BACK" if op == "provision" else "NODE_ADD_ROLLED_BACK"
+        data.pop("rollback_errors", None)
+    else:
+        data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+    write_journal_atomically(journal_path, data)
+    return verified
 
 
 def prune_snapshots(recovery_dir, max_snapshots=3, max_bytes=5 * 1024 * 1024 * 1024):

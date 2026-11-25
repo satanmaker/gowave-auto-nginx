@@ -1,23 +1,16 @@
 #!/usr/bin/env bash
 # modules/panel.sh - GoWave Panel native deployment, environment, and service lifecycle
-set -euo pipefail
+set -Eeuo pipefail
+
+# Sourced here as well as by the entrypoint so the download path can be tested
+# by sourcing this module alone; both modules tolerate a second sourcing.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/os.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tempdir.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/artifact.sh"
 
 GOWAVE_INSTALL_DIR="/opt/gowave"
 GOWAVE_DEFAULT_VERSION="latest"
 GOWAVE_REPO="aaaSaZaN/gowave"
-
-detect_arch() {
-    local m
-    m=$(uname -m)
-    case "$m" in
-        x86_64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *)
-            echo "Unsupported architecture: $m" >&2
-            return 1
-            ;;
-    esac
-}
 
 ensure_gowave_user() {
     if ! id -u gowave >/dev/null 2>&1; then
@@ -68,7 +61,7 @@ download_panel_release() {
     mkdir -p "$target_dir"
     local tmp_dir
     tmp_dir=$(mktemp -d "/tmp/gowave-download-XXXXXX")
-    trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "$tmp_dir"' RETURN
+    track_temp_dir "$tmp_dir"
 
     local base_url="https://github.com/${GOWAVE_REPO}/releases"
     local tag_url="$base_url/latest/download"
@@ -83,9 +76,17 @@ download_panel_release() {
     local frontend_source="${GOWAVE_FRONTEND_ARCHIVE:-}"
     local sums_source="${GOWAVE_SHA256SUMS:-}"
 
+    # fetch_panel_asset NAME TARGET [DIGEST]
+    #
+    # Without DIGEST this only moves bytes: it is used for SHA256SUMS, which is
+    # the digest source itself. With DIGEST the transfer goes through
+    # fetch_verified_artifact, so the bytes are checked before they are kept and
+    # a mismatch is terminal — the release host already answered, and a second
+    # host replying with different bytes is a supply-chain signal.
     fetch_panel_asset() {
         local name="$1"
         local target="$2"
+        local digest="${3:-}"
         local candidate_urls=()
         if [[ "$version" == "latest" ]]; then
             candidate_urls+=("$base_url/latest/download/$name")
@@ -98,15 +99,25 @@ download_panel_release() {
             fi
         fi
 
-        local downloaded=0
-        for u in "${candidate_urls[@]}"; do
-            if curl -fsSL --retry 2 --connect-timeout 15 "$u" -o "$target" 2>/dev/null; then
-                if [[ -s "$target" ]]; then
-                    downloaded=1
-                    break
+        local downloaded=0 rc=0
+        if [[ -n "$digest" ]]; then
+            fetch_verified_artifact "$target" "$name" "${candidate_urls[@]}" "$digest" || rc=$?
+            (( rc == 0 )) && return 0
+            # A mismatch is returned unchanged: it aborts this asset like a
+            # transport failure would, but the caller reports a different cause.
+            (( rc == 2 )) && return 2
+            downloaded=0
+        else
+            local u
+            for u in "${candidate_urls[@]}"; do
+                if curl -fsSL --retry 2 --connect-timeout 15 "$u" -o "$target" 2>/dev/null; then
+                    if [[ -s "$target" ]]; then
+                        downloaded=1
+                        break
+                    fi
                 fi
-            fi
-        done
+            done
+        fi
 
         if [[ "$downloaded" -eq 0 ]]; then
             echo "Direct download failed for $name; attempting GitHub API fallback..."
@@ -129,61 +140,87 @@ except Exception:
     pass
 " 2>/dev/null || true)
             if [[ -n "$api_url" ]]; then
-                curl -fsSL --retry 2 -H "Accept: application/octet-stream" "$api_url" -o "$target"
+                if [[ -n "$digest" ]]; then
+                    rc=0
+                    fetch_verified_artifact "$target" "$name" "$api_url" "$digest" || rc=$?
+                    (( rc == 0 )) || return "$rc"
+                else
+                    curl -fsSL --retry 2 -H "Accept: application/octet-stream" "$api_url" -o "$target"
+                fi
             fi
         fi
         [[ -s "$target" ]] || return 1
     }
 
-    if [[ -z "$bin_source" ]]; then
-        fetch_panel_asset "gowave-linux-$arch" "$tmp_dir/gowave-server" || {
-            echo "Error: failed to download GoWave Panel binary." >&2
+    # report_asset_failure RC NAME - name the cause a release asset was refused
+    # for. A mismatch means the release host answered with bytes SHA256SUMS does
+    # not describe; anything else means no host delivered the file at all.
+    report_asset_failure() {
+        local rc="$1"
+        local name="$2"
+        if (( rc == 2 )); then
+            echo "Checksum mismatch: $name does not match SHA256SUMS." >&2
+        else
+            echo "Error: $name could not be downloaded from any source." >&2
+        fi
+        return 1
+    }
+
+    # SHA256SUMS is obtained and parsed before any artifact is accepted: it is
+    # the value every other asset must match, so it is fetched from the release
+    # host only and the artifacts are checked against it before they are kept.
+    if [[ -n "$sums_source" ]]; then
+        cp -- "$sums_source" "$tmp_dir/SHA256SUMS" || {
+            echo "Error: could not read the supplied SHA256SUMS at $sums_source." >&2
             return 1
         }
-        fetch_panel_asset "gowave-frontend.tar.gz" "$tmp_dir/gowave-frontend.tar.gz" || {
-            echo "Error: failed to download GoWave frontend archive." >&2
-            return 1
-        }
+    else
         fetch_panel_asset "SHA256SUMS" "$tmp_dir/SHA256SUMS" || {
             echo "Error: release SHA256SUMS is required; refusing unverified artifacts." >&2
             return 1
         }
-    else
-        cp "$bin_source" "$tmp_dir/gowave-server"
-        cp "$frontend_source" "$tmp_dir/gowave-frontend.tar.gz"
-        [[ -n "$sums_source" ]] && cp "$sums_source" "$tmp_dir/SHA256SUMS"
     fi
-
-    # Checksums are mandatory for downloaded and explicitly supplied artifacts.
     [[ -s "$tmp_dir/SHA256SUMS" ]] || {
         echo "Error: SHA256SUMS is missing or empty; refusing unverified artifacts." >&2
         return 1
     }
-    echo "Verifying mandatory SHA256 checksums..."
-    (
-        cd "$tmp_dir"
-        local expected_bin expected_front actual_bin actual_front
-        expected_bin=$(awk -v name="gowave-linux-$arch" '$2 == name || $2 == "*" name {print $1}' SHA256SUMS)
-        expected_front=$(awk '$2 == "gowave-frontend.tar.gz" || $2 == "*gowave-frontend.tar.gz" {print $1}' SHA256SUMS)
-        [[ "$expected_bin" =~ ^[[:xdigit:]]{64}$ ]] || {
-            echo "Error: SHA256SUMS must contain exactly one valid checksum for gowave-linux-$arch." >&2
-            exit 1
-        }
-        [[ "$expected_front" =~ ^[[:xdigit:]]{64}$ ]] || {
-            echo "Error: SHA256SUMS must contain exactly one valid checksum for gowave-frontend.tar.gz." >&2
-            exit 1
-        }
-        actual_bin=$(sha256sum gowave-server | awk '{print $1}')
-        actual_front=$(sha256sum gowave-frontend.tar.gz | awk '{print $1}')
-        if [[ "$actual_bin" != "$expected_bin" ]]; then
-            echo "Error: Checksum mismatch for gowave-server: expected $expected_bin, got $actual_bin" >&2
-            exit 1
-        fi
-        if [[ "$actual_front" != "$expected_front" ]]; then
-            echo "Error: Checksum mismatch for gowave-frontend.tar.gz: expected $expected_front, got $actual_front" >&2
-            exit 1
-        fi
-    )
+
+    local expected_bin expected_front
+    expected_bin=$(awk -v name="gowave-linux-$arch" '$2 == name || $2 == "*" name {print $1}' "$tmp_dir/SHA256SUMS")
+    expected_front=$(awk '$2 == "gowave-frontend.tar.gz" || $2 == "*gowave-frontend.tar.gz" {print $1}' "$tmp_dir/SHA256SUMS")
+    if [[ ! "$expected_bin" =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo "Error: SHA256SUMS must contain exactly one valid checksum for gowave-linux-$arch." >&2
+        return 1
+    fi
+    if [[ ! "$expected_front" =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo "Error: SHA256SUMS must contain exactly one valid checksum for gowave-frontend.tar.gz." >&2
+        return 1
+    fi
+
+    echo "Fetching GoWave Panel artifacts verified against SHA256SUMS..."
+    local asset_rc=0
+    if [[ -n "$bin_source" ]]; then
+        fetch_verified_artifact "$tmp_dir/gowave-server" "the supplied GoWave Panel binary" \
+            "file://$bin_source" "$expected_bin" || asset_rc=$?
+    else
+        fetch_panel_asset "gowave-linux-$arch" "$tmp_dir/gowave-server" "$expected_bin" || asset_rc=$?
+    fi
+    (( asset_rc == 0 )) || {
+        report_asset_failure "$asset_rc" "the GoWave Panel binary"
+        return 1
+    }
+
+    asset_rc=0
+    if [[ -n "$frontend_source" ]]; then
+        fetch_verified_artifact "$tmp_dir/gowave-frontend.tar.gz" "the supplied GoWave frontend archive" \
+            "file://$frontend_source" "$expected_front" || asset_rc=$?
+    else
+        fetch_panel_asset "gowave-frontend.tar.gz" "$tmp_dir/gowave-frontend.tar.gz" "$expected_front" || asset_rc=$?
+    fi
+    (( asset_rc == 0 )) || {
+        report_asset_failure "$asset_rc" "the GoWave frontend archive"
+        return 1
+    }
 
     # Install files. A repeated install replaces the binary the Panel is already
     # running from this path, and writing through that inode fails with ETXTBSY.
@@ -195,9 +232,26 @@ except Exception:
     mv -f "$staged_server" "$target_dir/gowave-server"
     sync "$target_dir" 2>/dev/null || true
 
+    # The release archive holds the dashboard files at its root and the Panel
+    # resolves ./frontend/dist first, so the dashboard belongs in
+    # frontend/dist. Extract into a sibling and rename, so a failed extraction
+    # never leaves a half-written dashboard behind.
     mkdir -p "$target_dir/frontend"
-    tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$target_dir/frontend"
-    ln -sfn "$target_dir/frontend" "$target_dir/dist"
+    local staged_frontend="$target_dir/frontend/.dist.new"
+    rm -rf "$staged_frontend"
+    mkdir -p "$staged_frontend"
+    tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$staged_frontend"
+    rm -rf "$target_dir/frontend/dist"
+    mv "$staged_frontend" "$target_dir/frontend/dist"
+    sync "$target_dir/frontend" 2>/dev/null || true
+
+    # A host installed by an earlier version carries dist -> frontend, and the
+    # upstream service policy refuses any symlink there. A real directory or
+    # file at that path is not ours to remove.
+    if [[ -L "$target_dir/dist" ]]; then
+        rm -f "$target_dir/dist"
+        sync "$target_dir" 2>/dev/null || true
+    fi
 
     # Set ownership if root
     ensure_gowave_user
@@ -207,7 +261,7 @@ except Exception:
     fi
     chmod 1770 "$target_dir" 2>/dev/null || chmod 0770 "$target_dir" || true
     echo "GoWave Panel binaries installed successfully in $target_dir."
-    rm -rf "$tmp_dir"
+    release_temp_dir "$tmp_dir"
 }
 
 retain_panel_data_ownership() {
@@ -277,6 +331,8 @@ configure_panel_systemd() {
     local unit_file="/etc/systemd/system/gowave.service"
     local recover_unit="/etc/systemd/system/gowave-recover.service"
     local recover_prov_unit="/etc/systemd/system/gowave-recover-provision.service"
+    local update_unit="/etc/systemd/system/gowave-update.service"
+    local update_path_unit="/etc/systemd/system/gowave-update.path"
 
     ensure_gowave_user
 
@@ -292,6 +348,9 @@ Type=simple
 User=gowave
 Group=gowave
 WorkingDirectory=$target_dir
+RuntimeDirectory=gowave
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 ExecStart=$target_dir/gowave-server
 Restart=always
 RestartSec=5
@@ -333,9 +392,40 @@ ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot-provision
 WantedBy=multi-user.target
 EOF
 
+    # 4. In-panel update helper. The Panel leaves a request in its runtime
+    # directory and this root oneshot installs the verified release. These
+    # templates mirror the upstream service policy, so the "service install"
+    # that an update runs rewrites them with identical content.
+    cat > "$update_unit" <<EOF
+[Unit]
+Description=GoWave panel update from a verified release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$target_dir/gowave-server update apply $target_dir
+TimeoutStartSec=15min
+EOF
+
+    cat > "$update_path_unit" <<'EOF'
+[Unit]
+Description=Watch for GoWave panel update requests
+
+[Path]
+PathExists=/run/gowave/update-request
+Unit=gowave-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 0644 "$update_unit" "$update_path_unit"
+
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload --no-ask-password
-        systemctl enable --no-ask-password gowave.service gowave-recover.service gowave-recover-provision.service
+        systemctl enable --no-ask-password gowave.service gowave-recover.service \
+            gowave-recover-provision.service gowave-update.path
     fi
 
     # The managed gowave.service unit above is authoritative. Do not invoke the

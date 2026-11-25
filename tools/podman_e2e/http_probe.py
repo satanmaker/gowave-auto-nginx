@@ -19,6 +19,7 @@ import http.client
 import json
 import ssl
 import sys
+import time
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlsplit
 
@@ -132,13 +133,18 @@ def fetch(
         connection = http.client.HTTPConnection(host, parts.port or 80, timeout=timeout)
 
     try:
+        started = time.monotonic()
         connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read()
+        elapsed = time.monotonic() - started
         report: Dict[str, Any] = {
             "url": url,
             "method": method,
             "status": response.status,
+            # The wall clock of one request, connection included: a case that
+            # injects latency has to read the delay from the side that feels it.
+            "seconds": round(elapsed, 3),
             "headers": {key.lower(): value for key, value in response.getheaders()},
             "body_length": len(payload),
             "body_sha256": hashlib.sha256(payload).hexdigest(),

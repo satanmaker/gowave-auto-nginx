@@ -9,31 +9,136 @@ Run this module as a script to regenerate the catalog from the live spec:
 
     python3 -m tools.podman_e2e.catalog generate
     python3 -m tools.podman_e2e.catalog check
+
+``tests/cases/behaviors.yaml`` is the behaviour inventory beside the catalog:
+every case belongs to exactly one behaviour, and each behaviour names the cases
+that establish it, the cases that exercise its error paths, the topologies it
+is proven in and the gate that blocks on it. ``check`` audits that inventory
+and refuses a rendered report that is not the text the inventory renders to:
+
+    python3 -m tools.podman_e2e.catalog behaviors --write
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import yaml
 
 from . import matrix as matrix_data
+from . import trace as trace_data
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIVE_SPEC = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
 CATALOG_PATH = REPO_ROOT / "tests" / "cases" / "catalog.yaml"
 PARITY_PATH = REPO_ROOT / "tests" / "cases" / "PARITY.md"
 BEHAVIORS_PATH = REPO_ROOT / "tests" / "cases" / "behaviors.yaml"
+BEHAVIOR_REPORT_PATH = REPO_ROOT / "docs" / "PODMAN_E2E_BEHAVIORS.md"
 MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
+
+# The nine areas the delta spec's coverage requirement names, in its own order.
+# The inventory declares them and every one of them has to carry a behaviour:
+# an area the requirement names but no entry covers is a failure, not a gap.
+BEHAVIOR_SCHEMA = "gowave-podman-behaviors/v1"
+BEHAVIOR_AREAS: Tuple[str, ...] = (
+    "installation",
+    "provisioning",
+    "subscription-representations",
+    "data-plane",
+    "decoy",
+    "tls-dns-acme",
+    "network-policy",
+    "lifecycle",
+    "failure-injection",
+)
 
 PODMAN_CASES: Sequence[str] = ("aio", "multi-node")
 ALL_CASES: Sequence[str] = ("podman", "live")
+
+# Where each live scenario is answered is a checked field, not a default: the
+# table below is read by `build_catalog`, so a scenario the spec gains and the
+# table does not classify stops the build instead of being claimed by a
+# container that never ran it.
+SCENARIOS_PATH = REPO_ROOT / "tests" / "cases" / "scenarios.yaml"
+ENVIRONMENT_SCHEMA = "gowave-live-scenario-environments/v1"
+ENVIRONMENTS: Sequence[str] = ("container", "partial", "live-only")
+
+# The one-directional path a case walks: implemented here, stabilised here after
+# the configured green-run count and a review, and finally asserted by a live
+# driver that states the same outcome. `live-parity` is entered by the live spec
+# gaining a scenario, never by editing the register, which is what keeps the
+# direction one-way.
+PROMOTIONS_PATH = REPO_ROOT / "tests" / "cases" / "promotions.yaml"
+PROMOTION_SCHEMA = "gowave-case-promotions/v1"
+PROMOTION_STATES: Sequence[str] = ("incubating", "podman-stable", "live-parity")
+
+# The modules that build the Podman case list, keyed by the topology their
+# `Case(...)` calls declare. Implementation facts are read from this code and
+# written into the catalog, never the other way round: an entry cannot claim a
+# driver no function implements, and a function cannot run a case the catalog
+# does not declare implemented.
+DRIVER_MODULES: Dict[str, Path] = {
+    "aio": REPO_ROOT / "tools" / "podman_e2e" / "aio.py",
+    "multi-node": REPO_ROOT / "tools" / "podman_e2e" / "multi_node.py",
+    "panel-only": REPO_ROOT / "tools" / "podman_e2e" / "panel_only.py",
+}
+
+# Two drivers mint one `Case` per matrix tuple instead of writing each out, so
+# their ids are computed rather than spelled. The exception is a closed list —
+# the ids themselves are the ones `data_plane_cases()` puts in the catalog and
+# `tests/test_podman_matrix.py` checks against the matrix — and a new builder
+# appearing in the code is refused rather than silently escaping the catalog.
+# Keyed by module file stem, because that is what the source names.
+MATRIX_DRIVEN_BUILDERS: Set[Tuple[str, str]] = {
+    ("aio", "_data_plane_case"),
+    ("multi_node", "data_plane_case"),
+}
+
+DRIVER_STATUSES: Sequence[str] = ("implemented", "planned", "not-applicable")
+
+# The tiers a topology can be gated at, earliest first. A case's gate is the
+# earliest tier its own topology is gated at, read from the manifest rather than
+# written into the entry: the behaviour audit compares the two, so a topology
+# moved behind another tier cannot leave the catalog advertising the old one.
+GATE_TIERS: Sequence[str] = ("pre-push", "pr")
+
+
+def case_gate(topologies: Sequence[str], manifest: Dict[str, Any]) -> str:
+    """The earliest tier every one of ``topologies`` is gated at (intersection of all topologies' gates)."""
+    # Start with all tiers from the first topology, then intersect with each subsequent topology
+    common_tiers: Optional[Set[str]] = None
+    for topology in topologies:
+        tiers = {
+            str(tier)
+            for tier in (((manifest.get("topologies") or {}).get(str(topology)) or {}).get("gate") or [])
+        }
+        if common_tiers is None:
+            common_tiers = tiers
+        else:
+            common_tiers &= tiers
+    if not common_tiers:
+        raise CatalogError(
+            f"no common tier runs all topologies {sorted(str(name) for name in topologies)}, so a case "
+            "there would claim a gate no tier honours"
+        )
+    for tier in GATE_TIERS:
+        if tier in common_tiers:
+            return tier
+    raise CatalogError(
+        f"no tier in {GATE_TIERS} is common to all topologies {sorted(str(name) for name in topologies)}"
+    )
+
+
+class CatalogError(RuntimeError):
+    """The catalog and the code that implements it disagree."""
+
 
 REQUIREMENT_PREFIX = {
     "Disposable Environment Gate": "ENV",
@@ -77,32 +182,6 @@ MULTI_NODE_ONLY = {
     "Pair-Wide Run Locking",
     "Shared Mutation Lock Across All Management Entry Points",
     "Local-only live VPS credential handling",
-}
-
-PARTIAL_SCENARIOS = {
-    ("Preflight SSH Trust and DNS Verification", "Private or reserved IP rejected"):
-        "Container proves the private/reserved rule against Podman addresses with an explicitly scoped, fail-closed exemption; the live run is authoritative for real public addresses.",
-    ("UFW Firewall Isolation Verification", "Master local and external access are distinguished"):
-        "Container proves isolation between distinct source addresses; provider-level external reachability is live-only.",
-    ("Data Plane E2E Traffic Through All VPN Endpoints", "Staging and public CA chains are both trusted without bypass"):
-        "Container proves explicit verify anchors and no global trust change; public Let's Encrypt issuance is live-only.",
-    ("Data Plane E2E Traffic Through All VPN Endpoints", "Xray TLS outbounds carry explicit Staging trust anchors"):
-        "Container proves the injected verify anchor is required; real Staging material is live-only.",
-    ("Data Plane E2E Traffic Through All VPN Endpoints", "Staging CA material is pinned and reproducible"):
-        "Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.",
-    ("Teardown Policy Enforcement", "Snapshot restore reacquires the remote lock pair before baseline verification"):
-        "Container proves lock ordering and hook protocol; provider snapshots are live-only.",
-    ("Local Operator Credential Bootstrap and Cleanup", "Host identity is verified before password authentication"):
-        "Container proves host identity precedes the password; the live controller's public-target path is live-only.",
-    ("Local Operator Credential Bootstrap and Cleanup", "Temporary access is bounded and revoked"):
-        "Container proves bounded key lifetime and revocation; live account behaviour is live-only.",
-}
-
-LIVE_ONLY_SCENARIOS = {
-    ("Teardown Policy Enforcement", "Single-host snapshot reboot does not self-deadlock lock reacquisition"):
-        "Requires a provider snapshot and a real reboot; a container cannot reproduce the host lifecycle.",
-    ("Local-only live VPS credential handling", "Local operator starts a live run"):
-        "Starts the interactive operator against real disposable VPS instances; live infrastructure only.",
 }
 
 PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
@@ -170,6 +249,48 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Real Subscription Delivery and User-Agent Policy",
     },
     {
+        "id": "SUB-EDGE",
+        "requirement": "Panel subscription representations",
+        "assertion": "A subscription read through the public edge answers a client with the bytes the Panel issued plus no-store and the X-Robots-Tag, answers every link-preview crawler with an empty 204 carrying the same headers, lets the Panel's own 403 through for an absent header, and closes the connection for a dot-segment or an encoded-separator target; the Panel's route counter does not move for the crawler sweep but moves for a control fetch, and the NGINX access log holds no served subscription line while the refused targets are recorded.",
+        "topology": ["aio"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "SUB-EDGE-BAD",
+        "requirement": "Panel subscription representations",
+        "assertion": "A raw request target a normalising client would never send — a dot segment inside the subscription path and an encoded separator before the representation — is answered by closing the connection with no bytes, and the NGINX access log records both refusals while holding no served /api/sub/<shortUuid> line.",
+        "topology": ["aio"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "NGX-HYGIENE",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The panel vhost answers from the edge without naming its build in Server or in the error page NGINX writes for a request line past its header buffer, the Panel records the peer address for a subscription request that carries each header it would otherwise prefer, with the forged address appearing in no record, and every product surface — the REST API, the subscription route, the dashboard, both inbound transports and the gRPC inbound — is still proxied.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "NGX-SCANNER",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "Every path in the shipped scanner set is answered by closing the connection with no bytes, while the same client on a proxied route reaches the Panel and reads its own refusal, so a rule that closed every request cannot pass as the scan defence.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PRE-INPUTS",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The operator's install command, run again against the installed host with the ACME contact left out, is refused before the NGINX stop and before any managed path is written: the refusal names the missing input, the host's unit files and digested NGINX configuration are unchanged, and the Panel still answers its documented authenticated calls.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PRE-INPUTS-BAD",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The same command carrying a complete argument list with a malformed ACME contact is refused on that field, quoting the rejected value, while the same unchanged inventory and the same serving Panel are read, so a contract that accepted any non-empty argument cannot pass as input validation.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
         "id": "SUB-JSON-SHAPES",
         "requirement": "Panel subscription representations",
         "assertion": "/v2ray-json is validated in both served shapes: a list entry as a complete config, and only a bare outbound object wrapped with the minimal runtime wrapper.",
@@ -216,7 +337,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "requirement": "Fail-closed local ACME test mode",
         "assertion": "The local ACME fixture endpoint is refused without GOWAVE_ACME_TEST_MODE=1, an arbitrary directory URL is refused inside test mode, a CA whose digest does not match the pinned one is refused, and the production ACME directory is still accepted.",
         "topology": ["aio"],
-        "promotion_target": "Independent All-in-One Acceptance Topology",
+        "promotion_target": "Independent All-in-One acceptance topology",
     },
     {
         "id": "AIO-NEG-DEP",
@@ -224,6 +345,69 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "assertion": "With the product's NGINX unit stopped, the public HTTPS surface stops answering from the independent Control Machine while the Panel's loopback API still authenticates, and after the unit is started the same public call succeeds again inside one bounded deadline.",
         "topology": ["aio"],
         "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-NEG-PIN",
+        "requirement": "Pinned Version Fidelity",
+        "assertion": "A floating installer branch, a missing digest, a digest that is not 64 hex characters and an installer whose bytes do not match the configured SHA-256 are each refused, the pinned commit and digest together are accepted, the URL the pin derives names that commit rather than a branch, and the product's own install entrypoint returns non-zero for the floating branch while the node binary and its unit stay byte-identical.",
+        "topology": ["aio"],
+        "promotion_target": "Pinned Version Fidelity",
+    },
+    {
+        "id": "AIO-CHANNEL-NOOP",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The channel command invoked for the channel the host is already on reports that nothing changed, exits successfully, and takes no snapshot, rewrites no environment file or journal, and leaves the Panel process in place, so a repeated lifecycle call is a no-op rather than a restart.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-CHANNEL-ROLLBACK",
+        "requirement": "Signal-Safe and Verifiable Transaction Compensation",
+        "assertion": "A channel switch whose restarted Panel cannot start is undone from the snapshot taken before it: the binary, database, frontend, environment, state.json, NGINX tree and ACME lineage come back identical to the pre-switch state after each was overwritten, the journal ends ROLLED_BACK rather than staying at APPLYING, and the restored installation answers its authenticated API and carries a payload through every served outbound of both pinned clients.",
+        "topology": ["aio"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "AIO-INTERRUPT",
+        "requirement": "Failure injection and recovery",
+        "assertion": "An operator killed with SIGKILL while its channel switch is in the product's APPLYING state leaves a documented recoverable state: the journal still validates and names that in-progress transaction with the snapshot it took, the mutation lock is free, the switch never printed its success line, and the supported `recover --boot-files` entrypoint rolls that very snapshot back to the pre-switch channel, the journal ends ROLLED_BACK, and the Panel comes back active serving the same clients and a payload through both pinned engines.",
+        "topology": ["aio"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "AIO-CHANNEL-DEV",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The documented stable-to-dev transition is a snapshot, an environment rewrite and a restart: the journal ends COMMITTED with the target channel recorded, exactly one snapshot holds the pre-switch tree, the Panel answers its health route and serves every representation, both pinned clients transfer a payload through every served outbound, and the guarded dev-to-stable direction is still refused without --force and changes nothing.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-FAULT-DISK",
+        "requirement": "Failure injection and recovery",
+        "assertion": "A backup store that cannot hold the archive fails loudly and publishes nothing: no archive-shaped or partial file appears in the store, the Panel, its database, the frontend, state.json, the NGINX and ACME trees and the health route are unchanged by the failed write, and after the fault is removed the same operator command publishes a mode-0600 archive that the product's own preflight validator accepts.",
+        "topology": ["aio"],
+        "promotion_target": "Lifecycle recovery acceptance",
+    },
+    {
+        "id": "AIO-FAULT-PANEL",
+        "requirement": "Failure injection and recovery",
+        "assertion": "With gowave.service stopped, NGINX keeps answering on 443 for the Panel's own name and its routes return the gateway error rather than a Panel or subscription response, the data plane the node already configured still carries a payload through every served outbound, no operator-owned file or database row moves while the unit is down, and starting it again restores the health route and serves the same client inventory and byte-identical representations.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-FAULT-XRAY",
+        "requirement": "Failure injection and recovery",
+        "assertion": "Killing the core the node runs with SIGKILL is answered by gowave-node itself: a replacement core appears inside gowave-node.service's own cgroup within the deadline, the node's MainPID, ActiveEnterTimestamp and restart counter are unchanged, no unit of its own supervises a core, the operator-owned tree is untouched, and every served outbound carries a payload again afterwards.",
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
+        "id": "AIO-FAULT-LATENCY",
+        "requirement": "Failure injection and recovery",
+        "assertion": "Adding a netem delay to every interface of the installed host degrades but does not break it: the Control Machine's own request time rises by at least the injected delay while the Panel still answers 200 and every served outbound still carries a payload, removing the delay returns the request time to its baseline, and the operator-owned files, database integrity and units are unchanged throughout.",
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     },
     {
         "id": "NGX-05",
@@ -248,14 +432,14 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     },
     {
         "id": "ACME-01",
-        "requirement": "Real ACME issuance and renewal through the pinned directory",
+        "requirement": "Global Certbot Deploy Hook Ownership",
         "assertion": "On the installed host the certificate serving the Panel domain was issued during this run by the pinned ACME directory, Certbot's own renewal record names the webroot method and that webroot, a token written into the webroot is fetched through the product's port 80 vhost from an independent client, and a forced renewal performs an HTTP-01 challenge and yields a new serial whose leaf the independent client receives after the product's deploy hook reloads NGINX without replacing the master.",
         "topology": ["aio"],
         "promotion_target": "Global Certbot Deploy Hook Ownership",
     },
     {
         "id": "ACME-02",
-        "requirement": "Real ACME issuance and renewal through the pinned directory",
+        "requirement": "Global Certbot Deploy Hook Ownership",
         "assertion": "With the port 80 challenge webroot closed to the validator, and again with the pinned directory unreachable from the host, a forced renewal exits non-zero, quotes its own cause, leaves the installed serial, notBefore and archive count unchanged, and keeps serving the working leaf to an independent client; once each outage is removed the same forced renewal issues a new serial whose leaf the client then receives.",
         "topology": ["aio"],
         "promotion_target": "Global Certbot Deploy Hook Ownership",
@@ -310,6 +494,83 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     },
     {
+        "id": "MN-BACKUP",
+        "requirement": "Lifecycle recovery acceptance",
+        "assertion": "Both archive types are produced through the operator's own interface — --type panel on Master and --type node on Worker — as mode-0600 Format v1 archives whose actual contents match their documented allowlists: the Panel archive carries the database, environment, NGINX vhosts, the complete certificate lineage and run state with every declared checksum present and no binary, while the Worker archive carries exactly its environment file, and the product's own validator accepts both.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "MN-BACKUP-VOL",
+        "requirement": "Lifecycle recovery acceptance",
+        "assertion": "Both unencrypted archives are written into a /var/backups/gowave that is a run-owned Podman volume of its own — a filesystem distinct from the container's root, owned by root at mode 0700 with exactly one mount entry and carrying the run's cleanup label — each role's archive lands on that volume at mode 0600, and the run's artifact tree holds no gzip stream, no file named or suffixed as an archive, and no line carrying a private key or secret-bearing variable, so the volume's removal by label during cleanup leaves nothing behind.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "MN-BACKUP-BAD",
+        "requirement": "Lifecycle recovery acceptance",
+        "assertion": "An archive the product did not write, or wrote incompletely, is refused by the product's own restore on the role it names — truncated, garbage, checksum-mismatched, missing a member its manifest declares, missing the member its type requires, and of the wrong type are each rejected with their own message and no traceback, while the untouched archives of both roles still pass the 15-point preflight; every refusal leaves Master's unit state, NGINX, environment and database bytes and snapshot count, and the Worker's environment digest and unit, exactly as they were, so a partially applied restore can never be mistaken for a refused one.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "MN-RESTORE",
+        "requirement": "Lifecycle recovery acceptance",
+        "assertion": "A Panel archive and a Worker archive, both written by the product on the roles this run provisioned, are restored by the product's own restore command on those roles: a client created through the Panel API and then deleted comes back with its identity, the inventory and the exact bytes of every representation it was served, the Worker's environment file returns to the bytes the archive captured (the injected marker gone) with its unit active, and both nodes reconnect and carry data-plane payload through every served outbound afterwards.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "MN-LOCK",
+        "requirement": "Pair-Wide Run Locking",
+        "assertion": "While one runner holds both hosts, a second runner is refused before either host is modified with a sentence naming the held lock path, keeps no lease, and leaves the owner's published leases — run id, host address, live holder pid and token — exactly as they were; the lock file outlives its holder, so after the owner releases a fresh runner acquires both hosts with different tokens, the product's own `validate_mutation_lease` accepts the new holder's lease and refuses the released holder's, which is what distinguishes a held lock from a lock file that merely exists.",
+        "topology": ["multi-node"],
+        "promotion_target": "Pair-Wide Run Locking",
+    },
+    {
+        "id": "MN-LOCK-LOSS",
+        "requirement": "Pair-Wide Run Locking",
+        "assertion": "A lock-holder session lost on either host fails closed: the runner stops reporting the pair as held, gates every mutating phase as `INCOMPLETE` with a refusal naming the phase and the loss while a read-only phase is still allowed to report, a contender that wins the freed host releases it when the other host refuses instead of holding half the pair, and resumption is a reacquisition of both locks — a new token, the terminated holder's lease refused by the product's own validator, the reacquired one accepted.",
+        "topology": ["multi-node"],
+        "promotion_target": "Pair-Wide Run Locking",
+    },
+    {
+        "id": "MN-LOCK-PATH",
+        "requirement": "Shared Mutation Lock Across All Management Entry Points",
+        "assertion": "An unsafe lock path is refused rather than followed, replaced or removed: a lock file that is a symlink, a directory, a FIFO, a group- or world-accessible file, or a file owned by another user, and a lock directory that is a symlink, each stop the acquisition before either host is modified with a refusal naming that object; every refused object is still the object it was — same kind, mode, owner, inode and link target — the lock directory is a real directory again afterwards, and the same pair acquires both hosts once the path is restored.",
+        "topology": ["multi-node"],
+        "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
+    },
+    {
+        "id": "MN-LOCK-CLI",
+        "requirement": "Shared Mutation Lock Across All Management Entry Points",
+        "assertion": "While the run holds both hosts, the shipped management commands — `install`, `node add`, `node rollback`, `node reapply`, `domain-change`, `channel`, `uninstall` and `backup restore` — each exit nonzero with the lock's own sentence naming the canonical path and without printing the sentence they print once they are past the lock, so a command that kept a private lock or took none could not pass; the Master's environment, state, NGINX configuration and unit files keep their digests, `/run/lock` still holds exactly the protocol's two files, the holder's own session survives every refusal, and the Worker's canonical lock file is the one the run holds.",
+        "topology": ["multi-node"],
+        "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
+    },
+    {
+        "id": "MN-LOCK-NESTED",
+        "requirement": "Shared Mutation Lock Across All Management Entry Points",
+        "assertion": "A child command handed the run's own lease is accepted in both transports the product supports — the environment and the `GOWAVE_LEASE:` stdin line — while a child with no lease is refused by the lock, the parent's holder session is still alive afterwards, the published lease is byte-identical, the host's digests are unchanged and the lock is still held; a lease from a released holder and a lease replayed from a terminated holder are both refused as invalid or stale with a nonzero exit, and the terminated holder's token is rejected by the product's own validator.",
+        "topology": ["multi-node"],
+        "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
+    },
+    {
+        "id": "RUNID-01",
+        "requirement": "Durable Run State for Partial CLI Modes",
+        "assertion": "A run id containing `..`, a path separator, an encoded separator, a NUL byte, only dots, an empty string, a leading dash, more than 64 characters, or naming a symlinked component is refused by the product's own validator with the rule it broke before any directory is created, while the printed shape, one character, 64 characters and names with dots and dashes are accepted and resolve to a directory named strictly below the artifact root that validation does not create; the CLI's own source order places that validation before it creates the artifact directory and before it opens an SSH client.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Durable Run State for Partial CLI Modes",
+    },
+    {
+        "id": "RESUME-01",
+        "requirement": "Durable Run State for Partial CLI Modes",
+        "assertion": "A run state written by the product's own writer at mode 0600 is read back by its own reader, and the resume gate accepts a phase whose prerequisites all reported PASS while refusing another run id, another repository commit, another non-secret configuration identity, a phase that already has a terminal result, and each phase whose prerequisite is not PASS, each with a sentence naming the reason; teardown is refused without both preflight baselines; the baseline comparison reports drift on a host that grew a GoWave directory, started listening on a required port or lost a required tool, tolerates the volatile fields no gate reads, and the runner re-collects it before it copies the repository to the Master.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Durable Run State for Partial CLI Modes",
+    },
+    {
         "id": "PODNET-MASTER-ADDR",
         "requirement": "Podman-only Master address selection for Worker provisioning",
         "assertion": "The real node add path uses the validated private Master address on the run-scoped network, Worker observes that source, and the override is rejected without the explicit opt-in or when the address is not assigned to Master.",
@@ -336,6 +597,20 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "assertion": "A run that exhausts the declared runtime budget before every case executed reports INCOMPLETE naming the unexecuted cases and cannot be converted into PASS.",
         "topology": ["aio", "multi-node"],
         "promotion_target": "Result Status Semantics",
+    },
+    {
+        "id": "GATE-STATUS",
+        "requirement": "Result Status Semantics",
+        "assertion": "A run in which two of the runtime cases fail reports overall FAIL and names both in result.json; a run whose runtime cases all came back INCOMPLETE reports INCOMPLETE and marks none of them FAIL; a Vision-enabled run names its failing core and Vision cases in result.json and junit.xml; a skipped case beside a passing one is not green; and every report carries the schema, run id, revision, start, duration, cases and overall the suite promises.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Result Status Semantics",
+    },
+    {
+        "id": "GATE-TEARDOWN",
+        "requirement": "Teardown Policy Enforcement",
+        "assertion": "`TEST_TEARDOWN_POLICY=DESTROY` and an invented policy are refused by configuration preflight before any host is read, naming the value and the policies v1 has; `PRESERVE` reports `PASS` while reading no host and restates no test outcome; every declared `RESTORE_SNAPSHOT` precondition is refused — a missing snapshot ID, hook path or digest, a relative, symlinked, absent, non-executable, group-writable or foreign-owned hook, a malformed digest — and a hook whose bytes changed after preflight is refused at execution; the request the hook receives on stdin is executed as its own program with no arguments and carries `schema_version: 1`, `action: \"restore\"`, the run id and one `master`/`worker` object per host with its address and snapshot ID, while an answer missing the version, missing a host object, reporting a host unrestored or naming another ID is refused; a conforming hook with matching baselines reports `INCOMPLETE` with the baseline comparison matched and the pair-lock and ownership comparisons still unimplemented, a differing baseline is `TEARDOWN_FAILED` naming the field, and a hook that times out, exits nonzero or answers non-JSON, a host that comes back unclean, are `TEARDOWN_FAILED`, which the contour's own report writes as a JUnit error beside a passing acceptance case.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Teardown Policy Enforcement",
     },
     {
         "id": "GATE-COVERAGE",
@@ -387,11 +662,250 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Preflight SSH Trust and DNS Verification",
     },
     {
+        "id": "MN-SSH-DOWN",
+        "requirement": "Failure injection and recovery",
+        "assertion": "With `ssh.service` stopped on the Worker, the controller's remote-finalize operation is refused by the transport before the remote command runs, naming the connection failure rather than host-key verification, while the Worker's node unit stays active and the same captured subscription still carries a payload from the Worker's own data address; starting the daemon again lets the very operation that was refused run and remove the planted snapshot.",
+        "topology": ["multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
         "id": "MN-VISION",
         "requirement": "Independent Optional Vision Domains",
-        "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails.",
+        "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails. The configuration the run was given is also written as a document and read back through the live runner's whitelist parser: each of the two optional fields survives unchanged, and the endpoint total the parsed answer produces is the total the Panel declares across its nodes.",
         "topology": ["multi-node"],
         "promotion_target": "Independent Optional Vision Domains",
+    },
+    {
+        "id": "VIS-CONFIG",
+        "requirement": "Independent Optional Vision Domains",
+        "assertion": "All four Vision combinations — neither, Master only, Worker only, both — are accepted by the whitelist parser and each optional field is restated exactly as configured, including an absent one staying absent; eight duplicate classes are refused, each naming what collided: the two Vision names equal, a Vision name repeating the Master Panel or Master REALITY name, a Vision name repeating the Worker or Worker REALITY name, the Master Vision name taking the Worker's name, the Worker Vision name taking the Master Panel name, and the same name in two letter cases; and the runner itself, given the same duplicate, exits nonzero reporting a configuration parse error and creates no run directory, so the refusal precedes any host being read.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Independent Optional Vision Domains",
+    },
+    {
+        "id": "VIS-GATE",
+        "requirement": "Independent Optional Vision Domains",
+        "assertion": "The Vision port set (8444 and 9444) is owed only by the host whose own Vision domain is configured: with both hosts holding both ports, the configured Master is refused naming 8444 and the unconfigured Worker is accepted, the reverse holds with only the Worker configured, both are refused when both are configured, and neither is refused when neither is — while a run in which only the unconfigured host holds the two ports reports PASS, and a host exempt from the Vision ports is still evaluated against the default set and refused when it holds 443.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Independent Optional Vision Domains",
+    },
+    {
+        "id": "MN-ARGV-OBSERVER",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": (
+            "The Master traces its own dispatch of `gowave-auto.sh node add` with "
+            "`strace -f -v -s 32*PAGE_SIZE -e trace=execve,execveat`, and before that "
+            "trace is read the observer proves on the same host that a sentinel after "
+            "byte 32 of an argument survives in both an `execve` and an `execveat` "
+            "record while the same argument under `-s 32` is cut and reported as "
+            "truncated, and that a 128-element argv arrives in order with its sentinel "
+            "last and no omission marker; the dispatch trace then counts as complete "
+            "only if every argv vector is whole, holds the SSH client's own exec "
+            "record and carries no `SECRET_KEY` in raw or encoded form in any argv, "
+            "and the file is removed on the Master so the `envp` strace printed never "
+            "leaves that host."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "AIO-AUTH-NEG",
+        "requirement": "Failure injection and recovery",
+        "assertion": (
+            "The Panel's own gate refuses four credentials it did not issue — an "
+            "expired token signed with the Panel's real secret, a token signed with a "
+            "foreign key, an unsigned `alg: none` token, and a correctly signed token "
+            "naming an administrator record that does not exist — each answered 401 "
+            "with the middleware's own `Unauthorized` body and no traceback, while the "
+            "token the documented login issued still reads the same route before and "
+            "after; the signing key is read from the Panel's environment and never "
+            "printed, and the issued token's payload names an `ADMIN` subject."
+        ),
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
+        "id": "MN-DUP-ADD",
+        "requirement": "Failure injection and recovery",
+        "assertion": (
+            "The operator's `gowave-auto.sh node add` run for a name `state.json` already "
+            "holds at another address exits nonzero with the existing-name refusal, names "
+            "the address the record holds, and prints no traceback, and the state file's "
+            "bytes, the committed recovery journal's bytes and the Panel's node, profile, "
+            "squad, host and token inventory are what they were before the attempt, so the "
+            "refusal came from `state.json` before the Panel client was constructed rather "
+            "than after a partial registration. The same name at the address the record "
+            "already holds is the same node answering again and is accepted on purpose: the "
+            "wizard's per-node retry re-enters exactly that call, and the throwaway pin the "
+            "case writes for the second address is removed again."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
+        "id": "MN-ENV-CONTRACT",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": (
+            "A Worker onboarded through the environment contract "
+            "(GOWAVE_NODE_NAME, GOWAVE_NODE_IP, GOWAVE_WORKER_DOMAIN, GOWAVE_REALITY_DOMAIN, "
+            "GOWAVE_SSH_USER, GOWAVE_SSH_PORT, GOWAVE_VISION_DOMAIN) instead of positional "
+            "arguments is registered by the Master, appears in the Panel with the correct "
+            "endpoint, and reports as connected."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "PO-INSTALL",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The real operator runs its documented `install --panel-only` command on a "
+            "clean supported systemd host, exits successfully, and the Panel it installs "
+            "reports the version this deployment configured — a Panel-only install has no "
+            "Node and no core to ask, and their absence is asserted by the host case "
+            "rather than reported here as a probe that could not run."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-HOST",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The installed host is a Panel and a camouflage site and nothing else: "
+            "`gowave.service`, `nginx.service` and `fail2ban.service` active, no "
+            "`gowave-node.service` unit file, no listener on 8443 or 8444, no `rw-core` or "
+            "`xray` process, no worker binary on disk, the Panel listening on "
+            "127.0.0.1:3000 and NGINX publicly on 443, `nginx -t` accepting the rendered "
+            "configuration, the credentials file `600 root root` holding the three "
+            "documented keys, exactly two certificate lineages (the Panel and the "
+            "camouflage name), a public handshake for each, and a decoy that answers with "
+            "the static site rather than any product content."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-API",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The Panel API, reached with the credentials the install wrote, reports the "
+            "state a Panel-only install ends in: the documented login answers 200, hosts, "
+            "nodes, config profiles and internal squads are all empty, the default user is "
+            "served with a shortUuid and at least one scoped API token exists, while "
+            "`state.json` names `installationMode: panel-only` at `schemaVersion: 2`, "
+            "holds an empty node array and carries none of the local-node fields a "
+            "traffic-plane deployment would own."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-SQUAD",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The first `gowave-auto.sh node add` after a Panel-only install succeeds and "
+            "leaves the identifier it resolved in `state.json`, one internal squad named "
+            "`Default MVP Squad` that allows at least one inbound, one host record per "
+            "matching inbound whose `ALLOW_ONLY` squad list names exactly that identifier, "
+            "and the registered Worker as the Panel's only node — the state a later "
+            "subscription depends on, because a host record carrying no squad grants "
+            "access to none."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-SQUAD-REFUSED",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "A host record whose squad list carries a null entry never becomes the "
+            "operator's own grant: the same payload carrying the real squad is accepted "
+            "first and removed again, so the answer is attributable to the null entry "
+            "rather than to the payload shape, and the Panel either refuses the null-squad "
+            "post and leaves the host count unchanged, or stores a record that does not "
+            "name the identifier `state.json` resolved — after which the probe removes "
+            "what it created and the count returns to where it started."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PRE-PROXY-CIDR",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A requested name that resolves to an address inside the dated Cloudflare CIDR snapshot is refused before any certificate request: the preflight check names the domain, the proxied address, and the CIDR it falls in, and HTTP-01 is not attempted. An override GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 is honoured, and an unresolvable name is likewise refused with the resolution failure named.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PRE-PROXY-CIDR-OVERRIDE",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A name that resolves to a Cloudflare proxy address is accepted when GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 is explicitly set, recording the operator's decision to continue despite the proxy. The same DNS check passes, and the policy layer allows the request through.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "TLS-LINEAGE",
+        "requirement": "Explicit ACME Endpoint Selection and Certificate Lineage Isolation",
+        "assertion": "A repeated install adopts an existing suffixed ACME lineage (e.g. panel.example.com-0001) that covers the panel domain instead of creating a second lineage: select_acme_lineage returns the adopted lineage's live directory, prints the adoption message, and the same tree answers the same way on a second call.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "TLS-LINEAGE-BAD",
+        "requirement": "Explicit ACME Endpoint Selection and Certificate Lineage Isolation",
+        "assertion": "An expired lineage or a lineage from a mismatched ACME directory is not adopted by select_acme_lineage: the function returns empty stdout and prints a refusal message naming the expiry or directory mismatch.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "FAIL-STEP",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The ERR trap with CURRENT_STEP prints a located failure naming the step, the failing command and its status, prints it exactly once, and exits with the step's status; a step that succeeds prints no report.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PANEL-ASSET-VERIFICATION",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A release asset is checked against SHA256SUMS before the next URL is tried; a mismatched asset aborts without falling through, the binary is not left behind, and no release API fallback occurs.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PINNED-INSTALLER-HOSTS",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The commit is tried on GitHub first and jsDelivr second; the order is fixed and the environment variable GOWAVE_NODE_INSTALLER_COMMIT selects the exact commit.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "VERIFIED-ARTIFACT-FETCH",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A pinned artifact is fetched from ordered hosts; a host that cannot deliver falls through to the next, a mismatch is terminal and the next host is never asked, no host delivering leaves nothing behind, a destination is replaced only after its bytes are verified, an unusable digest is refused before any download, and a missing host list is refused.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "MN-PARTIAL-SUCCESS",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "A multi-node deployment where one Worker fails onboarding continues the Panel deployment and the successful sibling, records the failed node with its target, phase and diagnostic reason, exits with the partial-success code distinct from a failed Panel installation, and prints a per-node summary that names the successful node as registered and verified only with the uuid the Panel's own node list answered for it, while the failed node keeps its stage and reason.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "MN-ADD-NODE-REFUSED",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "An add-node attempt against a Panel whose API identity or reachability verification fails reports the failed verification and does not begin any remote node mutation; no Worker-side deployment is attempted and no credentials are transmitted.",
+        "topology": ["multi-node", "panel-only"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "MN-WIZARD-FLOW",
+        "requirement": "Independent Multi-Node acceptance topology",
+        "assertion": "Entering a plan whose second Worker's cover domain repeats a name the plan already holds re-asks that field alone and keeps every earlier answer; the composed batch that follows onboards one Worker and prints it as registered and verified only with the uuid the Panel's own node list answered for it, records the other with its phase and diagnostic, offers the retry for the failed Worker alone, exits with the partial-success code, and returns to the menu, while the Panel's node list stays as it was because the plan was never applied.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
     },
 ]
 
@@ -484,6 +998,34 @@ def data_plane_cases() -> List[Dict[str, Any]]:
         "topology": ["multi-node"],
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     })
+    entries.append({
+        "id": "AIO-PKT-02",
+        "requirement": "Per-Case Data-Plane Packet Evidence",
+        "assertion": (
+            "Four degradations are produced against a real transfer through the installed host — a "
+            "capture tool that is not there, a host that cannot report the client's address because "
+            "nothing answers the identity port, a capture that ran out its own window before the "
+            "harness stopped it, and an identity channel that did not travel the request's path — "
+            "and every one of them is INCOMPLETE with the missing fact named, the non-matching "
+            "source address recorded for the last, no aggregate counter read as an answer, and no "
+            "capture file or saved payload left on the host."
+        ),
+        "topology": ["aio"],
+        "promotion_target": "Per-Case Data-Plane Packet Evidence",
+    })
+    entries.append({
+        "id": "MN-PKT-03",
+        "requirement": "Per-Case Data-Plane Packet Evidence",
+        "assertion": (
+            "A real Worker request is bracketed by captures on both nodes and judged as if the "
+            "Master had carried it: the payload returns 200, the SNI is the inbound's, and the "
+            "egress address is the Worker's, so the case can only be refused by the packet evidence "
+            "— the Worker captured the client's packets, the Master captured none, and the harness "
+            "raises the failure instead of recording a pass."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Per-Case Data-Plane Packet Evidence",
+    })
     return entries
 
 
@@ -548,17 +1090,971 @@ def parse_live_spec(path: Path = LIVE_SPEC) -> List[LiveScenario]:
     return scenarios
 
 
-def classify(requirement: str, title: str) -> Tuple[str, Optional[str]]:
-    key = (requirement, title)
-    if key in LIVE_ONLY_SCENARIOS:
-        return "live-only", LIVE_ONLY_SCENARIOS[key]
-    if key in PARTIAL_SCENARIOS:
-        return "partial", PARTIAL_SCENARIOS[key]
-    return "container", None
+def load_scenario_environments(path: Path = SCENARIOS_PATH) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """The classification table, keyed by (requirement, scenario)."""
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if document.get("schema") != ENVIRONMENT_SCHEMA:
+        raise CatalogError(
+            f"{path}: schema is {document.get('schema')!r}, expected {ENVIRONMENT_SCHEMA!r}"
+        )
+    table: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in document.get("environments") or []:
+        key = (row.get("requirement"), row.get("scenario"))
+        if key in table:
+            raise CatalogError(f"{path}: {key[0]} / {key[1]} is classified twice")
+        table[key] = row
+    return table
 
 
-def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
+def classify(
+    requirement: str,
+    title: str,
+    table: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+) -> Tuple[str, Optional[str]]:
+    """The environment a live scenario is answered in, or a refusal.
+
+    There is no default: a scenario that reached the spec without a row in
+    `tests/cases/scenarios.yaml` cannot be called container-reproducible by
+    accident, which is what a live-only addition would otherwise become.
+    """
+    table = table if table is not None else load_scenario_environments()
+    row = table.get((requirement, title))
+    if row is None:
+        raise ValueError(
+            f"Live scenario has no environment classification: {requirement} / {title}"
+        )
+    environment = row.get("environment")
+    if environment == "partial":
+        return environment, row.get("partial_split")
+    if environment == "live-only":
+        return environment, row.get("live_only_reason")
+    return environment, None
+
+
+_CONSTANT_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _module_constants(module: str) -> Dict[str, str]:
+    """The string constants of a sibling module, read once per process."""
+    if module not in _CONSTANT_CACHE:
+        path = REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py"
+        if not path.is_file():
+            _CONSTANT_CACHE[module] = {}
+        else:
+            _CONSTANT_CACHE[module] = _string_constants(ast.parse(path.read_text(encoding="utf-8")))
+    return _CONSTANT_CACHE[module]
+
+
+def _string_constants(tree: ast.Module) -> Dict[str, str]:
+    """Module-level string constants, which is how a case id is spelled.
+
+    Three spellings are read, because the suite uses all of them:
+    `NAME = "..."`, the annotated `NAME: str = "..."`, and an alias such as
+    `NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID` or `NAME = OTHER_NAME`.
+    A missed spelling would be refused as a builder rather than resolved, which
+    is safe but would hide the real case behind a wrong error.
+    """
+    aliases = _imported_modules(tree)
+    pending: Dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            pending[node.target.id] = node.value
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    pending[target.id] = node.value
+
+    def resolve(node: ast.AST, seen: Set[str]) -> Optional[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in constants:
+                return constants[node.id]
+            if node.id in pending and node.id not in seen:
+                return resolve(pending[node.id], seen | {node.id})
+            return None
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            owner = aliases.get(node.value.id)
+            if owner is None:
+                return None
+            return _module_constants(owner).get(node.attr)
+        return None
+
+    constants: Dict[str, str] = {}
+    for _ in range(4):
+        before = len(constants)
+        for name, value in pending.items():
+            if name in constants:
+                continue
+            resolved = resolve(value, {name})
+            if resolved is not None:
+                constants[name] = resolved
+        if len(constants) == before:
+            break
+    return constants
+
+
+def _imported_modules(tree: ast.Module) -> Dict[str, str]:
+    """Local alias -> module name, for `budget.case_budget`-style callables.
+
+    Both spellings this package uses are read: `from . import budget` and
+    `from tools.podman_e2e import budget, aio`. Anything else — a stdlib alias,
+    say — is not a module of this suite and is resolved as a local object.
+    """
+    alias: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        inside_package = node.module == "tools.podman_e2e" or (
+            node.level == 1 and node.module is None
+        )
+        if not inside_package:
+            continue
+        for name in node.names:
+            alias[name.asname or name.name] = name.name
+    return alias
+
+
+def _dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = _dotted_name(node.value)
+        return f"{head}.{node.attr}" if head else node.attr
+    return ""
+
+
+def _case_callable(run_argument: ast.AST) -> str:
+    """The callable a `Case(...)` wraps, as the source spells it."""
+    body: ast.AST = run_argument
+    if isinstance(run_argument, ast.Lambda):
+        body = run_argument.body
+    if isinstance(body, ast.Call):
+        body = body.func
+    return _dotted_name(body)
+
+
+def _case_nodes(tree: ast.Module) -> List[ast.Call]:
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "Case" and len(node.args) >= 3
+    ]
+
+
+def _dict_literal_keys(node: ast.Dict) -> Set[str]:
+    return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+
+
+def _merged_keys(
+    call: ast.Call, module_tree: Optional[ast.Module], followed: Tuple[str, ...],
+) -> Set[str]:
+    """The keys ``evidence.update(module.helper(...))`` adds, read from the helper.
+
+    The helper has to be a module of this package, reached through the alias this
+    module imported it under, and has to build its record as a dict literal — the
+    two conditions that make the keys knowable from source instead of guessed. A
+    helper that is not found, is already being followed, or assembles its keys at
+    run time contributes nothing rather than a wrong list.
+    """
+    if module_tree is None:
+        return set()
+    name = _dotted_name(call.func)
+    if name.count(".") != 1:
+        return set()
+    head, _, tail = name.partition(".")
+    module = _imported_modules(module_tree).get(head)
+    if not module:
+        return set()
+    path = REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py"
+    if not path.is_file():
+        return set()
+    label = f"{module}.{tail}"
+    if label in followed:
+        return set()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    helper = _function_node(tree, tail)
+    if helper is None or not any(isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+                                 for node in ast.walk(helper)):
+        return set()
+    return set(evidence_keys(helper, tree, (*followed, label)))
+
+
+def evidence_keys(
+    function: ast.FunctionDef,
+    module_tree: Optional[ast.Module] = None,
+    _followed: Tuple[str, ...] = (),
+) -> List[str]:
+    """The evidence keys a driver's own source records.
+
+    Five shapes count, because they are the five the runner turns into a
+    ``CaseResult.evidence`` entry: ``evidence["key"] = ...``, a dict literal
+    assigned to ``evidence``, a dict literal the driver returns, a driver that
+    assigns the verdict of one helper to ``evidence`` and returns it, and a
+    driver that merges a helper's fixed record in with ``evidence.update(...)``.
+    The fourth is a delegation, not a record of its own: read literally it would
+    report a builder such as ``_data_plane_case`` as carrying no evidence at all,
+    which is how a tuple case loses the facts its helper does write. The fifth is
+    the same blind spot one level down — ``evidence.update(ingress.evidence(...))``
+    keeps the keys in another module, so a driver that published only its own
+    literals would report fewer facts than the run records. A helper is followed
+    by name once, inside this package, and only when it returns a dict literal,
+    so a cycle or a helper that computes its keys stops the walk instead of
+    looping on it.
+    """
+    keys: Set[str] = set()
+    delegated: Optional[ast.FunctionDef] = None
+    target_tree: Optional[ast.Module] = None
+    assignments = [
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "evidence"
+    ]
+    returns_evidence = any(
+        isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+        and node.value.id == "evidence"
+        for node in ast.walk(function)
+    )
+    for node in ast.walk(function):
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) \
+                and node.value.id == "evidence":
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                keys.add(node.slice.value)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            if any(isinstance(target, ast.Name) and target.id == "evidence" for target in node.targets):
+                keys |= _dict_literal_keys(node.value)
+        elif isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            keys |= _dict_literal_keys(node.value)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "update" and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id == "evidence" and len(node.args) == 1 \
+                and isinstance(node.args[0], ast.Call):
+            keys |= _merged_keys(node.args[0], module_tree, (*_followed, function.name))
+    if module_tree is not None and len(assignments) == 1 and returns_evidence \
+            and isinstance(assignments[0].value, ast.Call):
+        name = _dotted_name(assignments[0].value.func)
+        target_tree, target_name = module_tree, name
+        if name.count(".") == 1:
+            # `aio._data_plane_case`: a helper of another module of this package,
+            # named through the alias this module imported it under.
+            head, _, tail = name.partition(".")
+            sibling_module = _imported_modules(module_tree).get(head)
+            sibling = REPO_ROOT / "tools" / "podman_e2e" / f"{sibling_module}.py" if sibling_module else None
+            target_tree = ast.parse(sibling.read_text(encoding="utf-8")) if sibling and sibling.is_file() else None
+            target_name = tail
+        elif name.count(".") > 1:
+            target_tree = None
+        if target_tree is not None and target_name != function.name and target_name not in _followed:
+            delegated = _function_node(target_tree, target_name)
+    if delegated is not None:
+        keys |= set(evidence_keys(delegated, target_tree, (*_followed, function.name)))
+    return sorted(keys)
+
+
+def _resolve_callable(
+    topology: str, dotted: str, module_tree: ast.Module, aliases: Dict[str, str],
+) -> Optional[Tuple[str, str]]:
+    """Resolve a `Case` callable to (file stem, name) or None when it is not ours.
+
+    A bare name and a `product.method` belong to the topology's own module; a
+    `budget.case_budget` names another module of this package.
+    """
+    head, _, tail = dotted.partition(".")
+    if tail and head in aliases:
+        target = REPO_ROOT / "tools" / "podman_e2e" / f"{aliases[head]}.py"
+        if not target.is_file():
+            return None
+        target_tree = ast.parse(target.read_text(encoding="utf-8"))
+        names = {node.name for node in target_tree.body if isinstance(node, ast.FunctionDef)}
+        return (aliases[head], tail) if tail in names else None
+    if tail:
+        classes = [node for node in module_tree.body if isinstance(node, ast.ClassDef)]
+        for cls in classes:
+            if any(isinstance(item, ast.FunctionDef) and item.name == tail for item in cls.body):
+                return (DRIVER_MODULES[topology].stem, f"{cls.name}.{tail}")
+        return None
+    names = {node.name for node in module_tree.body if isinstance(node, ast.FunctionDef)}
+    return (DRIVER_MODULES[topology].stem, head) if head in names else None
+
+
+def _function_node(module_tree: ast.Module, name: str) -> Optional[ast.FunctionDef]:
+    """The driver node for a resolved callable (`Class.method` resolves to the method)."""
+    if "." in name:
+        _, _, method = name.partition(".")
+        for cls in module_tree.body:
+            if isinstance(cls, ast.ClassDef):
+                for item in cls.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method:
+                        return item
+        return None
+    for node in module_tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def matrix_driven_ids(topology: str) -> Set[str]:
+    """The case ids the matrix-driven builders mint, taken from the catalog's own rows."""
+    return {
+        entry["id"] for entry in data_plane_cases()
+        if entry["topology"] == [topology] and "-DP-" in entry["id"]
+    }
+
+
+def run_starts(path: Path = REPO_ROOT / "tools" / "podman_e2e" / "topology.py") -> List[Dict[str, Any]]:
+    """The start sequence a run performs, read from the topology's own `create()`.
+
+    A per-case fixture list cannot be derived from a driver's source: a case
+    consumes a fixture through an endpoint or a container, not a declared
+    dependency, so `AIO-NEG-DEST` reads the echo endpoint through
+    `endpoint_records` without naming any echo attribute. Nor can the fixtures
+    be told apart from the rest of the contour by a syntactic marker, which is
+    why this records the whole sequence with the markers it does have instead of
+    a guessed classification: the client container is started with
+    `image_alias=FIXTURE_IMAGE`, so that marker does not separate the
+    `dns`/`echo` fixtures from it, and `target`, `untrusted_client` and `worker`
+    carry no marker at all. What the source does prove is which steps
+    `create()` performs, and that is what is recorded.
+    """
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    aliases = _imported_modules(tree)
+    acme_modules = {alias for alias, module in aliases.items() if module == "acme_fixture"}
+    steps: Dict[str, ast.FunctionDef] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_start_"):
+            steps[node.name[len("_start_"):]] = node
+
+    created: Set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == "create"):
+            continue
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call):
+                name = _dotted_name(call.func)
+                if name.startswith("self._start_"):
+                    created.add(name[len("self._start_"):])
+
+    starts: List[Dict[str, Any]] = []
+    for step in sorted(created):
+        body = steps.get(step)
+        if body is None:
+            raise CatalogError(f"topology starts {step!r}, which has no _start_{step} body to read")
+        starts.append({
+            "step": step,
+            "started_by": _display(path),
+            "scope": "run",
+            "fixture_image": any(
+                keyword.arg == "image_alias"
+                and isinstance(keyword.value, ast.Name) and keyword.value.id == "FIXTURE_IMAGE"
+                for call in ast.walk(body) if isinstance(call, ast.Call)
+                for keyword in call.keywords
+            ),
+            "acme_module": any(
+                isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id in acme_modules
+                for node in ast.walk(body)
+            ),
+        })
+    return starts
+
+
+def _run_start_errors(catalog: Dict[str, Any]) -> List[str]:
+    """The catalog's start inventory is the topology's own `create()` sequence."""
+    errors: List[str] = []
+    recorded = catalog.get("run_starts")
+    if not isinstance(recorded, list) or not recorded:
+        errors.append("the catalog records no run_starts inventory, so a run's start sequence is unstated")
+        return errors
+    derived = {entry["step"]: entry for entry in run_starts()}
+    stated: Dict[str, Dict[str, Any]] = {}
+    for entry in recorded:
+        step = entry.get("step")
+        if step in stated:
+            errors.append(f"start step {step!r} is recorded twice")
+        stated[step] = entry
+        if step not in derived:
+            errors.append(f"start step {step!r} is recorded, but no topology `create()` performs it")
+            continue
+        for field_name in ("started_by", "scope", "fixture_image", "acme_module"):
+            if entry.get(field_name) != derived[step][field_name]:
+                errors.append(
+                    f"start step {step!r}: {field_name} is {entry.get(field_name)!r}, "
+                    f"the topology says {derived[step][field_name]!r}"
+                )
+    for step in sorted(set(derived) - set(stated)):
+        errors.append(f"start step {step!r} is performed by the topology and not recorded")
+    for case in catalog.get("cases", []):
+        if "fixtures" in case:
+            errors.append(
+                f"{case.get('id')}: a per-case fixtures list cannot be derived from the driver, "
+                "so it is refused rather than guessed; the run-level sequence is `run_starts`"
+            )
+    return errors
+
+
+def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """case id -> topology -> {driver, evidence}, read from the code that runs it.
+
+    Raises ``CatalogError`` when a `Case` names a callable this package does not
+    define, or when a builder mints ids outside the closed matrix-driven list:
+    both are cases the catalog could not check, so they are refused here rather
+    than recorded as if they had been.
+    """
+    registry: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for topology, path in DRIVER_MODULES.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        constants = _string_constants(tree)
+        aliases = _imported_modules(tree)
+
+        def record(case_id: str, dotted: str) -> None:
+            resolved = _resolve_callable(topology, dotted, tree, aliases)
+            if resolved is None:
+                raise CatalogError(
+                    f"{topology}: Case({case_id!r}) names {dotted!r}, which this package does not define"
+                )
+            module, name = resolved
+            function_tree = tree if module == path.stem else ast.parse(
+                (REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py").read_text(encoding="utf-8")
+            )
+            function = _function_node(function_tree, name)
+            if function is None:
+                raise CatalogError(f"{topology}: {module}:{name} has no function body to read")
+            registry.setdefault(case_id, {})[topology] = {
+                "driver": f"{module}:{name}",
+                "evidence": evidence_keys(function, function_tree),
+            }
+
+        for node in _case_nodes(tree):
+            first = node.args[0]
+            dotted = _case_callable(node.args[2])
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                record(first.value, dotted)
+            elif isinstance(first, ast.Name) and first.id in constants:
+                record(constants[first.id], dotted)
+            elif isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name):
+                owner = _imported_modules(tree).get(first.value.id)
+                sibling = REPO_ROOT / "tools" / "podman_e2e" / f"{owner}.py"
+                if owner is None or not sibling.is_file():
+                    raise CatalogError(f"{topology}: Case id {ast.unparse(first)} has no resolvable constant")
+                sibling_constants = _string_constants(ast.parse(sibling.read_text(encoding="utf-8")))
+                if first.attr not in sibling_constants:
+                    raise CatalogError(f"{topology}: Case id {ast.unparse(first)} is not a literal constant")
+                record(sibling_constants[first.attr], dotted)
+            else:
+                builder = dotted or ast.unparse(first)
+                if (path.stem, builder) not in MATRIX_DRIVEN_BUILDERS:
+                    raise CatalogError(
+                        f"{topology}: Case({ast.unparse(first)!r}) mints ids this catalog cannot check; "
+                        f"add {builder!r} to MATRIX_DRIVEN_BUILDERS with the ids it produces"
+                    )
+
+        for builder in sorted(name for module, name in MATRIX_DRIVEN_BUILDERS if module == path.stem):
+            function = _function_node(tree, builder)
+            if function is None:
+                raise CatalogError(f"{topology}: the declared matrix-driven builder {builder!r} is gone")
+            for case_id in sorted(matrix_driven_ids(topology)):
+                registry.setdefault(case_id, {})[topology] = {
+                    "driver": f"{path.stem}:{builder}",
+                    "evidence": evidence_keys(function, tree),
+                }
+    return registry
+
+
+# Some live-parity scenarios are witnessed by a container case that carries a
+# different id: DP-01 quantifies over every active endpoint and client, and the
+# case that quantifies over exactly those tuples is AIO-MATRIX / MN-MATRIX. Which
+# container case witnesses a given live sentence is a judgement the source cannot
+# make for us, so it is declared here — and pinned from both sides: the named case
+# must be one the code builds for that topology, and the evidence written into the
+# catalog entry is read out of that case rather than typed by hand.
+LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
+    "DP-01": {"aio": "AIO-MATRIX", "multi-node": "MN-MATRIX"},
+    # The live sentence is about the budget a single request's handshake gets
+    # when the resolver stalls: at least half of the request's allowance and
+    # never below ten seconds. The probe that carries the payload splits its
+    # budget that way, and `case_data_plane` requires both halves on every tuple,
+    # so the REALITY tuple of either contour is the case that reads the numbers
+    # back. What it states is the container's analogue — one request's budget —
+    # and docs/PODMAN_E2E_DISCOVERY.md records that difference.
+    "DP-02": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The Mihomo YAML the probe launches is read back from the file Mihomo loads:
+    # every served proxy, group and rule preserved, each listener on a free
+    # loopback port, and the controller pinned to 127.0.0.1 with `allow-lan`
+    # false. Any Mihomo tuple reports the same document, because the document is
+    # the served profile rather than the tuple; the REALITY one is named.
+    "DP-05": {"aio": "AIO-DP-REALITY-mihomo", "multi-node": "MN-DP-master-REALITY-mihomo"},
+    # A real engine process sends one request through the selected outbound, and
+    # the live sentence asks for two more facts beside the 200: the egress address
+    # and packet evidence that grew on that VPS during the request window. Every
+    # matrix tuple now runs inside a capture on each host of its contour, so the
+    # case asserts the address the host itself reports saw at least one segment on
+    # the proxy port and that no other host saw one. That is a per-source
+    # attribution in place of the live runner's delta of an aggregate counter,
+    # which the same requirement refuses as a PASS fallback; the difference is
+    # recorded in docs/PODMAN_E2E_DISCOVERY.md.
+    "DP-04": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The Mihomo half of the same tuple: the YAML the Panel served is the document
+    # the engine dialled, and the capture brackets the request it carried.
+    "DP-06": {"aio": "AIO-DP-REALITY-mihomo", "multi-node": "MN-DP-master-REALITY-mihomo"},
+    # A Worker request is the same body with the node named, and the sentence's
+    # whole content is that the Worker served it rather than the Master, so these
+    # two are witnessed only where a second node exists. The All-in-One contour is
+    # absent by construction: one host has no Worker to be confused with.
+    "DP-07": {"multi-node": "MN-DP-worker-REALITY-xray"},
+    "DP-08": {"multi-node": "MN-DP-worker-REALITY-mihomo"},
+    # The live contract asks for the status an absent User-Agent produces. The
+    # container case asks every served path rather than `/v2ray-json` alone and
+    # pins the code the pinned Panel answers, which is the same product rule read
+    # more strictly; the divergence is recorded in docs/PODMAN_E2E_DISCOVERY.md.
+    "SUB-01": {"aio": "SUB-UA-ABSENT"},
+    # 8/9/10 is the count a Master and a Worker together serve; an All-in-One
+    # install serves one per inbound as well, 4 or 5, and the page records that
+    # the topology, not the product, explains the number. SUB-SERVED reads the
+    # profiles back from the pinned Xray binary and requires one per inbound,
+    # every transport the matrix declares, and the configured fingerprint.
+    "SUB-02": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
+    # The Mihomo YAML half of the same case: one proxy per inbound (8/9/10 on a
+    # cluster, 4/5 on one host), `client-fingerprint` equal to the configured
+    # preset, no duplicate names, and a routing-rule family a client would
+    # actually route through.
+    "SUB-04": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
+    # The Xray JSON half, read clause by clause. `SUB-SERVED` asks the status, the
+    # media type every representation is served with, the `no-store` the public
+    # edge adds, and that the pinned Xray binary accepts each served profile — the
+    # clause that names this sentence's own validator. It also compares every
+    # served outbound with `GET /api/hosts` on address and SNI plus the path that
+    # tells two inbounds on one name apart, and scans each representation for the
+    # keys the product writes into its own environment files — the Panel's
+    # `APP_SECRET` and the Node's `SECRET_KEY` — plus the administrator's password,
+    # in four encodings, while requiring that no document carries a server-side
+    # private key field. The live text's "all mandatory response headers" is
+    # claimed only for the header it names itself, `Cache-Control: no-store`; the
+    # other response headers are recorded as facts, not asserted, because no
+    # container case reads one.
+    "SUB-03": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
+    # The live sentence asks for three things on one connection to the panel's
+    # name: TLS terminates, the certificate names that domain, and the Panel API
+    # answers. AIO-01 asserts all three — an authenticated `/api/nodes` call on
+    # the host and a client-side fetch pinned to the panel's SAN over TLS 1.3 —
+    # so it is read as the stricter form. The Multi-Node contour is deliberately
+    # absent: TLS-01 proves the Master's public HTTPS and its certificate policy,
+    # but no case there calls the Panel API over the public name (CLUS-01/02/03
+    # read it over the loopback), so the third clause would be claimed, not
+    # witnessed.
+    "NGX-01": {"aio": "AIO-01"},
+    # The decoy must hand out the cover site and never a management interface.
+    # DECOY-01 asks nine management paths on four ways into the camouflage
+    # listener and requires the site's own 404 page on every one, with the panel
+    # name as the control where the same read is refused by the Panel.
+    # NGX-DECOY-ROUTE is the cluster's version of that claim after the same
+    # probe was added there: the cover pair, the REALITY name without REALITY
+    # authentication and an SNI the stream map does not list each refuse all
+    # nine paths with the rendered 404.html.
+    "NGX-02": {"aio": "DECOY-01", "multi-node": "NGX-DECOY-ROUTE"},
+    # The fallback half: a client that reaches the node with an unrecognised
+    # REALITY handshake, or with a name the stream map does not list, lands on
+    # the rendered cover page rather than on anything the deployment manages.
+    # Both cases serve that page byte for byte from the client, over the REALITY
+    # lineage for the REALITY name and without a name pin for the unlisted one.
+    "NGX-03": {"aio": "DECOY-01", "multi-node": "NGX-DECOY-ROUTE"},
+    # Both halves of the sentence in one verdict: the intended host recorded at
+    # least one matching packet and the other recorded none, with the egress
+    # address asserted beside them. Only a cluster has an "other VPS", so this is
+    # witnessed in the Multi-Node contour and the All-in-One host is absent by
+    # construction rather than by omission.
+    "PKT-01": {"multi-node": "MN-DP-master-REALITY-xray"},
+    # Four degradations against a real request — no capture tool, no identity, a
+    # window that ran out before the harness stopped it, and an identity channel
+    # that did not travel the request's path, which is what a NAT looks like from
+    # the target. Each has to come back INCOMPLETE, the non-matching source is
+    # recorded for the last one, no counter is read as an answer, and no capture
+    # file or payload is left on any host.
+    "PKT-02": {"aio": "AIO-PKT-02"},
+    # A real Worker request judged as the Master's: the payload is right, the SNI
+    # is right, the egress address is right, and the capture at the Worker still
+    # refuses the case.
+    "PKT-03": {"multi-node": "MN-PKT-03"},
+    # The Worker dispatch is traced on the Master the way the live runner traces
+    # its own: strace installed there, the trace written there, the scan and the
+    # removal there, so ``envp`` never leaves the host. One case holds all three
+    # sentences: the acceptance fixtures say this host's observer captures a long
+    # argument whole under both execve and execveat and keeps a 128-element argv
+    # unabbreviated, and the scan says the dispatch's own vectors are complete and
+    # carry no raw or base64 SECRET_KEY. The live sentence also covers the remote
+    # Worker's processes up to the SSH boundary; this contour observes the same
+    # local tree and records in docs/PODMAN_E2E_DISCOVERY.md that the remote side
+    # is beyond it.
+    "WRK-01": {"multi-node": "MN-ARGV-OBSERVER"},
+    "WRK-02": {"multi-node": "MN-ARGV-OBSERVER"},
+    "WRK-03": {"multi-node": "MN-ARGV-OBSERVER"},
+    # The install case is where a configured version is compared with an installed
+    # one: it interrogates the Panel, the node and the Xray core through their own
+    # binaries, records all three against the pin this deployment configured, and
+    # fails the install when a component reports something else or cannot be read
+    # at all. What differs from the live sentence is the pin's source — the
+    # container passes an explicit version where the live runner's channel default
+    # is `latest`, which asks only that a version be reported — and that the
+    # comparison lives in the case rather than in a post-install phase of its own;
+    # docs/PODMAN_E2E_DISCOVERY.md records both.
+    "VER-01": {"aio": "AIO-INSTALL", "multi-node": "MN-INSTALL"},
+    # The installer pin is not reachable by running the install the live runner
+    # runs: the container would take the floating `main` download unless the pin
+    # were set, and this workstation bind-mounts a bundled installer into /repo
+    # besides. AIO-NEG-PIN therefore asks the product's own pin functions and then
+    # calls its install entrypoint with a scratch SCRIPT_DIR, so the refused branch
+    # is the pinned one and the node binary is proven untouched afterwards.
+    "VER-02": {"aio": "AIO-NEG-PIN"},
+    # Both cores are read through their own binaries and compared with each other
+    # on every matrix tuple: the client engine reports its version and the node
+    # that served the tuple reports the core it deployed, and the tuple is refused
+    # unless the two are the same pinned version. The install case carries the
+    # sentence's other half — the core is read through `rw-core`, and three
+    # components read through one binary is refused — so the divergence recorded in
+    # docs/PODMAN_E2E_DISCOVERY.md is that the client/server comparison is a
+    # data-plane tuple here rather than a post-install phase.
+    "VER-03": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The sentence's subject is the two client cores, and the container's engine
+    # container is one binary per run, read through its own version argument and
+    # required to carry the configured pin before it is used. The clause that the
+    # client must match the core the node deployed is asserted only on the Xray
+    # tuple, because the deployed core is the Xray core the node supervises.
+    "DP-03": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The live sentence is about a delta of listener counters that unrelated
+    # background traffic makes unattributable, and the verdict it demands is
+    # INCOMPLETE with the non-matching sources recorded. The container refuses
+    # counters as evidence altogether and attributes each segment to the address
+    # the target itself reported, so the branch the sentence names is the one
+    # `ingress` takes when every captured packet came from an address other than
+    # the client's. `AIO-PKT-02` is the case that reaches it — its last degradation
+    # is the container's NAT, where the counted source is not the source the
+    # target named — and the cluster contour asks the same question on every tuple
+    # instead of in a case of its own.
+    "DP-13": {"aio": "AIO-PKT-02"},
+    # The Data Plane is explicitly disabled and the live runner records the
+    # skipped cases as SKIP with an overall of INCOMPLETE. This contour has no
+    # switch that disables its subject, so `DP-14` is left for 9.3: the aggregate
+    # it would read is asserted by `GATE-STATUS` (a skip beside a pass is still
+    # not green), but the run the sentence describes — the Data Plane turned off
+    # for the whole suite — is one this suite cannot produce.
+    # Any failing runtime case makes the run FAIL, and the report names it. The
+    # case produces one failing tuple of the twenty a Vision-enabled cluster owes
+    # — eighteen on one host — and requires the aggregate to be FAIL.
+    "DP-15": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # Two of the runtime cases fail and the rest pass: the case requires overall
+    # FAIL, requires the two failing ids to be the only ones marked FAIL, and
+    # requires each message to name its own case. On a cluster that is the live
+    # sentence's fourteen of sixteen; on one host it is six of eight, and the
+    # topology explains the smaller number.
+    "RES-01": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # The run that decided nothing is told apart from the run that failed: every
+    # runtime case comes back INCOMPLETE, the aggregate is INCOMPLETE and no case
+    # is marked FAIL — the verdict the eight undecided All-in-One tuples of the run
+    # on 15 November earned. The Vision half then fails one core and one Vision
+    # tuple and requires both to be named in result.json and carried as a
+    # `<failure>` in junit.xml, which is all a CI reader sees.
+    "RES-02": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # The schema itself. The live report names `test_run_id`, `repository_commit`,
+    # `started_at`/`finished_at`, `control_machine`, `master`, `worker`, `trust`,
+    # `results`, `traffic` and `overall`; this suite writes `run_id`,
+    # `environment.repository`, `started` plus `duration`, `cases` and `overall`,
+    # because the two hosts of a cluster run are its own containers and it has no
+    # ACME trust block to describe. The case requires every field the container
+    # schema promises and every case field in it, and the mapping is recorded in
+    # docs/PODMAN_E2E_DISCOVERY.md.
+    "RES-03": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # Teardown is decided by a configuration file and a hook rather than by a
+    # host, so one case witnesses the whole policy on both contours: it writes a
+    # real mode-0600 configuration, loads it through the product's own preflight
+    # and hands it to the product's own teardown. DESTROY is refused while the
+    # file is read, which is what "before any remote modification" means here —
+    # there is no remote, and the refusal precedes the object that could reach
+    # one.
+    "TD-01": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # PRESERVE answers PASS while two SSH clients that raise on any attribute read
+    # are handed in, so the case measures that the policy consults no host. The
+    # record it returns is asserted to carry the teardown status alone, because a
+    # record that restates the test outcome is the coupling the sentence refuses.
+    "TD-02": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # Eleven refusals, each with its own message: four mandatory values, a
+    # relative path, a symlink, a directory, an absent file, a non-executable
+    # hook, a group-writable one and a malformed digest, plus the foreign-owned
+    # hook where the runner can create one. The digest's second check is the
+    # tampering clause — the same configuration is accepted, the hook's bytes
+    # change, and execution refuses it.
+    "TD-03": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # The hook is a Python program at a path a shell would split into two
+    # commands, and it records the program name it was executed as, the arguments
+    # it was given and the JSON it read from stdin: an execution through `sh -c`
+    # cannot run it at all, and a request in argv would be in that record. The
+    # five reply shapes that are not a restored host are refused beside it, and
+    # the timeout the sentence binds the call to is the one configuration
+    # declares.
+    "TD-04": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # The baseline comparison is the product's own, over the eight fields it
+    # compares: matching manifests report the comparison as MATCHED and the
+    # status as INCOMPLETE, because the pair lock and the complete ownership
+    # comparison are still unimplemented — a PASS here would be the false pass
+    # the sentence exists to refuse. One differing field is TEARDOWN_FAILED and
+    # names the field.
+    "TD-07": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # Four ways a hook fails to restore both hosts — a nonzero exit, a non-JSON
+    # answer, JSON that is not an object, and a call that outlives
+    # RESTORE_TIMEOUT — plus a host that came back with the install still on it,
+    # which the disposable gate refuses. Every one is TEARDOWN_FAILED, and the
+    # live reporter writes that status as a JUnit error beside a passing case, so
+    # no reader of the report can take the run for green.
+    "TD-08": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # The pair-wide lock is a kernel `flock` held by a session on each host, so
+    # the case drives the product's own `RemotePairLock` over real SSH into the
+    # two containers: an occupied pair is a refusal that names the lock, and the
+    # lock file that outlives its holder is not ownership.
+    "LOCK-01": {"multi-node": "MN-LOCK"},
+    # The lost session is the holder's own process, terminated inside the host as
+    # a dropped connection ends it. What the case reads is the runner's verdict
+    # afterwards — a gate on every mutating phase, and resumption as reacquisition
+    # rather than a retry.
+    "LOCK-02": {"multi-node": "MN-LOCK-LOSS"},
+    # Every shape the sentence names is planted at the canonical path in both
+    # hosts and refused there, with the object left exactly as it was: the case
+    # reads `lstat` before and after each refusal rather than the exit status.
+    "MLOCK-03": {"multi-node": "MN-LOCK-PATH"},
+    # The commands, not the lock: the shipped `gowave-auto.sh` and
+    # `gowave-backup.sh` entry points are run against the holder and each has to
+    # print the lock's own refusal instead of its own post-lock sentence, with the
+    # host's digests and the protocol's files unchanged. The Worker half of the
+    # sentence is named as not driven — a valid Worker lease would reinstall it.
+    "MLOCK-01": {"multi-node": "MN-LOCK-CLI"},
+    # The lease the run hands its own child, in both transports it supports, and
+    # the three ways it must stop authorizing: released, terminated, replayed.
+    # Acceptance is asserted with the parent's session still alive and its lease
+    # byte-identical, so "the child ran" cannot be "the child took a dropped lock".
+    "MLOCK-02": {"multi-node": "MN-LOCK-NESTED"},
+    # The run id is handed to the product's own validator against a real artifact
+    # root: every hostile shape is refused with the rule it broke, the accepted
+    # shapes resolve to a directory named below that root, and the runner's source
+    # order proves it asked before it created a directory or opened an SSH client.
+    "STATE-01": {"aio": "RUNID-01", "multi-node": "RUNID-01"},
+    # The record is written by the product's own writer at mode 0600 and read back
+    # by its own reader: a phase resumes only its own run, commit and non-secret
+    # identity, a terminal phase is not repeated, prerequisites are read, and the
+    # baseline is re-collected under both locks before the first remote write —
+    # with the volatile fields tolerated because no gate reads them.
+    "STATE-02": {"aio": "RESUME-01", "multi-node": "RESUME-01"},
+    # Vision is two optional domains. Three of its scenarios are one node's own
+    # configuration, which is `MN-VISION`'s question: the Master-only and the
+    # Worker-only combinations ask it of each field in turn, and the disabled
+    # combination is the same case's absent branch — exactly four inbounds and four
+    # hosts per node, no certificate and no route. `MN-VISION` now also reads the
+    # configuration the run was given back through the whitelist parser, so the
+    # parsed answer and the Panel's own declaration are one statement.
+    "VIS-01": {"multi-node": "MN-VISION"},
+    "VIS-02": {"multi-node": "MN-VISION"},
+    "VIS-07": {"multi-node": "MN-VISION"},
+    # The both-configured combination adds the endpoint arithmetic to the same
+    # per-node facts: five inbounds and five published hosts per node, ten in all.
+    # `NGX-04` reads that beside its route on both contours, because the route to
+    # 8444 and the decoy fallback on 9444 are the scenario's other half.
+    "VIS-03": {"aio": "NGX-04", "multi-node": "NGX-04"},
+    # The two fields are configured independently and a duplicate is refused. That
+    # clause is decided by the parser, so `VIS-CONFIG` writes the configuration
+    # files and reads them back: four accepted combinations, eight duplicate
+    # classes, and the runner's own exit before any host is read.
+    "VIS-04": {"aio": "VIS-CONFIG", "multi-node": "VIS-CONFIG"},
+    # A certificate failure has to abort the attempt and roll the host back.
+    # `VIS-05` is its own driver under its own id: it asks for a Vision domain the
+    # fixture resolver answers with NXDOMAIN, on the host the install already
+    # provisioned, so the Vision stage is the one that fails — and it fails after
+    # the Panel and REALITY lineages are already in place, which is what gives the
+    # rollback something to preserve and the case digests to compare instead of
+    # the installer's own account of itself.
+    # **VIS-06 stays live-only.** Reporting an incomplete compensation instead of
+    # hiding it needs a rollback that itself fails, which is a second injection on
+    # top of the first.
+    # Which host owes the Vision ports is decided before anything is contacted, and
+    # both contours read the same eligibility decision, so `VIS-GATE` asks it of
+    # both: the configured host is refused and the unconfigured one is not, and a
+    # host exempt from 8444/9444 is still evaluated against the default set.
+    "VIS-08": {"aio": "VIS-GATE", "multi-node": "VIS-GATE"},
+    # A Panel credential is refused by three clauses — the signature over the
+    # Panel's own `APP_SECRET`, the `exp` the middleware declares required, and
+    # the administrator record it names — and `AIO-AUTH-NEG` sends four tokens
+    # that are copies of the real one and each fail exactly one clause, then
+    # reads the same route with the real token before and after. The Panel is the
+    # Master's on both contours, so one case answers for both.
+    "NEG-06": {"aio": "AIO-AUTH-NEG", "multi-node": "AIO-AUTH-NEG"},
+    # The duplicate is refused from `state.json` before the Panel client exists,
+    # which is a fact about the Master's own registration record: `MN-DUP-ADD`
+    # runs the operator's verb a second time over a committed pair and reads the
+    # journal, the state file and the Panel inventory on both sides of it. The
+    # registration it duplicates is `node add`, which only a cluster performs —
+    # the All-in-One install registers its local node inside the same transaction
+    # and never exposes a second dispatch for a duplicate to collide with.
+    "NEG-02": {"multi-node": "MN-DUP-ADD"},
+    # Two corruptions of one archive: a container that does not read and a
+    # database that does not open. `MN-BACKUP-BAD` writes one broken archive per
+    # promise and asks the product's restore to refuse each before it mutates a
+    # live file; the database variant carries a manifest that names the digest of
+    # what it actually ships, so the integrity check the product runs on its
+    # staged copy is the only gate left.
+    "NEG-05": {"multi-node": "MN-BACKUP-BAD"},
+    # The sentence is the aggregate: any declared scenario that did not reach PASS
+    # leaves `negative_tests` not PASS. The container's aggregate is the one
+    # `GATE-STATUS` builds — a run whose runtime cases fail reports FAIL and names
+    # them, and a run whose runtime cases are all INCOMPLETE does not report PASS —
+    # so the same case answers for both contours. The live field, `NOT_RUN` and
+    # `PARTIAL` are the live runner's own vocabulary and stay live-only.
+    "NEG-07": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # The switch the sentence names does not exist here: this suite has no phase
+    # to disable, and a declared case that is skipped is a FAIL rather than an
+    # INCOMPLETE. What the container can prove is the other half — that a skipped
+    # declaration never becomes a PASS — which is the rule `DP-14` reads for the
+    # data plane and `skip_policy` enforces for every declared case.
+    "NEG-08": {"aio": "DP-14", "multi-node": "DP-14"},
+    # The controller aborts before it asks for a password when the fingerprint it
+    # was shown does not match the host's key. `SSHID-02` drives the product's own
+    # bootstrap against a modelled transport and reads the authentication itself:
+    # no `auth_password` call, no prompt, no write and no timer on the host.
+    "BOOT-01": {"aio": "SSHID-02", "multi-node": "SSHID-02"},
+    # The lock half of the teardown sentence, read on two real hosts: the pair is
+    # taken in address order, a refused second host leaves the first free, a lost
+    # holder session stops every mutating phase, and the replacement pair is taken
+    # only after the release is confirmed on both hosts — a fresh token, with the
+    # lost one refused by the product's own validator. The status half of the same
+    # sentence (a mismatch is TEARDOWN_FAILED and a match is still not PASS) is
+    # `GATE-TEARDOWN`'s, and provider snapshots are the live-only part named in the
+    # entry's own split.
+    "TD-05": {"multi-node": "MN-LOCK-LOSS"},
+}
+
+
+def apply_implementations(cases: List[Dict[str, Any]], registry: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+    """Write the code's own implementation facts into the catalog entries."""
+    known = {case["id"] for case in cases}
+    unknown = sorted(set(registry) - known)
+    if unknown:
+        raise CatalogError(
+            "the code runs cases the catalog does not define: " + ", ".join(unknown)
+        )
+    undeclared = sorted(set(LIVE_PARITY_OBSERVERS) - known)
+    if undeclared:
+        raise CatalogError(
+            "an observer is mapped to a live scenario the catalog does not define: "
+            + ", ".join(undeclared)
+        )
+    for case in cases:
+        drivers = {
+            topology: {**facts, "evidence": list(facts.get("evidence") or [])}
+            for topology, facts in sorted(registry.get(case["id"], {}).items())
+        }
+        for topology, observer in sorted(LIVE_PARITY_OBSERVERS.get(case["id"], {}).items()):
+            if topology in drivers:
+                raise CatalogError(
+                    f"{case['id']}: it runs as a case and is also mapped to the observer "
+                    f"{observer!r} in {topology}, so one of the two is stale"
+                )
+            facts = registry.get(observer, {}).get(topology)
+            if facts is None:
+                raise CatalogError(
+                    f"{case['id']}: the declared {topology} observer {observer!r} is not a Case "
+                    "the code builds for that topology"
+                )
+            # A fresh list per entry: two entries sharing one list would be dumped
+            # as a YAML anchor and alias, which reads as a link nobody declared.
+            drivers[topology] = {
+                **facts,
+                "evidence": list(facts.get("evidence") or []),
+                "case": observer,
+            }
+        case["drivers"] = drivers
+        if drivers:
+            case["driver_status"] = "implemented"
+        elif case.get("driver_status") == "implemented":
+            case["driver_status"] = "planned"
+
+
+def load_promotions(path: Path = PROMOTIONS_PATH) -> Dict[str, Any]:
+    """The promotion register: the criteria and the cases that met them.
+
+    The register is an input, not a report. `build_catalog` reads it to decide
+    which Podman-first cases have left `incubating`, so a hand edit of
+    `tests/cases/catalog.yaml` cannot grant a state the register does not carry.
+    """
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if document.get("schema") != PROMOTION_SCHEMA:
+        raise CatalogError(
+            f"{path}: schema is {document.get('schema')!r}, expected {PROMOTION_SCHEMA!r}"
+        )
+    criteria = document.get("criteria") or {}
+    promoted: Dict[str, Dict[str, Any]] = {}
+    for entry in document.get("promotions") or []:
+        case_id = entry.get("id")
+        if case_id in promoted:
+            raise CatalogError(f"{path}: {case_id} is listed twice")
+        promoted[case_id] = dict(entry)
+    return {"criteria": dict(criteria), "promoted": promoted}
+
+
+def _promotion_errors(catalog: Dict[str, Any], promotions: Dict[str, Any]) -> List[str]:
+    """The register and the catalog must agree about which case is where."""
+    errors: List[str] = []
+    criteria = promotions["criteria"]
+    green_runs = criteria.get("green_runs")
+    if not isinstance(green_runs, int) or green_runs < 1:
+        errors.append(f"promotion criteria must declare a positive green_runs, not {green_runs!r}")
+    if not str(criteria.get("review") or "").strip():
+        errors.append("promotion criteria must state what the review is")
+    minimum = green_runs if isinstance(green_runs, int) else 1
+
+    by_id = {case.get("id"): case for case in catalog.get("cases", [])}
+    for case_id, entry in sorted(promotions["promoted"].items()):
+        case = by_id.get(case_id)
+        if case is None:
+            errors.append(f"{case_id}: the promotion register names no such case")
+            continue
+        if case.get("live_scenario"):
+            errors.append(
+                f"{case_id}: already live-parity, and the promotion path runs one way"
+            )
+            continue
+        state = entry.get("state")
+        if state != "podman-stable":
+            errors.append(
+                f"{case_id}: promotion state {state!r} is not reachable from the register; "
+                f"live-parity is entered by a live scenario, not by an entry"
+            )
+        entry_runs = entry.get("green_runs")
+        if not isinstance(entry_runs, int) or entry_runs < minimum:
+            errors.append(
+                f"{case_id}: promotion rests on {entry_runs!r} green runs, "
+                f"the criteria require {minimum}"
+            )
+        if not str(entry.get("review") or "").strip():
+            errors.append(f"{case_id}: promotion names no review")
+
+    for case in catalog.get("cases", []):
+        if case.get("live_scenario"):
+            continue
+        registered = case.get("id") in promotions["promoted"]
+        expected = "podman-stable" if registered else "incubating"
+        if case.get("state") != expected:
+            errors.append(
+                f"{case.get('id')}: state {case.get('state')!r}, but the promotion register "
+                f"{'lists' if registered else 'does not list'} it, which makes it {expected!r}"
+            )
+        if registered and not case.get("promotion"):
+            errors.append(f"{case.get('id')}: promoted, but carries no promotion record")
+    return errors
+
+
+def build_catalog(
+    spec_path: Path = LIVE_SPEC,
+    scenario_path: Path = SCENARIOS_PATH,
+    promotion_path: Path = PROMOTIONS_PATH,
+) -> Dict[str, Any]:
     scenarios = parse_live_spec(spec_path)
+    environments = load_scenario_environments(scenario_path)
+    promotions = load_promotions(promotion_path)
+    promoted = promotions["promoted"]
     counters: Dict[str, int] = {}
     cases: List[Dict[str, Any]] = []
     for scenario in scenarios:
@@ -567,7 +2063,7 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             raise ValueError(f"No stable ID prefix for requirement: {scenario.requirement!r}")
         counters[prefix] = counters.get(prefix, 0) + 1
         case_id = f"{prefix}-{counters[prefix]:02d}"
-        environment, note = classify(scenario.requirement, scenario.title)
+        environment, note = classify(scenario.requirement, scenario.title, environments)
         if environment == "live-only":
             runs_in = ["live"]
             state = "live-only"
@@ -589,8 +2085,8 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             "environment": environment,
             "topology": topologies,
             "gate": "pre-push",
-            "driver": None,
             "driver_status": "planned" if "podman" in runs_in else "not-applicable",
+            "drivers": {},
         }
         if note:
             key = "partial_split" if environment == "partial" else "live_only_reason"
@@ -599,7 +2095,9 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
         cases.append(case)
 
     extras = PODMAN_FIRST_CASES + data_plane_cases()
+    manifest = matrix_data.load()
     for extra in extras:
+        promotion = promoted.get(extra["id"])
         cases.append({
             "id": extra["id"],
             "requirement": extra["requirement"],
@@ -607,14 +2105,17 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             "assertion": extra["assertion"],
             "assertion_sha256": hashlib.sha256(extra["assertion"].encode("utf-8")).hexdigest(),
             "runs_in": ["podman"],
-            "state": "incubating",
+            "state": "podman-stable" if promotion else "incubating",
             "environment": "container",
             "topology": extra["topology"],
-            "gate": "pre-push",
-            "driver": None,
+            "gate": case_gate(list(extra["topology"]), manifest),
             "driver_status": "planned",
+            "drivers": {},
             "promotion_target": extra["promotion_target"],
+            **({"promotion": promotion} if promotion else {}),
         })
+
+    apply_implementations(cases, driver_registry())
 
     counts = {
         "live_total": len(scenarios),
@@ -631,6 +2132,7 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
         "live_spec": str(spec_path.relative_to(REPO_ROOT)),
         "live_spec_sha256": spec_sha,
         "counts": counts,
+        "run_starts": run_starts(),
         "expected_positive_case_counts": {
             "aio": {"vision_disabled": 8, "vision_enabled": 10},
             "multi-node": {
@@ -694,11 +2196,45 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
         if key not in {(s.requirement, s.title) for s in scenarios}:
             errors.append(f"Catalog entry has no live scenario: {case.get('id')} / {key[1]}")
 
+    # Every live scenario is classified, and the classification is the table's,
+    # not the catalog's own word: a scenario the spec gained and nobody placed is
+    # refused here, and so is an entry whose environment drifted from the row.
+    environments = load_scenario_environments()
+    for scenario in scenarios:
+        key = (scenario.requirement, scenario.title)
+        row = environments.get(key)
+        if row is None:
+            errors.append(
+                f"Live scenario has no environment classification: {key[0]} / {key[1]}"
+            )
+            continue
+        if row.get("environment") not in ENVIRONMENTS:
+            errors.append(
+                f"{key[0]} / {key[1]}: environment {row.get('environment')!r} "
+                f"is not one of {list(ENVIRONMENTS)}"
+            )
+        case = by_live.get(key)
+        if case is not None and case.get("environment") != row.get("environment"):
+            errors.append(
+                f"{case.get('id')}: environment {case.get('environment')!r} "
+                f"is not the classification table's {row.get('environment')!r}"
+            )
+    spec_keys = {(scenario.requirement, scenario.title) for scenario in scenarios}
+    for key in environments:
+        if key not in spec_keys:
+            errors.append(
+                f"Environment classification names no live scenario: {key[0]} / {key[1]}"
+            )
+
     counts = catalog.get("counts", {})
+    # 115 was the plan-time split. Four of those sentences turned out to be
+    # conjunctions over other cases' verdicts — no single run can own them — so
+    # they are `partial` with the split written out, and the container count
+    # says so instead of pinning a number the evidence no longer supports.
     expected = {
         "live_total": 125,
-        "container": 115,
-        "partial": 8,
+        "container": 111,
+        "partial": 12,
         "live_only": 2,
     }
     for field_name, expected_value in expected.items():
@@ -707,46 +2243,446 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
                 f"Parity count drift: {field_name}={counts.get(field_name)} expected {expected_value}"
             )
 
+    # A Podman-first case is incubated here and promoted later, so both names it
+    # carries must be requirements a spec actually states: an owning requirement
+    # nobody declares is a string, and a promotion target nobody owns can never
+    # be reached. The vocabulary is read from the two specs rather than typed
+    # here, so a renamed requirement turns its cases red instead of orphaning
+    # them quietly.
+    vocabulary = {scenario.requirement for scenario in scenarios}
+    vocabulary.update(requirement for requirement, _ in trace_data.parse_spec())
+    # Also include requirements from traceability.yaml cases_by_requirement
+    trace_table = trace_data.load_table()
+    for group in trace_table.get("cases_by_requirement") or []:
+        vocabulary.add(group.get("requirement"))
     for case in catalog.get("cases", []):
-        if not case.get("live_scenario") and case.get("runs_in") != ["podman"]:
-            errors.append(f"{case.get('id')}: Podman-first case must run only in Podman")
-        if not case.get("live_scenario") and not case.get("promotion_target"):
-            errors.append(f"{case.get('id')}: Podman-first case requires a promotion target")
+        if case.get("live_scenario"):
+            continue
+        case_id = case.get("id")
+        if case.get("runs_in") != ["podman"]:
+            errors.append(f"{case_id}: Podman-first case must run only in Podman")
+        owner = case.get("requirement")
+        if owner not in vocabulary:
+            errors.append(
+                f"{case_id}: Podman-first case names no owning requirement: {owner!r}"
+            )
+        target = case.get("promotion_target")
+        if not target:
+            errors.append(f"{case_id}: Podman-first case requires a promotion target")
+        elif target not in vocabulary:
+            errors.append(
+                f"{case_id}: promotion target is not a requirement either spec states: {target!r}"
+            )
+    errors.extend(_implementation_errors(catalog))
+    errors.extend(_run_start_errors(catalog))
+    errors.extend(_promotion_errors(catalog, load_promotions()))
     return errors
+
+
+def _implementation_errors(catalog: Dict[str, Any]) -> List[str]:
+    """The code and the catalog must name each other's cases, both ways."""
+    errors: List[str] = []
+    registry = driver_registry()
+    cases = catalog.get("cases", [])
+    by_id = {case.get("id"): case for case in cases}
+    for case in cases:
+        case_id = case.get("id")
+        status = case.get("driver_status")
+        drivers = case.get("drivers") or {}
+        if status not in DRIVER_STATUSES:
+            errors.append(f"{case_id}: driver_status {status!r} is not one of {list(DRIVER_STATUSES)}")
+        if status == "implemented" and not drivers:
+            errors.append(f"{case_id}: implemented, but names no driver")
+        if status != "implemented" and drivers:
+            errors.append(f"{case_id}: driver_status {status!r}, but names drivers")
+        for topology, facts in sorted(drivers.items()):
+            observed = facts.get("case") or case_id
+            expected = (registry.get(observed) or {}).get(topology)
+            if expected is None:
+                errors.append(
+                    f"{case_id}: the {topology} driver {facts.get('driver')!r} is not a Case the code builds"
+                )
+                continue
+            if facts.get("case") != LIVE_PARITY_OBSERVERS.get(case_id, {}).get(topology):
+                errors.append(
+                    f"{case_id} / {topology}: the observer is {facts.get('case')!r}, "
+                    f"the declaration says {LIVE_PARITY_OBSERVERS.get(case_id, {}).get(topology)!r}"
+                )
+            if topology not in case.get("topology", []):
+                errors.append(f"{case_id}: driven in {topology}, which its topology list does not name")
+            if facts.get("driver") != expected["driver"]:
+                errors.append(
+                    f"{case_id} / {topology}: driver {facts.get('driver')!r} is not the one the code wraps, "
+                    f"{expected['driver']!r}"
+                )
+            if list(facts.get("evidence") or []) != expected["evidence"]:
+                errors.append(
+                    f"{case_id} / {topology}: the evidence keys differ from what the driver records: "
+                    f"{facts.get('evidence')} != {expected['evidence']}"
+                )
+    for case_id, topologies in sorted(registry.items()):
+        entry = by_id.get(case_id)
+        if entry is None:
+            errors.append(f"the code runs {case_id}, which the catalog does not define")
+            continue
+        if entry.get("driver_status") != "implemented":
+            errors.append(f"{case_id}: the code runs it, the catalog says {entry.get('driver_status')!r}")
+        for topology in sorted(topologies):
+            if topology not in (entry.get("drivers") or {}):
+                errors.append(f"{case_id}: the code drives it in {topology}, the catalog does not name it")
+    return errors
+
+
+def justified_exclusions(topology: str) -> List[Dict[str, Any]]:
+    """The live-only entries a run of ``topology`` does not execute, with their reason.
+
+    A scenario that is simply absent from a run reads as parity in a green
+    artifact, so each run names what it leaves out and why. The reason is the
+    catalog's own ``live_only_reason`` rather than a copy kept here: an entry
+    that cannot state one, or that also claims to run in this suite, is refused
+    instead of being printed as a justified exclusion.
+    """
+    cases = load_catalog().get("cases", [])
+    # The matrix declares every topology this harness runs, including one whose
+    # cases have not landed yet; the catalog only names the topologies a case
+    # happens to be driven in, so it cannot answer for an empty suite.
+    known = set(matrix_data.load().get("topologies", {}))
+    known.update(name for case in cases for name in (case.get("topology") or []))
+    if topology not in known:
+        raise ValueError(f"unsupported topology: {topology!r}")
+    exclusions: List[Dict[str, Any]] = []
+    problems: List[str] = []
+    for case in cases:
+        if case.get("environment") != "live-only":
+            continue
+        if topology not in (case.get("topology") or []):
+            continue
+        case_id = case.get("id")
+        reason = (case.get("live_only_reason") or "").strip()
+        if not reason:
+            problems.append(f"{case_id}: live-only case must state its reason")
+        if "podman" in (case.get("runs_in") or []):
+            problems.append(
+                f"{case_id}: live-only case is listed as running in the Podman suite"
+            )
+        exclusions.append({
+            "id": case_id,
+            "requirement": case.get("requirement"),
+            "environment": case.get("environment"),
+            "topology": list(case.get("topology") or []),
+            "reason": reason or None,
+        })
+    if problems:
+        raise CatalogError(
+            "the catalog cannot justify what this run leaves out: " + "; ".join(problems)
+        )
+    return exclusions
+
+
+def require_executable(cases: Iterable[Tuple[str, str]]) -> None:
+    """Refuse a run whose case list is not what the catalog declares.
+
+    The runner builds its cases in Python and the catalog states which of them
+    exist; without this check a case could run under an id no audit knows. It is
+    called before the install, so a disagreement costs no product time.
+    """
+    catalog = load_catalog()
+    by_id = {case.get("id"): case for case in catalog.get("cases", [])}
+    problems: List[str] = []
+    for case_id, topology in cases:
+        entry = by_id.get(case_id)
+        if entry is None:
+            problems.append(f"{case_id}: no catalog entry")
+        elif entry.get("driver_status") != "implemented":
+            problems.append(f"{case_id}: the catalog says {entry.get('driver_status')!r}")
+        elif topology not in (entry.get("drivers") or {}):
+            problems.append(f"{case_id}: the catalog names no {topology} driver")
+    if problems:
+        raise CatalogError(
+            "the case list does not match tests/cases/catalog.yaml: " + "; ".join(problems)
+        )
 
 
 def executable_gaps(catalog: Dict[str, Any], suite: str = "podman") -> List[str]:
     """Return cases that claim to run in a suite but have no implemented driver."""
     gaps = []
     for case in catalog.get("cases", []):
-        if suite in case.get("runs_in", []) and not case.get("driver"):
+        if suite in case.get("runs_in", []) and not case.get("drivers"):
             gaps.append(f"{case['id']} ({case.get('environment')})")
     return gaps
 
 
-def coverage_audit(catalog: Dict[str, Any], behaviors_path: Path = BEHAVIORS_PATH) -> List[str]:
-    errors: List[str] = []
+def _display(path: Path) -> str:
+    """A path as the repository names it, or as it stands when it is outside."""
+    try:
+        return str(Path(path).resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def load_behaviors(path: Path = BEHAVIORS_PATH) -> Dict[str, Any]:
+    with Path(path).open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def coverage_audit(
+    catalog: Dict[str, Any],
+    behaviors_path: Path = BEHAVIORS_PATH,
+    matrix_path: Path = MATRIX_PATH,
+    parity_path: Path = PARITY_PATH,
+) -> List[str]:
+    """Judge the behaviour inventory against the catalog it claims to cover.
+
+    The inventory is a partition, not a summary: every catalog case is named by
+    exactly one behaviour, and every behaviour states where its cases run and
+    which tier blocks on them. A behaviour with no case is an empty promise; a
+    behaviour whose only cases establish its happy path has no measured failure
+    behaviour; a case no behaviour names is a guarantee nobody wrote down.
+    """
+    behaviors_path = Path(behaviors_path)
     if not behaviors_path.exists():
-        return [f"Behavior inventory is missing: {behaviors_path.relative_to(REPO_ROOT)}"]
-    inventory = yaml.safe_load(behaviors_path.read_text(encoding="utf-8")) or {}
-    behaviors = inventory.get("behaviors", [])
-    case_ids = {case["id"] for case in catalog.get("cases", [])}
-    mapped_cases = set()
-    for behavior in behaviors:
-        name = behavior.get("name", "<unnamed>")
-        cases = behavior.get("cases") or []
-        error_paths = behavior.get("error_paths") or []
-        if not cases:
+        return [f"Behavior inventory is missing: {_display(behaviors_path)}"]
+    try:
+        inventory = load_behaviors(behaviors_path)
+    except yaml.YAMLError as exc:
+        return [f"Behavior inventory is not valid YAML: {_display(behaviors_path)}: {exc}"]
+    if not isinstance(inventory, dict):
+        return [f"Behavior inventory must be a mapping: {_display(behaviors_path)}"]
+
+    errors: List[str] = []
+    topology_manifest = (yaml.safe_load(Path(matrix_path).read_text(encoding="utf-8")) or {}).get(
+        "topologies"
+    ) or {}
+    gated_by = {
+        str(name): {str(tier) for tier in (entry or {}).get("gate") or []}
+        for name, entry in topology_manifest.items()
+    }
+
+    schema = inventory.get("schema")
+    if schema != BEHAVIOR_SCHEMA:
+        errors.append(
+            f"Behavior inventory schema is {schema!r}, expected {BEHAVIOR_SCHEMA!r}"
+        )
+    declared_areas = inventory.get("areas")
+    if not isinstance(declared_areas, list):
+        errors.append("Behavior inventory declares no areas")
+        declared_areas = []
+    for area in declared_areas:
+        if area not in BEHAVIOR_AREAS:
+            errors.append(f"Behavior inventory declares unknown area {area!r}")
+    for area in BEHAVIOR_AREAS:
+        if area not in declared_areas:
+            errors.append(f"Behavior inventory does not declare area {area}")
+
+    cases = inventory.get("behaviors")
+    if not isinstance(cases, list) or not cases:
+        return errors + ["Behavior inventory names no behavior"]
+
+    by_id: Dict[str, Dict[str, Any]] = {
+        str(case.get("id")): case for case in catalog.get("cases", []) if case.get("id")
+    }
+    owners: Dict[str, List[str]] = {}
+    covered_areas: Set[str] = set()
+    seen_names: Set[str] = set()
+
+    def reachable(case_ids: Iterable[str]) -> Set[str]:
+        found: Set[str] = set()
+        for case_id in case_ids:
+            found |= set((by_id.get(case_id) or {}).get("topology") or [])
+        return found
+
+    for index, behavior in enumerate(cases):
+        if not isinstance(behavior, dict):
+            errors.append(f"Behavior #{index + 1} is not a mapping")
+            continue
+        name = behavior.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = f"<unnamed #{index + 1}>"
+        elif name in seen_names:
+            errors.append(f"Duplicate behavior name: {name}")
+        seen_names.add(name)
+
+        area = behavior.get("area")
+        if area not in BEHAVIOR_AREAS:
+            errors.append(f"Behavior {name} declares unknown area {area!r}")
+        else:
+            covered_areas.add(area)
+
+        gate = behavior.get("gate")
+        if not isinstance(gate, str) or not gate.strip():
+            errors.append(f"Behavior {name} declares no gate")
+            gate = None
+
+        declared = behavior.get("topology")
+        if not isinstance(declared, list) or not declared:
+            errors.append(f"Behavior {name} declares no topology")
+            declared = []
+        elif len({str(item) for item in declared}) != len(declared):
+            errors.append(f"Behavior {name} declares a topology more than once")
+        declared_topologies = {str(item) for item in declared}
+        for topology in sorted(declared_topologies):
+            if topology not in gated_by:
+                errors.append(
+                    f"Behavior {name} declares unknown topology {topology}"
+                )
+
+        happy = behavior.get("cases")
+        failure = behavior.get("error_paths")
+        if not isinstance(happy, list):
+            errors.append(f"Behavior {name} names no cases")
+            happy = []
+        if not isinstance(failure, list):
+            errors.append(f"Behavior {name} names no error paths")
+            failure = []
+        if not happy:
             errors.append(f"Behavior has no case: {name}")
-        if not error_paths:
+        if not failure:
             errors.append(f"Behavior has no error-path case: {name}")
-        for case_id in cases + error_paths:
-            mapped_cases.add(case_id)
-            if case_id not in case_ids:
+
+        named_here: Set[str] = set()
+        establishing: List[str] = []
+        for case_id in list(happy) + list(failure):
+            if not isinstance(case_id, str):
+                errors.append(f"Behavior {name} names a case that is not an id: {case_id!r}")
+                continue
+            if case_id in named_here:
+                errors.append(f"Behavior {name} names case {case_id} more than once")
+                continue
+            named_here.add(case_id)
+            case = by_id.get(case_id)
+            if case is None:
                 errors.append(f"Behavior {name} references unknown case {case_id}")
-    for case_id in sorted(case_ids - mapped_cases):
-        errors.append(f"Case is mapped to no behavior: {case_id}")
+                continue
+            owners.setdefault(case_id, []).append(name)
+            if gate and case.get("gate") != gate:
+                errors.append(
+                    f"Behavior {name} declares gate {gate} but case {case_id} "
+                    f"is gated {case.get('gate')}"
+                )
+        establishing = [item for item in happy if isinstance(item, str) and item in by_id]
+
+        reached = reachable(named_here)
+        for topology in sorted(declared_topologies - reached):
+            errors.append(
+                f"Behavior {name} declares topology {topology} that none of its cases runs in"
+            )
+        for topology in sorted(reachable(establishing) - declared_topologies):
+            errors.append(
+                f"Behavior {name} does not declare topology {topology} where its cases are established"
+            )
+        if gate:
+            for topology in sorted(declared_topologies & set(gated_by)):
+                if gate not in gated_by[topology]:
+                    errors.append(
+                        f"Behavior {name} declares gate {gate} for {topology}, which "
+                        f"{_display(matrix_path)} does not gate that way"
+                    )
+
+    for case_id in sorted(by_id):
+        claimants = owners.get(case_id) or []
+        if not claimants:
+            errors.append(f"Case is mapped to no behavior: {case_id}")
+        elif len(claimants) > 1:
+            errors.append(
+                f"Case is mapped by more than one behavior: {case_id} "
+                f"({', '.join(sorted(claimants))})"
+            )
+
+    for area in BEHAVIOR_AREAS:
+        if area not in covered_areas:
+            errors.append(f"Area has no behavior: {area}")
+    errors.extend(parity_audit(catalog, parity_path))
     return errors
+
+
+def render_behaviors(catalog: Dict[str, Any], inventory: Dict[str, Any]) -> str:
+    """The inventory for a reader who will not open the YAML."""
+    behaviors = [entry for entry in inventory.get("behaviors") or [] if isinstance(entry, dict)]
+    named = {
+        case_id
+        for entry in behaviors
+        for case_id in (entry.get("cases") or []) + (entry.get("error_paths") or [])
+    }
+    lines = [
+        "<!-- Generated by `python3 -m tools.podman_e2e.catalog behaviors --write`. -->",
+        "",
+        "# Podman acceptance behaviour inventory",
+        "",
+        "Rendered from `tests/cases/behaviors.yaml`; do not edit by hand. Every row",
+        "names the cases that establish the behaviour and the cases that exercise",
+        "its error paths, the topologies it is proven in and the gate tier that",
+        "blocks on it. The topology column lists every topology the row's cases",
+        "apply to, so which case runs where is `tests/cases/catalog.yaml`'s own",
+        "per-case `topology`, not this column.",
+        "`python3 -m tools.podman_e2e.catalog check` fails on a",
+        "behaviour with no case, a behaviour covered only on its happy path, an",
+        "area the delta spec names but no entry covers, and a case no behaviour",
+        "names (an orphan) or two behaviours claim.",
+        "",
+        f"Behaviours: {len(behaviors)} across {len(BEHAVIOR_AREAS)} areas, naming "
+        f"{len(named)} of {len(catalog.get('cases') or [])} catalog cases.",
+        "",
+        "| Area | Behaviours | Cases | Error-path cases |",
+        "|---|---:|---:|---:|",
+    ]
+    for area in BEHAVIOR_AREAS:
+        entries = [entry for entry in behaviors if entry.get("area") == area]
+        happy = sum(len(entry.get("cases") or []) for entry in entries)
+        failure = sum(len(entry.get("error_paths") or []) for entry in entries)
+        lines.append(f"| {area} | {len(entries)} | {happy} | {failure} |")
+    for area in BEHAVIOR_AREAS:
+        entries = [entry for entry in behaviors if entry.get("area") == area]
+        if not entries:
+            continue
+        lines.extend(
+            [
+                "",
+                f"## {area}",
+                "",
+                "| Behaviour | Topologies | Gate | Cases | Error paths |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for entry in entries:
+            topologies = ", ".join(str(item) for item in entry.get("topology") or [])
+            cases = ", ".join(f"`{case_id}`" for case_id in entry.get("cases") or [])
+            failure = ", ".join(f"`{case_id}`" for case_id in entry.get("error_paths") or [])
+            lines.append(
+                f"| {entry.get('name')} | {topologies} | {entry.get('gate')} "
+                f"| {cases} | {failure} |"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def report_problems(
+    catalog: Dict[str, Any],
+    behaviors_path: Path = BEHAVIORS_PATH,
+    report_path: Optional[Path] = None,
+) -> List[str]:
+    """The rendered inventory must be the text the YAML renders to."""
+    behaviors_path = Path(behaviors_path)
+    path = Path(BEHAVIOR_REPORT_PATH if report_path is None else report_path)
+    if not behaviors_path.exists():
+        return []
+    try:
+        inventory = load_behaviors(behaviors_path)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(inventory, dict):
+        return []
+    expected = render_behaviors(catalog, inventory)
+    if not path.exists():
+        return [
+            f"{_display(path)} is missing: run "
+            f"`python3 -m tools.podman_e2e.catalog behaviors --write`"
+        ]
+    if path.read_text(encoding="utf-8") != expected:
+        return [
+            f"{_display(path)} is not what the behaviour inventory renders to: run "
+            f"`python3 -m tools.podman_e2e.catalog behaviors --write` and commit the result"
+        ]
+    return []
 
 
 def executed_ids_from_results(paths: Iterable[Path]) -> set:
@@ -757,6 +2693,34 @@ def executed_ids_from_results(paths: Iterable[Path]) -> set:
             if case.get("status") not in ("SKIP", None):
                 executed.add(case.get("id"))
     return executed
+
+
+def executed_assertions_from_results(paths: Iterable[Path]) -> Dict[str, set]:
+    """The assertion digest each executed case declared, grouped by case id.
+
+    A case that ran without recording one is present with an empty declaration,
+    so the guard can refuse the silence instead of reading it as agreement.
+    """
+    declared: Dict[str, set] = {}
+    for path in paths:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        for case in data.get("cases", []):
+            if case.get("status") in ("SKIP", None):
+                continue
+            case_id = case.get("id")
+            declared.setdefault(case_id, set()).add(
+                str(case.get("assertion_sha256") or "")
+            )
+    return declared
+
+
+def assertion_digests(path: Path = CATALOG_PATH) -> Dict[str, str]:
+    """The assertion digest every catalog case carries, for the run that reports it."""
+    return {
+        str(case["id"]): str(case["assertion_sha256"])
+        for case in load_catalog(path).get("cases", [])
+        if case.get("id") and case.get("assertion_sha256")
+    }
 
 
 def divergence_guard(
@@ -796,6 +2760,37 @@ def divergence_guard(
             errors.append(f"Live run executed an unknown case: {case_id}")
         elif case.get("state") == "live-parity" and case_id not in podman_executed:
             errors.append(f"live-parity case was not executed by the Podman suite: {case_id}")
+
+    # An id proves the case ran, not what it ran. A result that names a catalog
+    # case without the digest of the sentence it asserted cannot be compared, so
+    # it is refused rather than read as agreement with the other suite.
+    declared_by_suite = {
+        "Podman": executed_assertions_from_results(podman_results),
+        "Live": executed_assertions_from_results(live_results),
+    }
+    for suite, declared in declared_by_suite.items():
+        for case_id, digests in declared.items():
+            case = by_id.get(case_id)
+            if case is None or not case.get("assertion_sha256"):
+                continue
+            if "" in digests:
+                errors.append(
+                    f"{case_id}: the {suite} result records no assertion text, so the case "
+                    "cannot be compared with the other suite"
+                )
+            if digests - {""} and digests - {""} != {str(case["assertion_sha256"])}:
+                errors.append(
+                    f"{case_id}: the {suite} result asserts text the catalog does not carry"
+                )
+    podman_declared = declared_by_suite["Podman"]
+    live_declared = declared_by_suite["Live"]
+    for case_id in sorted(set(podman_declared) & set(live_declared)):
+        podman_text = podman_declared[case_id] - {""}
+        live_text = live_declared[case_id] - {""}
+        if podman_text and live_text and podman_text != live_text:
+            errors.append(
+                f"{case_id}: the live result and the Podman result assert different text"
+            )
     return errors
 
 
@@ -827,6 +2822,31 @@ def render_parity(catalog: Dict[str, Any]) -> str:
         lines.append(
             f"| {requirement} | {total} | {counts['container']} | {counts['partial']} | {counts['live-only']} |"
         )
+    lines.extend([
+        "",
+        "## Scenario inventory",
+        "",
+        "One row per live scenario: the catalog case that covers it, the environment",
+        "classification `tests/cases/scenarios.yaml` states, and the gate tier that",
+        "blocks on the case. A scenario missing from this table has no case, and",
+        "`python3 -m tools.podman_e2e.catalog check` refuses that before the table can",
+        "be published.",
+        "",
+        "| Case | Environment | Gate | Live scenario | Requirement |",
+        "|---|---|---|---|---|",
+    ])
+    for case in catalog["cases"]:
+        if not case.get("live_scenario"):
+            continue
+        lines.append(
+            "| {id} | {environment} | {gate} | {scenario} | {requirement} |".format(
+                id=case.get("id"),
+                environment=case.get("environment"),
+                gate=case.get("gate"),
+                scenario=str(case.get("live_scenario") or "").replace("|", "\\|"),
+                requirement=str(case.get("requirement") or "").replace("|", "\\|"),
+            )
+        )
     lines.extend(["", "## Partial splits", ""])
     for case in catalog["cases"]:
         if case.get("environment") == "partial":
@@ -843,12 +2863,53 @@ def render_parity(catalog: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def parity_audit(catalog: Dict[str, Any], parity_path: Path = PARITY_PATH) -> List[str]:
+    """The published inventory covers every live scenario and is the catalog's own text.
+
+    A stale render is a claim about a catalog that no longer exists, so it is
+    refused here rather than read as documentation.
+    """
+    errors: List[str] = []
+    seen: Set[str] = set()
+    for case in catalog.get("cases", []):
+        if not case.get("live_scenario"):
+            continue
+        case_id = str(case.get("id") or "")
+        if not case_id:
+            errors.append("Live scenario has no case id in the parity inventory")
+            continue
+        if case_id in seen:
+            errors.append(f"Parity inventory names case {case_id} twice")
+        seen.add(case_id)
+        if case.get("environment") not in ENVIRONMENTS:
+            errors.append(
+                f"{case_id}: parity row states environment {case.get('environment')!r}"
+            )
+        if not case.get("gate"):
+            errors.append(f"{case_id}: parity row states no gate")
+    parity_path = Path(parity_path)
+    if not parity_path.exists():
+        return errors + [f"Parity inventory is missing: {_display(parity_path)}"]
+    expected = render_parity(catalog)
+    if parity_path.read_text(encoding="utf-8") != expected:
+        errors.append(
+            f"{_display(parity_path)} is not what the catalog renders to: run "
+            "`python3 -m tools.podman_e2e.catalog generate` and commit the result"
+        )
+    return errors
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("generate", help="Regenerate catalog.yaml and PARITY.md from the live spec")
-    sub.add_parser("check", help="Validate catalog parity, counts, and coverage")
+    sub.add_parser("check", help="Validate catalog parity, counts, coverage, and the rendered inventory")
     sub.add_parser("gaps", help="List cases without an implemented driver")
+    behaviors = sub.add_parser("behaviors", help="Render the checked-in behaviour inventory")
+    behaviors.add_argument(
+        "--write", action="store_true",
+        help=f"write {_display(BEHAVIOR_REPORT_PATH)} instead of printing it",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "generate":
@@ -862,11 +2923,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         catalog = load_catalog()
         errors = validate_catalog(catalog)
         errors.extend(coverage_audit(catalog))
+        errors.extend(report_problems(catalog))
         if errors:
             for error in errors:
                 print(f"ERROR: {error}", file=sys.stderr)
             return 1
         print("CATALOG: PASS")
+        return 0
+
+    if args.command == "behaviors":
+        catalog = load_catalog()
+        inventory = load_behaviors()
+        if not args.write:
+            print(render_behaviors(catalog, inventory), end="")
+            return 0
+        BEHAVIOR_REPORT_PATH.write_text(render_behaviors(catalog, inventory), encoding="utf-8")
+        print(f"Wrote {_display(BEHAVIOR_REPORT_PATH)}")
         return 0
 
     if args.command == "gaps":

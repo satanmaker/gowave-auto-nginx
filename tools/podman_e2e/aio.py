@@ -14,22 +14,78 @@ product code on it.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from . import acme_fixture, client_trust, matrix, panel_surface, topology
+from . import (
+    acme_fixture,
+    acme_mode,
+    budget,
+    client_image,
+    client_trust,
+    diagnostics,
+    environment_gate,
+    hook_ownership,
+    ingress,
+    matrix,
+    operator_access,
+    ownership,
+    firewall_image,
+    gate_tiers,
+    mutation_baseline,
+    negative_journal,
+    negative_matrix,
+    ownership_targets,
+    package_residual,
+    panel_surface,
+    preflight_cases,
+    revocation,
+    rollback_sides,
+    runstate_cases,
+    signal_compensation,
+    skip_policy,
+    staging_trust,
+    status,
+    teardown,
+    tls_anchors,
+    topology,
+    transaction_recovery,
+    traffic_probe,
+    trust_bundle,
+    worker_journal,
+    # ``cases()`` takes a ``vision`` boolean, so the module is imported under a
+    # name the parameter cannot shadow.
+    vision as vision_policy,
+    hosts_block,
+)
 from .podman import wait_until
-from .runner import Case, CaseBlocked, require
+from .runner import (
+    Case, CaseBlocked, CaseIncomplete, CaseTimeout, PASS, CaseResult, redaction_audit, require,
+)
+# One version rule for both contours: the live runner interrogates the same three
+# binaries over SSH, and a second copy would let the two disagree about what a
+# pin means.
+from tools.live_vps.versions import output_matches_expected_version, version_token
+# The redaction contract is one filter, so both contours register into the same
+# registry: a secret the case registered is redacted from every artifact the run
+# writes afterwards, wherever it was written.
+from tools.live_vps.redaction import register_secret
 
 INSTALL_CASE_ID = "AIO-INSTALL"
 
 # The real install downloads releases, resolves packages, and issues three
 # certificates; the ceiling is a hang guard, not an expectation.
 INSTALL_TIMEOUT_SECONDS = 5400
+
+# The artifact cases drive the shipped shell helpers from this checkout instead
+# of from the container, so the verdict is about the file the release ships.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Mirrors get_required_packages in modules/os.sh. The harness keeps its own copy
 # so a case can never be satisfied by asking the product what it installed; a
@@ -61,6 +117,10 @@ UNITS: Sequence[str] = (
 )
 
 CREDENTIALS_FILE = "/root/gowave-credentials.txt"
+UPDATE_UNIT = "/etc/systemd/system/gowave-update.service"
+UPDATE_PATH_UNIT = "/etc/systemd/system/gowave-update.path"
+UPDATE_RUNTIME_DIR = "/run/gowave"
+UNPRIVILEGED_DROPIN = "/etc/systemd/system/gowave.service.d/90-unprivileged.conf"
 LETSENCRYPT_ROOT = "/etc/letsencrypt/live"
 LOOPBACK_PANEL = "http://127.0.0.1:3000"
 PUBLIC_PANEL = f"https://{topology.PANEL_DOMAIN}"
@@ -68,6 +128,29 @@ PANEL_DOMAIN = topology.PANEL_DOMAIN
 REALITY_DOMAIN = topology.REALITY_DOMAIN
 PANEL_SURFACE_SCRIPT = "/repo/tools/podman_e2e/panel_surface.py"
 SUBSCRIPTION_PROBE_SCRIPT = topology.SUBSCRIPTION_PROBE_SCRIPT
+# The Panel's own gate, read from the four credentials it must refuse. The case
+# is the same question on both contours — a Master serves the Panel — so the
+# Multi-Node suite registers this same id against its Master product.
+AUTH_NEGATIVE_CASE_ID = "AIO-AUTH-NEG"
+# The controller's own Panel client, driven over the Panel's public name. The
+# bound is deliberately a value neither the client nor the parser defaults to,
+# so "the client used API_TIMEOUT" is a measurement rather than a coincidence.
+PANEL_API_CLIENT_CASE_ID = "APIC-01"
+PANEL_API_CLIENT_TIMEOUT_SECONDS = 7
+# The two halves of the redaction contract. Both ask a question about the
+# harness rather than about the product, so both are answerable wherever the
+# product ran: the credentials file exists on every role the installer touched,
+# and the diagnostic bundle reads whichever containers the run owns.
+REDACTION_CASE_ID = "RED-01"
+DIAGNOSTICS_CASE_ID = "RED-02"
+# The bundle's own budget is 90 s; the case's deadline is what a wedged host
+# costs on top of it, so a probe that hangs is reported inside the bundle rather
+# than as a case that never finished.
+DIAGNOSTICS_TIMEOUT_SECONDS = 300
+# The fields the credentials file names. The installer writes the two secrets
+# and the scoped token; the case withholds every value and keeps the names.
+CREDENTIAL_FIELDS = ("ADMIN_USERNAME", "ADMIN_PASSWORD", "SCOPED_API_TOKEN")
+CREDENTIAL_SECRET_FIELDS = ("ADMIN_PASSWORD", "SCOPED_API_TOKEN")
 
 # What each YAML representation is expected to carry, per the shipped generators.
 # GenerateMihomo skips only kcp, so Mihomo receives one proxy per inbound.
@@ -81,6 +164,18 @@ CLASH_PROXY_TYPES: Sequence[str] = ("trojan",)
 # Every served representation the Panel exposes, and the client family that
 # consumes it. The order matches the documented representation inventory.
 REPRESENTATIONS: Sequence[str] = ("base64", "xray-json", "mihomo", "clash", "singbox")
+# The media type each representation is served with, as `panel_surface.media_type`
+# reduces it. The base64 list is text because a client imports it as text, and
+# both YAML dialects are `text/yaml` because that is the type the Panel's own
+# generators name; a representation served as something else would be handed to
+# the wrong importer.
+REPRESENTATION_MEDIA_TYPES = {
+    "base64": "text/plain",
+    "xray-json": "application/json",
+    "mihomo": "text/yaml",
+    "clash": "text/yaml",
+    "singbox": "application/json",
+}
 # Non-base64 representations are validated structurally; these two are loaded by
 # the real engine that consumes them.
 ENGINE_LOADED: Sequence[str] = ("base64", "xray-json", "mihomo", "clash")
@@ -103,6 +198,48 @@ TRAFFIC_TIMEOUT_SECONDS = 900
 # the deadline of the whole matrix.
 DATA_PLANE_TIMEOUT_SECONDS = 300
 
+# The three binaries the live runner interrogates on the Master, read here inside
+# the target through one command each. Separate commands matter: a single probe
+# that fell back from the core to the Node binary would report the Node's version
+# twice and prove nothing about the core it supervises.
+INSTALLED_VERSION_SCRIPT = r"""
+python3 - <<'PY'
+import json
+import os
+import subprocess
+
+COMPONENTS = (
+    ("panel", ("/opt/gowave/gowave-server",), (("--version",), ("version",))),
+    ("node", ("/opt/gowave-node/gowave-node", "/usr/local/bin/gowave-node"),
+     (("--version",), ("version",))),
+    ("xray_server", ("/opt/gowave-node/rw-core",), (("version",),)),
+)
+
+report = {}
+for component, binaries, attempts in COMPONENTS:
+    binary = next((path for path in binaries if os.path.exists(path)), "")
+    entry = {"binary": binary, "argv": "", "returncode": None, "stdout": "", "stderr": ""}
+    for suffix in attempts:
+        if not binary:
+            break
+        try:
+            result = subprocess.run((binary, *suffix), capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as error:
+            entry["stderr"] = str(error)
+            break
+        entry.update({
+            "argv": " ".join((binary, *suffix)),
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        })
+        if result.returncode == 0 and (result.stdout.strip() or result.stderr.strip()):
+            break
+    report[component] = entry
+print(json.dumps(report, sort_keys=True))
+PY
+"""
+
 # A restart of the product's own units is bounded by the same kind of deadline as
 # any other readiness wait; the interval is coarse because every poll is an exec.
 RESTART_TIMEOUT_SECONDS = 900
@@ -119,6 +256,14 @@ TUNNEL_READY_INTERVAL_SECONDS = 5
 # One warm-up attempt starts an engine per profile and sends one request through
 # each; it must not inherit the deadline of the whole matrix.
 TUNNEL_READY_ATTEMPT_TIMEOUT_SECONDS = 180
+# The positive matrix a revocation case runs before it revokes anything is a
+# precondition, not a verdict: the Panel re-pushes the node's users while the case
+# runs, and a transfer that loses that race comes back with no endpoint record at
+# all — the probe exits without facts instead of reporting a refusal. Re-running
+# it under this deadline leaves every assertion that follows untouched, and an
+# exhausted deadline still fails the case on its own message.
+REVOCATION_TRANSFER_TIMEOUT_SECONDS = 120
+REVOCATION_TRANSFER_INTERVAL_SECONDS = 5
 
 # The host resources a repeated install must neither duplicate nor rewrite. The
 # Nginx section carries a digest per file, so a regenerated-but-different config
@@ -249,6 +394,114 @@ if GOWAVE_ACME_TEST_MODE=0 \
     echo "letsencrypt_production=accepted"
 else
     echo "letsencrypt_production=refused"
+fi
+"""
+
+# The installer pin, asked directly instead of by running an install: the commit
+# has to be one 40-hex SHA, the digest one 64-hex SHA-256, the URL the pin derives
+# must name that commit rather than a branch, and the bytes on disk must match the
+# digest before they are executed. The last probe calls the real install path with
+# a scratch SCRIPT_DIR, because this workstation bind-mounts /repo into the
+# container and the bundled installer there would otherwise answer for the pinned
+# branch the live runner takes.
+INSTALLER_PIN_SCRIPT = r"""
+source /repo/modules/node.sh
+# node.sh enables errexit; every probe below is a negative that has to be allowed
+# to fail, so each one is guarded instead of aborting the script.
+set +e
+pin_commit=0123456789abcdef0123456789abcdef01234567
+zero_digest=$(printf '%064d' 1)
+if GOWAVE_NODE_INSTALLER_COMMIT=main GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "floating_commit=accepted"
+else
+    echo "floating_commit=refused"
+fi
+if GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" GOWAVE_NODE_INSTALLER_SHA256= \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "missing_digest=accepted"
+else
+    echo "missing_digest=refused"
+fi
+if GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" \
+    GOWAVE_NODE_INSTALLER_SHA256="$pin_commit" \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "short_digest=accepted"
+else
+    echo "short_digest=refused"
+fi
+if GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" \
+    GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "pinned_pair=accepted"
+else
+    echo "pinned_pair=refused"
+fi
+url=$(GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" pinned_node_installer_url)
+if [[ "$url" == *"/$pin_commit/install.sh" ]]; then
+    echo "url_names_commit=yes"
+else
+    echo "url_names_commit=no"
+fi
+installer=$(mktemp)
+printf 'probe installer bytes\n' > "$installer"
+matching_sha=$(sha256sum "$installer" | awk '{print $1}')
+if GOWAVE_NODE_INSTALLER_SHA256="$matching_sha" \
+    verify_node_installer_digest "$installer" >/dev/null 2>&1; then
+    echo "matching_bytes=accepted"
+else
+    echo "matching_bytes=refused"
+fi
+if GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    verify_node_installer_digest "$installer" >/dev/null 2>&1; then
+    echo "mismatched_bytes=accepted"
+else
+    echo "mismatched_bytes=refused"
+fi
+rm -f "$installer"
+scratch=$(mktemp -d)
+if [[ -f "$scratch/sources/gowave-node/install.sh" ]]; then
+    echo "scratch_carries_bundle=yes"
+else
+    echo "scratch_carries_bundle=no"
+fi
+node_bin=/opt/gowave-node/gowave-node
+[[ -x "$node_bin" ]] || node_bin=/usr/local/bin/gowave-node
+if [[ -x "$node_bin" ]]; then
+    echo "node_binary_present=yes"
+else
+    echo "node_binary_present=no"
+fi
+unit=$(systemctl show -p FragmentPath --value gowave-node.service 2>/dev/null)
+[[ -n "$unit" && -f "$unit" ]] || unit=/etc/systemd/system/gowave-node.service
+node_before=$(sha256sum "$node_bin" 2>/dev/null | awk '{print $1}')
+unit_before=$(sha256sum "$unit" 2>/dev/null | awk '{print $1}')
+saved_script_dir="$SCRIPT_DIR"
+SCRIPT_DIR="$scratch"
+refusal=$(GOWAVE_NODE_REQUIRE_PINNED_INSTALLER=1 \
+    GOWAVE_NODE_INSTALLER_COMMIT=main GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    install_local_node not-a-credential 3002 2>&1 >/dev/null)
+rc=$?
+SCRIPT_DIR="$saved_script_dir"
+node_after=$(sha256sum "$node_bin" 2>/dev/null | awk '{print $1}')
+unit_after=$(sha256sum "$unit" 2>/dev/null | awk '{print $1}')
+rm -rf "$scratch"
+if (( rc != 0 )); then
+    echo "install_refused=yes"
+else
+    echo "install_refused=no"
+fi
+if [[ "$refusal" == *"40-character hex commit SHA"* ]]; then
+    echo "refusal_names_pin=yes"
+else
+    echo "refusal_names_pin=no"
+fi
+printf 'refusal_text=%s\n' \
+    "$(printf '%s' "$refusal" | tr -s '[:space:]' '-' | cut -c1-160)"
+if [[ "$node_before" == "$node_after" && "$unit_before" == "$unit_after" ]]; then
+    echo "installer_untouched=yes"
+else
+    echo "installer_untouched=no"
 fi
 """
 
@@ -534,6 +787,11 @@ ARCHIVE_DIR = "ARCHIVE_DIR_PLACEHOLDER"
 LINEAGE_DIR = "LINEAGE_DIR_PLACEHOLDER"
 RELOAD_WAIT_SECONDS = RELOAD_WAIT_PLACEHOLDER
 RENEWAL_TIMEOUT_SECONDS = RENEWAL_TIMEOUT_PLACEHOLDER
+# How many times a renewal that produced a certificate without performing a
+# challenge is asked again. Each attempt reuses the fixture's own randomness, so
+# the chance of exhausting them is the fixture's reuse rate cubed: one in a
+# million at Pebble's floor of one in a hundred.
+RENEWAL_ATTEMPTS = 3
 
 
 def run(argv, timeout=90, env=None):
@@ -716,13 +974,26 @@ def wait_for_new_workers(before_pids):
     return state, round(time.monotonic() - started, 2)
 
 
-def renewal_log():
+def renewal_log(directory):
     try:
-        with open(os.path.join(LOG_DIR, "letsencrypt.log"), encoding="utf-8",
+        with open(os.path.join(directory, "letsencrypt.log"), encoding="utf-8",
                   errors="replace") as handle:
             return handle.read()[-20000:]
     except OSError:
         return ""
+
+
+def challenged(result, log_text):
+    # A CA may answer a new order with an authorization it already holds, and then
+    # Certbot finalizes the order without performing any challenge: the renewal
+    # succeeds and the route this phase exists to exercise was never used. Pebble
+    # cannot be told not to: PEBBLE_AUTHZREUSE=0 still reuses one order in a
+    # hundred, because it compares rand.Intn(100) > percent. The fixture is the
+    # unreliable part here — the product is asked the same question either way — so
+    # an attempt that came back with a certificate but no challenge is retried,
+    # while an attempt that failed is not (a refusal must stay a refusal).
+    transcript = "\n".join([result["stdout"] or "", result["stderr"] or "", log_text])
+    return ("http-01 challenge for %s" % DOMAIN) in transcript
 
 
 report = {
@@ -744,12 +1015,30 @@ if MODE == "renew":
         # renewal has to be handed the anchor the install was handed.
         environment["REQUESTS_CA_BUNDLE"] = CA_FILE
         environment["SSL_CERT_FILE"] = CA_FILE
+    # The deadline covers every attempt, so a retry can never turn one hang guard
+    # into three: each attempt gets what is left of the phase.
+    deadline = time.monotonic() + RENEWAL_TIMEOUT_SECONDS
     started = time.monotonic()
-    renewal = run(
-        ("certbot", "renew", "--cert-name", DOMAIN, "--force-renewal",
-         "--non-interactive", "--no-random-sleep-on-renew", "--logs-dir", LOG_DIR),
-        timeout=RENEWAL_TIMEOUT_SECONDS, env=environment,
-    )
+    attempts = []
+    renewal, log_text = None, ""
+    for attempt in range(1, RENEWAL_ATTEMPTS + 1):
+        attempt_dir = "%s-%d" % (LOG_DIR, attempt)
+        renewal = run(
+            ("certbot", "renew", "--cert-name", DOMAIN, "--force-renewal",
+             "--non-interactive", "--no-random-sleep-on-renew", "--logs-dir", attempt_dir),
+            timeout=max(1, int(deadline - time.monotonic())), env=environment,
+        )
+        log_text = renewal_log(attempt_dir)
+        performed = challenged(renewal, log_text)
+        attempts.append({
+            "attempt": attempt,
+            "returncode": renewal["returncode"],
+            "challenged": performed,
+        })
+        # A failed attempt is the answer when an outage is installed, so only the
+        # silent one — success with no challenge — is worth asking again.
+        if renewal["returncode"] != 0 or performed:
+            break
     elapsed = round(time.monotonic() - started, 2)
     after_hook, waited = wait_for_new_workers(report["service"]["worker_pids"])
     report.update({
@@ -759,8 +1048,9 @@ if MODE == "renew":
             "stderr": (renewal["stderr"] or "").strip()[-3000:],
             "tail": tail(renewal, 3000),
             "duration_seconds": elapsed,
+            "attempts": attempts,
         },
-        "certbot_log": renewal_log(),
+        "certbot_log": log_text,
         "live_after": live(),
         "archive_after": archive(),
         "service_after": after_hook,
@@ -789,6 +1079,37 @@ def acme_renewal_script(
         .replace("RELOAD_WAIT_PLACEHOLDER", str(int(reload_wait)))
         .replace("RENEWAL_TIMEOUT_PLACEHOLDER", str(int(ACME_RENEWAL_TIMEOUT_SECONDS)))
     )
+
+
+# The /etc/hosts rewrite the ACME fixture uses: the probe keeps the directory
+# unreachable. A container's /etc/hosts is a bind mount, so the file is rewritten
+# in place — renaming a file over it would leave the mount pointing at a deleted
+# inode and the next process would read the host's view instead of this one's.
+# This one stays python because it runs after the install, when the product has
+# already supplied python3; the pinned-core block runs before it and speaks shell
+# for the same reason it exists.
+HOSTS_REWRITE_HELPERS = '''def hosts_lines():
+    try:
+        with open(HOSTS, encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except OSError:
+        return []
+
+
+def write_hosts(lines):
+    with open(HOSTS, "w", encoding="utf-8") as handle:
+        handle.write("\\n".join(lines) + "\\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def set_host_entry(host, address, marker):
+    """Install one entry, or drop this marker's own line when address is empty."""
+    lines = [line for line in hosts_lines() if marker not in line]
+    if address:
+        lines.append("%s %s  # %s" % (address, host, marker))
+    write_hosts(lines)
+'''
 
 
 ACME_OUTAGE_SCRIPT = r"""python3 - MODE_PLACEHOLDER WEBROOT_PLACEHOLDER PRIOR_OCTAL_PLACEHOLDER HOST_PLACEHOLDER MARKER_PLACEHOLDER HOSTS_PLACEHOLDER <<'PY'
@@ -823,32 +1144,16 @@ def resolution():
     return (run(("getent", "hosts", HOST))["stdout"] or "").strip()
 
 
-def hosts_lines():
-    try:
-        with open(HOSTS, encoding="utf-8") as handle:
-            return handle.read().splitlines()
-    except OSError:
-        return []
-
-
-def write_hosts(lines):
-    # /etc/hosts is a bind mount inside the container, so it is rewritten in
-    # place: renaming a file over it would leave the mount pointing at a deleted
-    # inode and the next process reading the host's view instead of this one's.
-    with open(HOSTS, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+HOSTS_HELPERS_PLACEHOLDER
 
 
 def blackhole():
-    write_hosts([line for line in hosts_lines() if MARKER not in line]
-                + ["127.0.0.1 %s  # %s" % (HOST, MARKER)])
+    set_host_entry(HOST, "127.0.0.1", MARKER)
     return resolution()
 
 
 def unblackhole():
-    write_hosts([line for line in hosts_lines() if MARKER not in line])
+    set_host_entry(HOST, "", MARKER)
     return resolution()
 
 
@@ -891,7 +1196,29 @@ def acme_outage_script(
         .replace("HOST_PLACEHOLDER", acme_fixture.FIXTURE_HOST)
         .replace("MARKER_PLACEHOLDER", ACME_BLACKHOLE_MARKER)
         .replace("HOSTS_PLACEHOLDER", shlex.quote(hosts_file))
+        .replace("HOSTS_HELPERS_PLACEHOLDER", HOSTS_REWRITE_HELPERS)
     )
+
+
+# The name and the address the pinned-core proofs block. ``api.github.com`` is the
+# release API the upstream installer spends to buy a core that the pin supplies;
+# The line the step prints when it placed the core, matched against the install's
+# own output so the run quotes what the step verified instead of inferring it.
+PINNED_CORE_STEP_PATTERN = re.compile(
+    r"Installed pinned Xray core (?P<version>\S+) from (?P<url>\S+)"
+    r" \(SHA-256 (?P<digest>[0-9a-f]{64})\)"
+)
+
+# The hosts block constants and functions are now in hosts_block.py; import them
+# from there so both AIO and Multi-Node use the same implementation.
+from .hosts_block import (
+    PINNED_CORE_BLOCKED_HOST,
+    PINNED_CORE_BLOCK_ADDRESS,
+    PINNED_CORE_BLOCK_MARKER,
+    hosts_block_script,
+    hosts_block_facts,
+    require_host_blocked,
+)
 
 
 TLS_CASE_ID = "TLS-01"
@@ -899,6 +1226,9 @@ TLS_CASE_ID = "TLS-01"
 # configuration read; the ceiling is a hang guard, not an expectation.
 TLS_PROBE_TIMEOUT_SECONDS = 60
 TLS_TIMEOUT_SECONDS = 300
+# Six short legs over the local listener plus one key generation; the ceiling
+# guards a stalled openssl, not the expected cost.
+TLS_CA_TIMEOUT_SECONDS = 300
 # The versions the product documents for its HTTPS vhosts. A role that inherits
 # a platform default instead would accept whatever the distribution shipped,
 # which is exactly the difference an independent client cannot see on its own.
@@ -906,6 +1236,43 @@ TLS_POLICY_PROTOCOLS = ("TLSv1.2", "TLSv1.3")
 # A certificate with less headroom than this has no time left for the renewal
 # that is supposed to replace it.
 TLS_MINIMUM_REMAINING_SECONDS = 86400
+
+TLS_CA_CASE_ID = "AIO-02"
+TLS_CA_PROBE_DIR = "/run/gowave-e2e-tls-ca"
+TLS_CA_PROBE_SCRIPT = TLS_CA_PROBE_DIR + "/verify_public_tls_sni.sh"
+TLS_CA_PROBE_BODY = TLS_CA_PROBE_DIR + "/probe-body.sh"
+TLS_CA_FOREIGN_ROOT = TLS_CA_PROBE_DIR + "/foreign-root.pem"
+TLS_CA_FOREIGN_KEY = TLS_CA_PROBE_DIR + "/foreign-root.key"
+TLS_CA_SYMLINK = TLS_CA_PROBE_DIR + "/linked-root.pem"
+TLS_CA_ATTEMPTS = 3
+# The probe's own words for a bundle it will not read, so a failure leg can say
+# why it failed instead of only that it did.
+TLS_CA_REFUSAL = "GOWAVE_TLS_CA_FILE must be a readable regular file, not a symlink"
+# OpenSSL's ways of saying "this chain does not end in a root you gave me".
+TLS_CA_FAILURE_MARKERS = (
+    "unable to get local issuer certificate",
+    "self-signed certificate",
+    "certificate verify failed",
+)
+# The probe is lifted out of the installer the install actually ran, so the case
+# judges the shipped function rather than a copy of its logic. `/repo` is the
+# same tree, mounted read-only; the slice stops where the entrypoint's next
+# function starts, and the last two greps report that it did.
+TLS_CA_PROBE_SETUP = r"""set -Eeuo pipefail
+mkdir -p -m 0700 PROBE_DIR_PLACEHOLDER
+rm -f SCRIPT_PLACEHOLDER BODY_PLACEHOLDER FOREIGN_ROOT_PLACEHOLDER FOREIGN_KEY_PLACEHOLDER
+sed -n '/^verify_public_tls_sni() {$/,/^acquire_lock() {$/p' /repo/gowave-auto.sh \
+    | head -n -1 > BODY_PLACEHOLDER
+{
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nsource /repo/modules/tempdir.sh\n'
+    cat BODY_PLACEHOLDER
+} > SCRIPT_PLACEHOLDER
+rm -f BODY_PLACEHOLDER
+chmod 0700 SCRIPT_PLACEHOLDER
+sha256sum /repo/gowave-auto.sh | cut -d' ' -f1
+grep -c '^verify_public_tls_sni() {$' SCRIPT_PLACEHOLDER || true
+grep -c '^acquire_lock() {$' SCRIPT_PLACEHOLDER || true
+"""
 
 TLS_POLICY_SCRIPT = r"""python3 - DOMAIN_PLACEHOLDER <<'PY'
 import glob
@@ -1228,6 +1595,27 @@ def probe_json(case_id: str, label: str, result: Any) -> Dict[str, Any]:
         return {}
 
 
+def hosts_block_facts(
+    podman: Any, container: str, case_id: str, mode: str = "install",
+    role: str = "", host: str = PINNED_CORE_BLOCKED_HOST,
+    address: str = PINNED_CORE_BLOCK_ADDRESS, timeout: int = 120,
+) -> Dict[str, Any]:
+    """Apply or remove the block in one container and report what the name answers.
+
+    The report comes from inside the container, so it describes the resolution and
+    the request that this host makes rather than the ones the harness can make.
+    """
+    result = podman.exec_bash(
+        container, hosts_block_script(mode, host, address), check=False, timeout=timeout,
+    )
+    return probe_json(
+        case_id, f"the {role or container} hosts entry for {host} ({mode})", result,
+    )
+
+
+from .hosts_block import pinned_core_digests
+
+
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
 
@@ -1258,6 +1646,15 @@ class AioProduct:
         self._subscriptions: Optional[Dict[str, Any]] = None
         self._subscription_error = ""
         self.subscription_inbounds_override: Optional[List[Dict[str, Any]]] = None
+        # Read once by the install case and compared again by every data-plane
+        # tuple: the core a client ran must be the core the node deployed.
+        self._installed_versions: Optional[Dict[str, Any]] = None
+        self.server_core_version = ""
+
+    @property
+    def repo(self) -> Path:
+        """The checkout the host-side cases source their shell helpers from."""
+        return REPO_ROOT
 
     @property
     def inbound_count(self) -> int:
@@ -1308,6 +1705,13 @@ class AioProduct:
             )
             host.create()
         self.host = host
+        # The block goes on before the install: with the release API answered by
+        # nothing, a core the step failed to place cannot be covered by the
+        # installer's own download, which is the only thing this case can see.
+        core_block = require_host_blocked(
+            self.install_case_id, "the installed host",
+            hosts_block_facts(self.podman, host.target_name, self.install_case_id),
+        )
         self.outcome = host.install()
         require(
             self.install_case_id,
@@ -1315,7 +1719,58 @@ class AioProduct:
             f"the operator full install failed with exit {self.outcome.returncode}:\n"
             f"{self.outcome.tail(6000)}",
         )
-        return host.evidence(self.outcome)
+        record = host.evidence(self.outcome)
+        record["core_host_block"] = core_block
+        # The install is not complete until the binaries it deployed are asked
+        # what they are: a host that answers health checks while running a version
+        # nobody configured is the failure this case exists to report.
+        record.update(self.require_configured_versions())
+        # The step's own account of what it placed, quoted beside the core the
+        # container reports: one is what the installer verified, the other is
+        # what the file is now.
+        record.update(self.pinned_core_step())
+        return record
+
+    def pinned_core_step(self) -> Dict[str, Any]:
+        """The pinned-core step's success line, read from the install's output.
+
+        The step names the version and the archive digest it verified, so the run
+        can quote the verification instead of inferring it from a file that is
+        there afterwards. Exactly one line is expected: a second would mean the
+        step ran twice on one install.
+        """
+        stdout = self.outcome.stdout if self.outcome is not None else ""
+        matched = [
+            (line.strip(), PINNED_CORE_STEP_PATTERN.search(line))
+            for line in stdout.splitlines()
+            if PINNED_CORE_STEP_PATTERN.search(line)
+        ]
+        require(
+            self.install_case_id,
+            len(matched) == 1,
+            f"the install printed {len(matched)} pinned-core success lines instead of one "
+            f"for the core it placed",
+        )
+        line, match = matched[0]
+        expected = matrix.product(self.matrix).get("xray_version", "")
+        require(
+            self.install_case_id,
+            match.group("version") == expected,
+            f"the pinned-core step installed {match.group('version')!r} while this "
+            f"deployment configured {expected!r}",
+        )
+        require(
+            self.install_case_id,
+            match.group("digest") in pinned_core_digests(),
+            f"the pinned-core step verified {match.group('digest')} which is not an archive "
+            "digest this checkout pins",
+        )
+        return {
+            "pinned_core_step_line": line,
+            "pinned_core_step_version": match.group("version"),
+            "pinned_core_step_artifact": match.group("url"),
+            "pinned_core_step_sha256": match.group("digest"),
+        }
 
     def reinstall(self, case_id: str) -> Dict[str, Any]:
         """Run the operator's install command a second time against the same host.
@@ -1352,6 +1807,122 @@ class AioProduct:
             )
         return self.host
 
+    # ---------------------------------------------------------------- versions
+    def installed_versions(self) -> Dict[str, Any]:
+        """What the three installed binaries say they are, read once per run.
+
+        The live runner asks the Master's Panel, its Node binary and the
+        Node-managed core; the same three are asked here, inside the target, so
+        the container contour compares the same components rather than trusting
+        the installer's own account of what it deployed.
+        """
+        if self._installed_versions is not None:
+            return self._installed_versions
+        host = self.require_installed()
+        proc = self.podman.exec_bash(
+            host.target_name, INSTALLED_VERSION_SCRIPT, check=False, timeout=180,
+        )
+        require(
+            self.install_case_id,
+            proc.returncode == 0,
+            f"the installed-version probe exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[-2000:]}",
+        )
+        report: Optional[Dict[str, Any]] = None
+        try:
+            candidate = json.loads(proc.stdout or "")
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict):
+            report = candidate
+        require(
+            self.install_case_id,
+            report is not None,
+            f"the installed-version probe printed no JSON object: {(proc.stdout or '')[:400]}",
+        )
+        self._installed_versions = report
+        return report
+
+    def require_configured_versions(self) -> Dict[str, str]:
+        """VER-01/VER-03: the installed binaries report the versions this deployment configured.
+
+        Three independent comparisons, because the live sentence is explicit that
+        a Node version is not evidence of the core it supervises: each component
+        is interrogated through its own binary, and a probe that answered for two
+        of them from one path is refused rather than counted twice.
+        """
+        report = self.installed_versions()
+        pins = matrix.product(self.matrix)
+        expectations = {
+            "panel": pins.get("panel_version", ""),
+            "node": pins.get("node_version", ""),
+            "xray_server": pins.get("xray_version", ""),
+        }
+        evidence: Dict[str, str] = {}
+        for component, expected in expectations.items():
+            facts = report.get(component) or {}
+            output = f"{facts.get('stdout') or ''}\n{facts.get('stderr') or ''}"
+            require(
+                self.install_case_id,
+                bool(facts.get("binary")),
+                f"the {component} binary is installed at no documented path, so its version "
+                "cannot be recorded",
+            )
+            require(
+                self.install_case_id,
+                facts.get("returncode") == 0 and bool(version_token(output)),
+                f"`{facts.get('argv') or component}` printed no version: {output.strip()[:300]!r}",
+            )
+            require(
+                self.install_case_id,
+                output_matches_expected_version(output, expected),
+                f"the installed {component} reports {output.strip()[:200]!r} while this "
+                f"deployment configured {expected!r}",
+            )
+            evidence[f"{component}_version"] = version_token(output)
+            evidence[f"{component}_version_expected"] = expected
+            evidence[f"{component}_version_binary"] = str(facts.get("binary") or "")
+        binaries = {
+            component: evidence[f"{component}_version_binary"] for component in expectations
+        }
+        require(
+            self.install_case_id,
+            len(set(binaries.values())) == len(binaries),
+            f"two components were interrogated through one binary: {binaries}",
+        )
+        self.server_core_version = evidence["xray_server_version"]
+        return evidence
+
+    def engine_version(self, case_id: str, client: str) -> Dict[str, str]:
+        """DP-03: the engine that carries a payload, as the client itself reports it.
+
+        The client image pins its artifacts by digest at build time; this reads
+        the version the installed binary prints at run time, so a tuple records
+        which core carried it rather than assuming the image still holds what the
+        matrix asked for.
+        """
+        engine = next(
+            (item for item in client_image.engine_list(self.matrix) if item["id"] == client),
+            None,
+        )
+        require(case_id, engine is not None, f"the matrix declares no client {client!r}")
+        host = self.require_installed()
+        proc = self.podman.exec(
+            host.engine_client(), [engine["binary"], engine["argument"]], check=False, timeout=60,
+        )
+        reported = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        require(
+            case_id,
+            proc.returncode == 0 and engine["contains"] in reported,
+            f"the {client} binary reports {reported[:200]!r} instead of the pinned "
+            f"{engine['contains']!r}",
+        )
+        return {
+            "engine_version": version_token(reported),
+            "engine_version_expected": engine["contains"],
+            "engine_binary": engine["binary"],
+        }
+
     # ------------------------------------------------------------------ probes
     def host_script(self, script: str, timeout: int = 120) -> Any:
         host = self.require_installed()
@@ -1361,17 +1932,30 @@ class AioProduct:
     def collect_subscriptions(self, case_id: str) -> Dict[str, Any]:
         """Fetch every representation once; the payloads stay on the host, 0600.
 
-        The subscription routes are loopback-only, so the host is the only place
-        that can read them. What comes back is a status, a media type, and a byte
+        The admin API is loopback-only, so the host is the only place that can
+        read a client's shortUuid and the bytes it is issued. The public edge is
+        read from the same host for the transport headers: ``/api/sub/`` is
+        proxied by the shipped vhost, and that vhost is what a client talks to,
+        so its ``Cache-Control`` is observable only over HTTPS on the panel
+        domain. What comes back is a status, a media type, a header, and a byte
         count per representation — never the payload itself.
         """
         if self._subscriptions is not None:
             return self._subscriptions
         if self._subscription_error:
             raise CaseBlocked(f"SUB-SERVED: {self._subscription_error}")
+        host = self.require_installed()
+        # The run CA is mounted into every role before the install starts, so the
+        # edge fetch verifies against the certificates the fixture directory
+        # issued and against nothing else.
+        ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+        arguments = [
+            f"--payload-dir {topology.PAYLOAD_MOUNT}",
+            f"--edge-base https://{host.panel_domain}",
+            f"--ca {ca_file}",
+        ]
         result = self.host_script(
-            f"python3 {PANEL_SURFACE_SCRIPT} --scope subscriptions "
-            f"--payload-dir {topology.PAYLOAD_MOUNT}"
+            f"python3 {PANEL_SURFACE_SCRIPT} --scope subscriptions " + " ".join(arguments)
         )
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
         if result.returncode != 0:
@@ -1432,6 +2016,37 @@ class AioProduct:
         """Run the policy probe: one permitted control, one destination the product denies."""
         host = self.require_installed()
         return self._probe_json(case_id, "the policy probe", host.prohibited_facts())
+
+    def bracket_request(
+        self, request: Any, inbound: Dict[str, Any], node: str = "",
+        window: int = ingress.CAPTURE_WINDOW_SECONDS,
+        *, intended: str = "", identity_port: int = ingress.IDENTITY_PORT,
+        probe_script: str = ingress.PROBE_SCRIPT, identity_engine: str = "",
+    ) -> ingress.Measurement:
+        """Run one request inside a capture on every host that could have taken it.
+
+        The capture is started from inside each host, so the account of which host
+        received the client's packets is the host's own rather than the vantage
+        point the request was sent from. ``request`` is called once, between the
+        captures being ready and being stopped.
+
+        The keyword arguments exist so a case can ask for the same bracket with one
+        fact deliberately unavailable, and see it come back as INCOMPLETE rather
+        than as a pass on whatever the other hosts still managed to count.
+        """
+        host = self.require_installed()
+        return ingress.measure(
+            request,
+            backend=host.ingress_backend(),
+            hosts=host.ingress_hosts(),
+            engine=host.ingress_engine(),
+            port=ingress.listener_port(inbound),
+            intended=intended or host.ingress_role(node),
+            window=window,
+            identity_port=identity_port,
+            probe_script=probe_script,
+            identity_engine=identity_engine,
+        )
 
     def _probe_json(self, case_id: str, label: str, result: Any) -> Dict[str, Any]:
         """A probe that exited non-zero or printed no JSON fails the case."""
@@ -1664,7 +2279,55 @@ def case_services(product: AioProduct) -> Dict[str, Any]:
             f"the local Node is not listening on 3002: {addresses}")
     require("AIO-04", any(addr.endswith(":443") and not addr.startswith("127.0.0.1") for addr in addresses),
             f"NGINX is not listening publicly on 443: {addresses}")
-    return {"units": states, "listeners": sorted(addresses)}
+
+    # The in-panel update helper is provisioned by the installer itself: a
+    # private runtime directory for the Panel, both units, an armed path unit,
+    # and no upstream sandbox drop-in until the first in-panel update runs.
+    helper_script = (
+        f"stat -c '%U %a' {UPDATE_RUNTIME_DIR} 2>/dev/null || echo 'runtime-dir missing'\n"
+        "echo ---\n"
+        f"test -f {UPDATE_UNIT} && echo present || echo missing\n"
+        f"test -f {UPDATE_PATH_UNIT} && echo present || echo missing\n"
+        "echo ---\n"
+        "systemctl is-enabled gowave-update.path 2>/dev/null || true\n"
+        "systemctl is-active gowave-update.path 2>/dev/null || true\n"
+        "echo ---\n"
+        f"test -e {UNPRIVILEGED_DROPIN} && echo present || echo absent"
+    )
+    helper = product.host_script(helper_script)
+    require("AIO-04", helper.returncode == 0, f"update helper probe failed: {helper.stderr.strip()}")
+    helper_parts = (helper.stdout or "").split("---")
+    require("AIO-04", len(helper_parts) == 4, f"update helper probe was truncated: {helper.stdout!r}")
+    runtime_stat, unit_stat, state_stat, dropin_stat = (part.strip() for part in helper_parts)
+
+    runtime_owner, _, runtime_mode = runtime_stat.partition(" ")
+    require("AIO-04", runtime_owner == "gowave",
+            f"{UPDATE_RUNTIME_DIR} is not owned by the service account: {runtime_stat!r}")
+    require("AIO-04", runtime_mode == "700",
+            f"{UPDATE_RUNTIME_DIR} mode is {runtime_mode!r}, expected 700")
+    unit_states = unit_stat.splitlines()
+    require("AIO-04", unit_states.count("present") == 2,
+            f"update helper units are missing: {unit_states}")
+    path_states = state_stat.splitlines()
+    require("AIO-04", path_states[:1] == ["enabled"],
+            f"gowave-update.path is not enabled: {path_states}")
+    require("AIO-04", path_states[1:2] == ["active"],
+            f"gowave-update.path is not active: {path_states}")
+    require("AIO-04", dropin_stat == "absent",
+            f"the installation created {UNPRIVILEGED_DROPIN}")
+
+    return {
+        "units": states,
+        "listeners": sorted(addresses),
+        "update_helper": {
+            "runtime_owner": runtime_owner,
+            "runtime_mode": runtime_mode,
+            "units": unit_states,
+            "path_enabled": path_states[:1],
+            "path_active": path_states[1:2],
+            "unprivileged_dropin": dropin_stat,
+        },
+    }
 
 
 def case_panel_ready(product: AioProduct) -> Dict[str, Any]:
@@ -1768,6 +2431,144 @@ def case_tls_and_identity(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def case_tls_ca_bundle(product: AioProduct) -> Dict[str, Any]:
+    """AIO-02: the install's TLS/SNI probe trusts the per-run bundle and nothing else.
+
+    The assertion is about the decision the *installer* made, so the probe under
+    test is the product's own function, sliced at run time out of the
+    `gowave-auto.sh` the install dispatched (`/repo` is the same tree, mounted
+    read-only) rather than re-implemented here. Five legs then ask what decides
+    that decision: the fixture root succeeds, a foreign root does not, an absent
+    path and a symlink are refused before any handshake, the same probe with the
+    bundle removed from its environment rejects the served lineage (so the
+    per-run root was supplied per run and not installed where the host trusts it
+    globally), and the probe leaves nothing behind.
+    """
+    host = product.require_installed()
+    domain = host.panel_domain
+    ca_file = f"{topology.CA_MOUNT}/{topology.ISSUED_ROOT_NAME}"
+    setup = (
+        TLS_CA_PROBE_SETUP
+        .replace("PROBE_DIR_PLACEHOLDER", TLS_CA_PROBE_DIR)
+        .replace("BODY_PLACEHOLDER", TLS_CA_PROBE_BODY)
+        .replace("SCRIPT_PLACEHOLDER", TLS_CA_PROBE_SCRIPT)
+        .replace("FOREIGN_ROOT_PLACEHOLDER", TLS_CA_FOREIGN_ROOT)
+        .replace("FOREIGN_KEY_PLACEHOLDER", TLS_CA_FOREIGN_KEY)
+    )
+    prepared = product.host_script(setup)
+    detail = (prepared.stderr or prepared.stdout or "").strip()[-2000:]
+    require(TLS_CA_CASE_ID, prepared.returncode == 0,
+            f"the probe could not be sliced out of the installer: {detail}")
+    lines = (prepared.stdout or "").split()
+    digest = lines[0] if lines else ""
+    functions = lines[1] if len(lines) > 1 else ""
+    stray = lines[2] if len(lines) > 2 else ""
+    require(TLS_CA_CASE_ID, len(digest) == 64, f"the installer's digest was not read: {lines}")
+    require(TLS_CA_CASE_ID, functions == "1",
+            f"the slice carries {functions} definitions of verify_public_tls_sni, not one")
+    # The slice ends at the next function: a stray `acquire_lock` body would mean
+    # the markers moved and the probe under test is not the installer's.
+    require(TLS_CA_CASE_ID, stray in ("", "0"), f"the slice ran past its end ({stray})")
+    try:
+        foreign = product.host_script(
+            "openssl req -x509 -newkey rsa:2048 -nodes -days 2 "
+            "-subj /CN=gowave-e2e-foreign-root "
+            f"-keyout {TLS_CA_FOREIGN_KEY} -out {TLS_CA_FOREIGN_ROOT} 2>/dev/null && "
+            f"sha256sum {TLS_CA_FOREIGN_ROOT}"
+        )
+        require(TLS_CA_CASE_ID, foreign.returncode == 0,
+                "a foreign root could not be created: "
+                f"{(foreign.stderr or foreign.stdout or '').strip()[-500:]}")
+
+        anchor = _tls_ca_leg(product, domain, ca_file)
+        require(TLS_CA_CASE_ID, anchor["status"] == 0,
+                "the install's probe rejected the per-run bundle: "
+                f"{anchor['output'][-600:]}")
+
+        untrusted = _tls_ca_leg(product, domain, TLS_CA_FOREIGN_ROOT)
+        require(TLS_CA_CASE_ID, untrusted["status"] != 0,
+                "the install's probe accepted a certificate no foreign root issued")
+        require(TLS_CA_CASE_ID,
+                any(marker in untrusted["output"] for marker in TLS_CA_FAILURE_MARKERS),
+                "the foreign root failed for a reason other than the chain: "
+                f"{untrusted['output'][-600:]}")
+
+        missing = _tls_ca_leg(product, domain, TLS_CA_PROBE_DIR + "/absent.pem")
+        require(TLS_CA_CASE_ID, missing["status"] != 0,
+                "a bundle path that does not exist was accepted")
+        require(TLS_CA_CASE_ID, TLS_CA_REFUSAL in missing["output"],
+                f"an absent bundle was not refused as such: {missing['output'][-600:]}")
+
+        linked = product.host_script(f"ln -sfn {ca_file} {TLS_CA_SYMLINK}")
+        require(TLS_CA_CASE_ID, linked.returncode == 0,
+                f"the symlink leg could not be set up: {(linked.stderr or '').strip()[-300:]}")
+        symlink = _tls_ca_leg(product, domain, TLS_CA_SYMLINK)
+        require(TLS_CA_CASE_ID, symlink["status"] != 0,
+                "a bundle that is a symlink was accepted")
+        require(TLS_CA_CASE_ID, TLS_CA_REFUSAL in symlink["output"],
+                f"a symlinked bundle was not refused as such: {symlink['output'][-600:]}")
+
+        store = _tls_ca_leg(product, domain, None)
+        require(TLS_CA_CASE_ID, store["status"] != 0,
+                "the install's probe verified the lineage without the per-run bundle, "
+                "so the fixture root reached the global trust store instead of being "
+                "supplied per run")
+        require(TLS_CA_CASE_ID,
+                any(marker in store["output"] for marker in TLS_CA_FAILURE_MARKERS),
+                "the default trust path failed for a reason other than the chain: "
+                f"{store['output'][-600:]}")
+
+        leftovers = product.host_script(
+            "ls -1d /tmp/gowave-tls-sni.* 2>/dev/null | wc -l"
+        )
+        scratch = (leftovers.stdout or "").strip()
+        require(TLS_CA_CASE_ID, leftovers.returncode == 0 and scratch == "0",
+                f"the probe left {scratch} scratch directories behind")
+    finally:
+        product.host_script(f"rm -rf {TLS_CA_PROBE_DIR}")
+    removed = product.host_script(f"test ! -e {TLS_CA_PROBE_DIR} && echo removed")
+    require(TLS_CA_CASE_ID, (removed.stdout or "").strip() == "removed",
+            "the foreign root and the sliced probe were left on the host")
+    return {
+        "installer_sha256": digest,
+        "install_ca_file": ca_file,
+        "run_ca_status": anchor["status"],
+        "foreign_ca_status": untrusted["status"],
+        "foreign_ca_is_a_chain_error": any(
+            marker in untrusted["output"] for marker in TLS_CA_FAILURE_MARKERS),
+        "absent_ca_status": missing["status"],
+        "symlink_ca_status": symlink["status"],
+        "default_trust_status": store["status"],
+        "default_trust_anchors_lineage": store["status"] == 0,
+        "scratch_leftovers": scratch,
+        "probe_removed": True,
+    }
+
+
+def _tls_ca_leg(product: AioProduct, domain: str,
+                ca_file: Optional[str]) -> Dict[str, Any]:
+    """Run the product's probe once with one bundle, as the install does.
+
+    ``ca_file=None`` is the install's fallback. The variable has to be removed
+    rather than left out: the target is created with the install environment,
+    so ``GOWAVE_TLS_CA_FILE`` is part of the container's own configuration and
+    every ``podman exec`` inherits it. Omitting it here would silently re-run
+    the anchored leg and call the result a store check.
+    """
+    inner = (
+        f"source {TLS_CA_PROBE_SCRIPT} && "
+        f"verify_public_tls_sni {shlex.quote(domain)} 127.0.0.1:443 {TLS_CA_ATTEMPTS}"
+    )
+    command = f"bash -c {shlex.quote(inner)}"
+    if ca_file is None:
+        script = f"env -u GOWAVE_TLS_CA_FILE {command}"
+    else:
+        script = f"GOWAVE_TLS_CA_FILE={shlex.quote(ca_file)} {command}"
+    result = product.host_script(script)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    return {"status": result.returncode, "output": output}
+
+
 def case_tls_surface(product: AioProduct) -> Dict[str, Any]:
     """TLS-01: an independent client validates the certificate the host serves.
 
@@ -1805,6 +2606,95 @@ def panel_probe(product: AioProduct, case_id: str, scope: str, extra: str = "") 
     except json.JSONDecodeError:
         require(case_id, False, f"the Panel probe did not print JSON: {(result.stdout or '')[:400]}")
         return {}
+
+
+# The Panel the add-node refusal case names. A bare address never reaches the
+# probe the case is about — the wizard refuses it first, because a certificate
+# names a domain — and a name pointed at a loopback alias would not be refused
+# either: the product's own NGINX listens on 443 of every local address, so the
+# flow would meet that listener and report its certificate. The name is left to
+# resolve nowhere, which the ``.invalid`` TLD reserves: the API check then fails
+# on reachability, which is the step under test.
+ADD_NODE_REFUSED_PANEL = "panel-unverifiable.invalid"
+ADD_NODE_REFUSED_PROBE_MARKER = "gowave-e2e-add-node-refused-probe"
+# One resolution query in the container; the ceiling guards a stalled script,
+# not the expected cost.
+ADD_NODE_REFUSED_PROBE_TIMEOUT_SECONDS = 120
+
+# Every message ``wizard_verify_panel_api`` prints on a path that ends in
+# ``return 1``. The case accepts the set rather than one string: which step
+# fails depends on whether the address answers at all and whether what it
+# answers with is a certificate, and the claim under test is only that the flow
+# stops inside the verification step.
+PANEL_VERIFICATION_FAILURES = (
+    "TLS certificate verification failed.",
+    "Could not retrieve certificate.",
+    "Panel API unreachable.",
+    "Panel verification cancelled.",
+)
+
+
+def add_node_refusal_script() -> str:
+    """The operator's add-node wizard, run against a Panel it cannot verify.
+
+    ``detect_local_panel`` is overridden because the host under test does run a
+    Panel: the mistake being refused is pointing the flow at some other address,
+    not failing to detect the local one. ``cmd_node`` is the mutation boundary,
+    so it is replaced by a printed sentinel — whether that line appears is the
+    fact that says the refused attempt never reached the Worker deployment.
+    """
+    return "\n".join([
+        "set -Eeuo pipefail",
+        f"source {topology.REPO_IN_CONTAINER}/gowave-auto.sh",
+        "trap - ERR",
+        "set +e",
+        "detect_local_panel() { return 1; }",
+        "cmd_node() { printf 'GOWAVE_CMD_NODE_CALLED\\n'; }",
+        f"wizard_add_node_to_panel <<< '{ADD_NODE_REFUSED_PANEL}'",
+        "wizard_rc=$?",
+        "printf 'GOWAVE_WIZARD_EXIT=%d\\n' \"$wizard_rc\"",
+        "exit \"$wizard_rc\"",
+    ])
+
+
+def add_node_refused_resolution(podman, container: str, case_id: str) -> Dict[str, Any]:
+    """Ask the container what the refusal case's Panel name resolves to.
+
+    The probe is the shared hosts-block script in ``remove`` mode: it drops any
+    entry this case wrote into a container that is reused across cases, then
+    reports what ``getent`` answers for the name with nothing steered. Its own
+    request reading is not asked for — a name that resolves at all is the
+    failure this probe exists to catch.
+    """
+    script = hosts_block_script(
+        "remove", ADD_NODE_REFUSED_PANEL, marker=ADD_NODE_REFUSED_PROBE_MARKER,
+    )
+    result = podman.exec_bash(
+        container, script, check=False, timeout=ADD_NODE_REFUSED_PROBE_TIMEOUT_SECONDS,
+    )
+    return probe_json(case_id, f"the resolution of {ADD_NODE_REFUSED_PANEL}", result)
+
+
+def require_add_node_refused_premise(case_id: str, report: Dict[str, Any]) -> None:
+    """Refuse the case when its Panel name resolves anywhere at all.
+
+    A name that answers is not the mistake under test: whatever it reaches holds
+    a certificate, so the verification the flow reports would be a refusal of
+    that certificate rather than of a Panel that cannot be found.
+    """
+    resolution = str(report.get("resolution") or "")
+    require(
+        case_id,
+        report.get("mode") == "remove",
+        f"the resolution probe reports {report.get('mode')!r}, so a steered entry may still "
+        f"be in force for {ADD_NODE_REFUSED_PANEL}",
+    )
+    require(
+        case_id,
+        not resolution,
+        f"{ADD_NODE_REFUSED_PANEL} resolves to {resolution!r}, so the flow could reach a "
+        "Panel that answers instead of a name nothing can verify",
+    )
 
 
 def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
@@ -1891,6 +2781,317 @@ def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def case_panel_auth_negative(product: AioProduct) -> Dict[str, Any]:
+    """AIO-AUTH-NEG: the Panel refuses what it did not issue, and keeps serving.
+
+    The four credentials are one sentence each in the middleware: a token the
+    Panel did not sign, one that was signed and has expired, one that declares
+    no signature at all, and one whose signature and expiry are both good but
+    whose `uuid` names no administrator. A case that only sent garbage would
+    pass on the first clause alone, so every variant is a copy of the real token
+    that fails exactly one — and the real token reads the same route before and
+    after, which is what makes "refused" different from "refuses everything".
+    """
+    facts = panel_probe(product, AUTH_NEGATIVE_CASE_ID, "auth-negative")
+    negative = facts.get("auth_negative") or {}
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("claims_present"),
+            "the token the Panel issued carries no readable claims, so the variants "
+            "could not be faithful copies of it")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("role") == "ADMIN",
+            f"the issued token names the role {negative.get('role')!r} instead of ADMIN")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("signing_key_present"),
+            "APP_SECRET is absent or shorter than the Panel's own 32-character floor, so the "
+            "expired variant would not carry the Panel's signature")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("control_before") == 200,
+            f"the issued token read /api/nodes as {negative.get('control_before')!r} "
+            "before the refusals, so a refusal below would prove nothing")
+    refusals = negative.get("refusals") or {}
+    for name in ("expired", "forged", "unsigned", "unknown-admin"):
+        entry = refusals.get(name) or {}
+        require(AUTH_NEGATIVE_CASE_ID, entry.get("status") == 401,
+                f"the {name} token read /api/nodes as {entry.get('status')!r} instead of "
+                f"being refused with 401")
+        require(AUTH_NEGATIVE_CASE_ID, entry.get("error") == "Unauthorized",
+                f"the {name} token was refused with {entry.get('error')!r} instead of "
+                "the Panel's own Unauthorized body")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("control_after") == 200,
+            f"the issued token read /api/nodes as {negative.get('control_after')!r} after the "
+            "refusals, so the Panel stopped serving the credential it issued")
+    return {
+        "control_before": negative.get("control_before"),
+        "control_after": negative.get("control_after"),
+        "signing_key_present": negative.get("signing_key_present"),
+        "refusals": {
+            name: {
+                "status": (refusals.get(name) or {}).get("status"),
+                "error": (refusals.get(name) or {}).get("error"),
+                "verdict": "PASS",
+            }
+            for name in ("expired", "forged", "unsigned", "unknown-admin")
+        },
+    }
+
+
+def case_panel_api_client_trust(product: AioProduct) -> Dict[str, Any]:
+    """APIC-01: the controller's Panel client trusts the run bundle and nothing else.
+
+    Four clauses, one probe. The bundle logs in over the Panel's public name —
+    and a context with no anchor at all is refused, so the success came from
+    that file rather than from a store the image happened to carry. The same
+    bundle naming an address the certificate does not carry is refused, which is
+    hostname verification being on rather than being configured on. The bound is
+    set to a value neither the client nor the parser defaults to, so a literal
+    that happened to agree today would be caught rather than confirmed. And the
+    two sources are read for a bypass: an ``allowInsecure`` or a
+    ``check_hostname = False`` added to either makes the first three clauses
+    describe a client nobody ships.
+    """
+    host = product.require_installed()
+    ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+    script = (
+        f"API_TIMEOUT={PANEL_API_CLIENT_TIMEOUT_SECONDS} python3 {PANEL_SURFACE_SCRIPT} "
+        f"--scope api-client --edge-base https://{host.panel_domain} --ca {ca_file}"
+    )
+    facts = product._probe_json(
+        PANEL_API_CLIENT_CASE_ID, "the Panel API client probe", product.host_script(script),
+    ).get("api_client") or {}
+
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("verify_mode") == "CERT_REQUIRED",
+            f"the context built from the run bundle verifies in {facts.get('verify_mode')!r} "
+            "instead of CERT_REQUIRED")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("hostname_verification") is True,
+            "the context built from the run bundle does not check the hostname")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("bundle_login") == "accepted",
+            f"the client could not log in through the run bundle: it reported "
+            f"{facts.get('bundle_login')!r}")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("nodes", 0) >= 0,
+            f"the authenticated client read {facts.get('nodes')!r} nodes instead of a list")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("empty_store_login") != "accepted",
+            "the client logged in through a context with no trust anchor, so the bundle is not "
+            "what made the first login work")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("hostname_mismatch_login") != "accepted",
+            "the client accepted a certificate that names a different host, so hostname "
+            "verification is configured off")
+    require(PANEL_API_CLIENT_CASE_ID,
+            facts.get("timeout_used") == PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            f"the client used a {facts.get('timeout_used')!r} second bound while API_TIMEOUT was "
+            f"{PANEL_API_CLIENT_TIMEOUT_SECONDS}")
+    require(PANEL_API_CLIENT_CASE_ID,
+            facts.get("timeout_configured") == PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            f"API_TIMEOUT parsed as {facts.get('timeout_configured')!r} instead of "
+            f"{PANEL_API_CLIENT_TIMEOUT_SECONDS}, so the bound above was not the configured one")
+    require(PANEL_API_CLIENT_CASE_ID,
+            facts.get("production_default_timeout") == PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            "a caller that omits the optional timeout did not inherit API_TIMEOUT: it got "
+            f"{facts.get('production_default_timeout')!r}")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("production_default_context") is True,
+            "a caller that omits the optional context did not get the default one")
+    require(PANEL_API_CLIENT_CASE_ID, not facts.get("bypass_tokens"),
+            "a trust bypass reached the shipped sources: " + ", ".join(facts.get("bypass_tokens") or []))
+    return {
+        "bundle_login": facts.get("bundle_login"),
+        "empty_store_login": facts.get("empty_store_login"),
+        "hostname_mismatch_login": facts.get("hostname_mismatch_login"),
+        "hostname_verification": facts.get("hostname_verification"),
+        "nodes": facts.get("nodes"),
+        "production_default_timeout": facts.get("production_default_timeout"),
+        "production_default_context": facts.get("production_default_context"),
+        "request_timeout_configured": facts.get("timeout_configured"),
+        "request_timeout_used": facts.get("timeout_used"),
+        "system_store_login": facts.get("system_store_login"),
+        "verify_mode": facts.get("verify_mode"),
+        "bypass_tokens": len(facts.get("bypass_tokens") or []),
+    }
+
+
+def credentials_probe_script() -> str:
+    """Print the credentials file the way a careless diagnostic dump would.
+
+    The accident this case exists for is one ``cat`` of the file: the operator's
+    administrator password in a bundle that gets copied off the host. So the
+    script prints exactly what such a dump prints — the stat line the product's
+    own hardening reads, then the file — and the case is the writer that has to
+    stand between the two.
+    """
+    return (
+        "set -u\n"
+        f"path={CREDENTIALS_FILE}\n"
+        'if [ ! -f "$path" ] || [ -L "$path" ]; then printf \'unreadable\\n\'; exit 3; fi\n'
+        "stat -c 'mode=%a' \"$path\"\n"
+        "stat -c 'owner=%u' \"$path\"\n"
+        "stat -c 'type=%F' \"$path\"\n"
+        "printf -- '--file--\\n'\n"
+        'cat -- "$path"\n'
+    )
+
+
+def case_redacted_credentials(product: AioProduct) -> Dict[str, Any]:
+    """RED-01: the credentials file reaches an artifact as names, never values.
+
+    The case reads the real file, registers both secret values with the run's own
+    filter, and writes the raw dump through the writer every artifact goes
+    through. Then it reads the tree back: the field names must survive, both
+    values must be `[REDACTED]`, and the run's own audit must call the whole
+    artifact directory a fixed point of the filter. A case that only inspected a
+    redacted string it built itself would prove nothing about the writer, and one
+    that trusted the writer without reading the file back would pass on a writer
+    that was never wired to the filter.
+    """
+    result = product.host_script(credentials_probe_script())
+    require(REDACTION_CASE_ID, result.returncode == 0,
+            f"the credentials probe exited {result.returncode}: "
+            f"{(result.stderr or '').strip()[-400:]}")
+    lines = (result.stdout or "").splitlines()
+    require(REDACTION_CASE_ID, "--file--" in lines,
+            "the credentials probe printed no file marker")
+    split_at = lines.index("--file--")
+    stat_fields = dict(
+        tuple(line.split("=", 1)) for line in lines[:split_at] if "=" in line
+    )
+    require(REDACTION_CASE_ID, stat_fields.get("mode"),
+            "the credentials probe printed no stat line for the file")
+    require(REDACTION_CASE_ID, stat_fields.get("type") == "regular file",
+            f"the credentials file is {stat_fields.get('type')!r}, not a regular file")
+    require(REDACTION_CASE_ID, stat_fields.get("mode") == "600",
+            f"the credentials file is mode {stat_fields.get('mode')!r}, not 600")
+    require(REDACTION_CASE_ID, stat_fields.get("owner") == "0",
+            f"the credentials file is owned by uid {stat_fields.get('owner')!r}, not root")
+
+    body = "\n".join(lines[split_at + 1:])
+    values: Dict[str, str] = {}
+    for line in body.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in CREDENTIAL_FIELDS:
+            values[name] = value.strip()
+    missing = [name for name in CREDENTIAL_FIELDS if not values.get(name)]
+    require(REDACTION_CASE_ID, not missing,
+            "the credentials file does not name " + ", ".join(missing)
+            + " (field names only; no value is reported)")
+
+    # From here the two secret values are registered with the run's filter and
+    # never printed: the raw dump goes through the writer, and the case reads
+    # back what the writer made of it.
+    for name in CREDENTIAL_SECRET_FIELDS:
+        register_secret(values[name])
+    path = product.context.evidence_text(
+        f"diagnostics/{REDACTION_CASE_ID}/credentials.txt", body
+    )
+    written = path.read_text(encoding="utf-8")
+    require(REDACTION_CASE_ID, "[REDACTED]" in written,
+            "the evidence writer kept the credentials text unchanged")
+    for name in CREDENTIAL_SECRET_FIELDS:
+        require(REDACTION_CASE_ID, values[name] not in written,
+                f"the {name} value survived the evidence writer")
+    require(REDACTION_CASE_ID, all(name in written for name in CREDENTIAL_FIELDS),
+            "the redacted copy does not name every field it withheld")
+
+    audit = redaction_audit(product.context.artifact_dir)
+    require(REDACTION_CASE_ID, not audit.get("offences"),
+            "artifacts that change when redacted: " + ", ".join(audit.get("offences") or []))
+    return {
+        "credential_fields": ",".join(CREDENTIAL_FIELDS),
+        "file_mode": stat_fields.get("mode"),
+        "file_owner": stat_fields.get("owner"),
+        "file_type": stat_fields.get("type"),
+        "redacted_markers": written.count("[REDACTED]"),
+        "audited_files": audit.get("files"),
+        "audit_offences": len(audit.get("offences") or []),
+    }
+
+
+# What the bundle must carry for RED-02 to be true, per area: (area, label, needles).
+# Every needle is text the tool on the host printed — the kernel line, the
+# distribution's own identifiers, the installed package version, a unit's state,
+# journalctl's output, a listener, the vhost test, ufw's verdict, iptables' chain
+# policy, and the served certificate's fields — so a bundle cannot satisfy this
+# table by being written by the harness itself. A tuple means any one of its
+# needles is enough: the journal and the firewall are read through the words the
+# tools use when they have nothing to report, because a container without a
+# journal is a fact the bundle must state rather than hide.
+DIAGNOSTIC_REQUIRED_FIELDS = (
+    ("operator", "kernel", ("Linux ",)),
+    ("operator", "distribution", ("ID=",)),
+    ("operator", "distribution version", ("VERSION_ID=",)),
+    ("operator", "package version", ("nginx=",)),
+    ("service", "unit state", ("is-active: active",)),
+    ("service", "unit enablement", ("is-enabled: enabled",)),
+    ("systemd", "journal", ("No entries", "systemd[")),
+    ("network", "listener", ("LISTEN",)),
+    ("network", "tls listener", (":443",)),
+    ("network", "firewall verdict", ("Status: active", "Status: inactive")),
+    ("network", "firewall rules", ("-P INPUT",)),
+    ("tls", "certificate subject", ("subject=",)),
+    ("tls", "certificate validity", ("notAfter=",)),
+    ("endpoint", "vhost test", ("syntax is ok",)),
+    ("endpoint", "vhost test verdict", ("test is successful",)),
+)
+
+
+def case_diagnostic_artifacts(product: AioProduct) -> Dict[str, Any]:
+    """RED-02: the bundle a failure would leave behind carries the safe fields.
+
+    A wedged host is read through this bundle and nothing else, so the case asks
+    the real collector for it on a healthy one: the same eight areas, the same
+    per-container probes, the same redaction, modes, truncation accounting and
+    index. Then it reads every file back and asks for the fields the requirement
+    names — the host's own OS, kernel and package versions, unit state, journal,
+    listeners, the vhost test, the firewall, and certificate metadata with no key
+    material.
+
+    Two clauses of the requirement are report-side and are not claimed here: API
+    object summaries and traffic results are carried by the evidence of the cases
+    that observed them, and per-case timings by ``result.json``, which the runner
+    writes after the last case. The bundle's own timing metric — the index's
+    duration — is read back below, and the report-side half is proven by the
+    runner's own tests rather than by a file that does not exist yet.
+    """
+    product.require_installed()
+    placeholder = CaseResult(DIAGNOSTICS_CASE_ID, product.context.topology, PASS)
+    written = diagnostics.collect(product.context, product.podman, placeholder)
+    bundle: Dict[str, str] = {}
+    for relative in written:
+        bundle[relative] = (product.context.artifact_dir / relative).read_text(encoding="utf-8")
+    expected = len(diagnostics.AREAS) + 1
+    require(DIAGNOSTICS_CASE_ID, len(bundle) == expected,
+            f"the collector wrote {len(bundle)} file(s), expected one per area plus an index "
+            f"({expected})")
+
+    prefix = f"evidence/diagnostics/{DIAGNOSTICS_CASE_ID}/"
+    for area, label, needles in DIAGNOSTIC_REQUIRED_FIELDS:
+        text = bundle.get(f"{prefix}{area}.txt", "")
+        require(DIAGNOSTICS_CASE_ID, any(needle in text for needle in needles),
+                f"the {area} file does not carry the {label} "
+                f"({' or '.join(repr(needle) for needle in needles)} is absent)")
+    for relative, text in bundle.items():
+        require(DIAGNOSTICS_CASE_ID, "PRIVATE KEY" not in text,
+                f"{relative} carries private key material")
+        if relative.endswith("index.txt"):
+            continue
+        require(DIAGNOSTICS_CASE_ID, "[bundle complete:" in text,
+                f"{relative} does not say whether it is complete")
+    for relative in bundle:
+        mode = (product.context.artifact_dir / relative).stat().st_mode & 0o777
+        require(DIAGNOSTICS_CASE_ID, mode == 0o600,
+                f"{relative} is mode {oct(mode)}, not 0o600")
+
+    index = bundle.get(f"{prefix}index.txt", "")
+    require(DIAGNOSTICS_CASE_ID, "duration:" in index, "the index carries no timing metric")
+    require(DIAGNOSTICS_CASE_ID, "not run: 0" in index,
+            "the index does not account for every probe it ran")
+    seconds = ""
+    for line in index.splitlines():
+        if line.startswith("duration:"):
+            seconds = line.split(":", 1)[1].strip()
+    return {
+        "files": len(bundle),
+        "areas": ",".join(area.name for area in diagnostics.AREAS),
+        "required_fields": len(DIAGNOSTIC_REQUIRED_FIELDS),
+        "bundle_seconds": seconds,
+        "file_mode": "0600",
+        "private_key_files": 0,
+    }
+
+
 def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
     """AIO-CLIENT: a client is created, read back, and deleted through the real API.
 
@@ -1923,6 +3124,57 @@ def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
             f"the deleted client is still served by username "
             f"(status {facts.get('after_delete_status')!r})")
     return facts
+
+
+def transfer_matrix_carried(facts: Dict[str, Any], expected: int) -> bool:
+    """Whether the matrix finished: every transport delivered and the endpoint recorded it.
+
+    Two unfinished observations are worth a second run — a matrix that reported
+    fewer transfers than the subscription owes, and a request id the endpoint's
+    log never recorded. Both are what a Panel that re-pushes the node's users
+    mid-case leaves behind, and neither is a verdict this case can rest on.
+    """
+    return (
+        int(facts.get("transfer_count") or 0) == expected
+        and int(facts.get("missing_request_ids") or 0) == 0
+    )
+
+
+def transfer_matrix_until_carried(
+    attempt, expected: int, deadline_seconds: float, interval_seconds: float,
+    clock=time.monotonic, sleep=time.sleep,
+) -> Dict[str, Any]:
+    """Run the positive matrix until every transport carries its payload, or the deadline passes.
+
+    ``attempt`` returns the probe's facts, or raises the ``AssertionError`` that
+    ``probe_json`` builds when the probe exited without them. Nothing else can
+    assert while the matrix is being taken — the tunnel readiness check has
+    already passed by then — so the only failure this loop retries is the probe's
+    own, and a spent deadline re-raises it with its message intact. The attempt
+    count travels with the facts, so a matrix that needed a second try says so in
+    the case's evidence instead of looking like one that carried first time.
+    """
+    deadline = clock() + deadline_seconds
+    attempts = 0
+    last_error: Optional[AssertionError] = None
+    facts: Dict[str, Any] = {}
+    # The first attempt is taken whatever the clock says, and every further one has
+    # to start before the deadline: the loop is bounded by time, and the wait after
+    # an attempt never carries it past the deadline it is waiting for.
+    while attempts == 0 or clock() < deadline:
+        attempts += 1
+        try:
+            facts = attempt()
+        except AssertionError as exc:
+            last_error, facts = exc, {}
+        else:
+            last_error = None
+            if transfer_matrix_carried(facts, expected):
+                break
+        sleep(interval_seconds)
+    if last_error is not None and not facts:
+        raise last_error
+    return {**facts, "positive_attempts": attempts}
 
 
 def case_revocation(
@@ -1976,8 +3228,13 @@ def case_revocation(
 
     try:
         tunnel = product.wait_tunnel_ready(case_id, payload_dir=payload_dir)
-        positive = product.traffic_facts(case_id, "traffic", payload_dir=payload_dir)
         expected = product.subscription_inbound_count * len(TRAFFIC_ENGINES)
+        positive = transfer_matrix_until_carried(
+            lambda: product.traffic_facts(case_id, "traffic", payload_dir=payload_dir),
+            expected,
+            deadline_seconds=REVOCATION_TRANSFER_TIMEOUT_SECONDS,
+            interval_seconds=REVOCATION_TRANSFER_INTERVAL_SECONDS,
+        )
         require(case_id, int(positive.get("transfer_count") or 0) == expected,
                 f"the issued client transferred through {positive.get('transfer_count')!r} "
                 f"transports, expected {expected}")
@@ -2037,6 +3294,7 @@ def case_revocation(
         "patch_status": issue.get("patch_status"),
         "readiness_network": tunnel.get("network"),
         "positive_transfer_count": positive.get("transfer_count"),
+        "positive_attempts": positive.get("positive_attempts"),
         "positive_source_ips": ",".join(positive.get("source_ips") or []),
         "expected_source_ips": ",".join(sorted(sources)),
         "revoke_status": applied.get("revoke_status"),
@@ -2255,6 +3513,950 @@ def case_idempotent(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+BACKUP_FAULT_CASE_ID = "AIO-FAULT-DISK"
+# The product's own store, the tmpfs size that stands in for a full filesystem,
+# and the filler that leaves it that way. 512k holds the filler and nothing else:
+# the panel archive this host produces is ~76k, so the write cannot complete.
+BACKUP_FAULT_STORE = "/var/backups/gowave"
+BACKUP_FAULT_TMPFS_SIZE = "512k"
+BACKUP_FAULT_FILLER_KB = 500
+BACKUP_FAULT_TIMEOUT_SECONDS = 600
+
+BACKUP_FAULT_SCRIPT = r"""
+store=BACKUP_STORE_PLACEHOLDER
+size=BACKUP_TMPFS_SIZE_PLACEHOLDER
+filler=BACKUP_FILLER_PLACEHOLDER
+
+created=no
+if [[ ! -d "$store" ]]; then
+    mkdir -p "$store"
+    created=yes
+fi
+
+# The fault is the case's own to remove, whatever the run of the command below
+# does: a full store left behind would be read by every case that follows as a
+# product failure of its own.
+cleanup() {
+    set +e
+    rm -f -- "$store"/filler "$store"/gowave-backup-*.tar.gz "$store"/*.partial 2>/dev/null
+    if mountpoint -q "$store" 2>/dev/null; then
+        umount "$store"
+    fi
+    if [[ "$created" == "no" ]]; then
+        rmdir "$store" 2>/dev/null
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+mount -t tmpfs -o "size=$size,mode=0700" tmpfs "$store"
+dd if=/dev/zero of="$store/filler" bs=1k "count=$filler" status=none
+free_kb=$(df -k --output=avail "$store" | tail -1 | tr -d ' ')
+
+rc=0
+bash "$repo/gowave-auto.sh" backup --type panel \
+    >/tmp/gowave-e2e-fault-backup.out 2>/tmp/gowave-e2e-fault-backup.err || rc=$?
+files_during=$(ls -1A "$store" | tr '\n' ' ')
+
+# The fault is removed and the operator's own command is run again: an archive
+# that appears and validates is what separates a store that refused the write
+# from a backup that no longer works at all.
+umount "$store"
+rc_after=0
+bash "$repo/gowave-auto.sh" backup --type panel \
+    >/tmp/gowave-e2e-fault-backup2.out 2>/tmp/gowave-e2e-fault-backup2.err || rc_after=$?
+archive=$(ls -1 "$store"/gowave-backup-panel-*.tar.gz 2>/dev/null | tail -1)
+archive_mode=""
+archive_bytes=""
+verify=127
+if [[ -n "$archive" ]]; then
+    archive_mode=$(stat -c '%a' "$archive")
+    archive_bytes=$(stat -c '%s' "$archive")
+    verify=0
+    bash "$repo/assets/backup/gowave-backup.sh" verify "$archive" panel \
+        >/tmp/gowave-e2e-fault-verify.out 2>&1 || verify=$?
+fi
+
+RC="$rc" RC_AFTER="$rc_after" VERIFY="$verify" FREE="$free_kb" FILES="$files_during" \
+ARCHIVE="$archive" ARCHIVE_MODE="$archive_mode" ARCHIVE_BYTES="$archive_bytes" python3 - <<'PY'
+import json, os, subprocess, urllib.request
+
+
+def read(path, tail=1200):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-tail:]
+    except OSError:
+        return ""
+
+
+unit = {}
+show = subprocess.run(
+    ["systemctl", "show", "gowave.service", "nginx", "-p", "Id", "-p", "ActiveState"],
+    capture_output=True, text=True,
+)
+for block in (show.stdout or "").split("\n\n"):
+    fields = dict(
+        line.partition("=")[::2] for line in block.splitlines() if "=" in line
+    )
+    if fields.get("Id"):
+        unit[fields["Id"]] = fields.get("ActiveState")
+
+health = None
+try:
+    with urllib.request.urlopen("http://127.0.0.1:3000/api/system/health", timeout=5) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - the probe reports, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+print(json.dumps({
+    "free_kb": os.environ.get("FREE", ""),
+    "returncode": int(os.environ.get("RC") or 0),
+    "stdout": read("/tmp/gowave-e2e-fault-backup.out"),
+    "stderr": read("/tmp/gowave-e2e-fault-backup.err"),
+    "files_during": os.environ.get("FILES", "").split(),
+    "returncode_after": int(os.environ.get("RC_AFTER") or 0),
+    "stderr_after": read("/tmp/gowave-e2e-fault-backup2.err"),
+    "archive": os.path.basename(os.environ.get("ARCHIVE", "")),
+    "archive_mode": os.environ.get("ARCHIVE_MODE", ""),
+    "archive_bytes": os.environ.get("ARCHIVE_BYTES", ""),
+    "verify_returncode": int(os.environ.get("VERIFY") or 0),
+    "verify_output": read("/tmp/gowave-e2e-fault-verify.out"),
+    "unit": unit,
+    "health": health,
+}, sort_keys=True))
+PY
+"""
+
+
+def backup_fault_script() -> str:
+    """Fill the backup store with a tmpfs and run the operator's own backup twice."""
+    return (
+        "set -Eeuo pipefail\n"
+        "umask 077\n"
+        f"repo={shlex.quote(topology.REPO_IN_CONTAINER)}\n"
+        + BACKUP_FAULT_SCRIPT
+        .replace("BACKUP_STORE_PLACEHOLDER", shlex.quote(BACKUP_FAULT_STORE))
+        .replace("BACKUP_TMPFS_SIZE_PLACEHOLDER", shlex.quote(BACKUP_FAULT_TMPFS_SIZE))
+        .replace("BACKUP_FILLER_PLACEHOLDER", str(BACKUP_FAULT_FILLER_KB))
+        .strip()
+        + "\n"
+    )
+
+
+def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-DISK: a store that cannot hold the archive fails without publishing one.
+
+    The injected fault is a filesystem that runs out of space while the archive is
+    being written. What the operator must be able to rely on is the name: an
+    archive that appears in the store is complete, so a write that cannot finish
+    leaves no file a later restore would offer and reject as truncated. The live
+    tree is read around the fault because a backup that damaged the Panel while
+    failing would be the worse defect, and the same command is run again after
+    the fault is removed so "the store refused" is separated from "backup is
+    broken".
+
+    The database is read where the Panel serves it. A running Panel writes to
+    SQLite on its own schedule — a heartbeat, a traffic sample, the rows it
+    writes when it starts — so a dump comparison across a window in which the
+    Panel served would measure the Panel's own write log, not the fault; the
+    rows are read as "nothing the database held is gone" and the client surface
+    is compared byte for byte through the API.
+    """
+    product.require_installed()
+    read_started = time.monotonic()
+    before = channel_state(product, BACKUP_FAULT_CASE_ID)
+    captured = channel_client_surface(product, BACKUP_FAULT_CASE_ID, "capture")
+    before_seconds = round(time.monotonic() - read_started, 3)
+    require(
+        BACKUP_FAULT_CASE_ID,
+        before.get("database", {}).get("integrity") == "ok"
+        and before.get("unit", {}).get("ActiveState") == "active",
+        f"the host was not healthy before the fault: database "
+        f"{before.get('database', {}).get('integrity')!r}, unit "
+        f"{before.get('unit', {}).get('ActiveState')!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        f"the Panel served no default client before the fault, so keeping it afterwards "
+        f"would prove nothing: {captured!r}",
+    )
+
+    fault_started = time.monotonic()
+    facts = probe_json(
+        BACKUP_FAULT_CASE_ID, "the backup store fault",
+        product.host_script(backup_fault_script(), timeout=BACKUP_FAULT_TIMEOUT_SECONDS),
+    )
+    fault_seconds = round(time.monotonic() - fault_started, 3)
+    require(
+        BACKUP_FAULT_CASE_ID, int(facts.get("free_kb") or 0) < 64,
+        f"the injected store still had {facts.get('free_kb')!r} KiB free, so the write was not "
+        "the one that could fail",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("returncode") not in (None, 0),
+        "the backup reported success on a store with no room left for the archive: "
+        f"{(facts.get('stdout') or '').strip()[-600:]!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, "nothing was published" in (facts.get("stderr") or ""),
+        f"the failed backup did not report that nothing was published: "
+        f"{(facts.get('stderr') or '').strip()[-800:]!r}",
+    )
+    published = [
+        name for name in (facts.get("files_during") or [])
+        if name.endswith(".tar.gz") or name.endswith(".partial")
+    ]
+    require(
+        BACKUP_FAULT_CASE_ID, not published,
+        f"the failed backup left {published!r} in the store, so a later restore would be "
+        "offered an archive that cannot be complete",
+    )
+
+    after_started = time.monotonic()
+    after = channel_state(product, BACKUP_FAULT_CASE_ID)
+    surface = channel_client_surface(product, BACKUP_FAULT_CASE_ID, "verify")
+    after_seconds = round(time.monotonic() - after_started, 3)
+    # The database is read by its integrity, by the tables it holds and by the
+    # rows it kept, never by its file digest or by a whole-dump digest: the
+    # product checkpoints the WAL before it stages a copy, so even a backup that
+    # publishes nothing moves the pages of the live file, and the Panel writes
+    # its own rows while it serves. What a failed backup can destroy is what is
+    # asserted. Everything else is written by the operator's configuration and
+    # must not move at all.
+    database = require_database_intact(
+        BACKUP_FAULT_CASE_ID, before, after, "after the failed backup",
+    )
+    served = require_served_surface_unchanged(
+        BACKUP_FAULT_CASE_ID, captured, surface, "the failed backup",
+    )
+    for field, label in (
+        ("env_digest", "the environment file"),
+        ("frontend", "the frontend tree"),
+        ("state", "state.json"),
+        ("nginx", "the NGINX tree"),
+        ("letsencrypt", "the ACME tree"),
+    ):
+        require(
+            BACKUP_FAULT_CASE_ID, after.get(field) == before.get(field),
+            f"the failed backup changed {label}: {after.get(field)!r} vs {before.get(field)!r}",
+        )
+    require(
+        BACKUP_FAULT_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+        f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the failed backup",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("health") == 200,
+        f"the Panel's health route answered {facts.get('health')!r} after the failed backup",
+    )
+
+    # The fault is gone by the time the probe returns; the same command has to
+    # publish an archive that the product's own validator accepts.
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("returncode_after") == 0,
+        f"the backup still failed once the store had room again: "
+        f"{(facts.get('stderr_after') or '').strip()[-800:]!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, bool(facts.get("archive")),
+        "the backup after the fault published no archive in the store",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("archive_mode") == "600",
+        f"the published archive has mode {facts.get('archive_mode')!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("verify_returncode") == 0
+        and "15-point preflight archive validation PASSED" in (facts.get("verify_output") or ""),
+        f"the product's own validator rejected the published archive: "
+        f"{facts.get('verify_output')!r}",
+    )
+    return {
+        "free_kb_with_fault": facts.get("free_kb"),
+        "returncode_with_fault": facts.get("returncode"),
+        "files_with_fault": ",".join(facts.get("files_during") or []),
+        "returncode_after": facts.get("returncode_after"),
+        "archive": facts.get("archive"),
+        "archive_bytes": facts.get("archive_bytes"),
+        "archive_mode": facts.get("archive_mode"),
+        "verify_returncode": facts.get("verify_returncode"),
+        "database_integrity": after.get("database", {}).get("integrity"),
+        "database_tables": database.get("tables"),
+        "database_tables_added": ",".join(database.get("tables_added") or []),
+        "database_rows_before": database.get("rows_before"),
+        "database_rows_after": database.get("rows_after"),
+        "database_dump_digest_changed": str(
+            after.get("database", {}).get("logical") != before.get("database", {}).get("logical")
+        ).lower(),
+        "clients_served": served.get("users"),
+        "clients_captured": served.get("users_captured"),
+        "representations_identical": served.get("representations_identical"),
+        "seconds_before": before_seconds,
+        "seconds_fault": fault_seconds,
+        "seconds_after": after_seconds,
+        "unit_state": after.get("unit", {}).get("ActiveState"),
+        "health": facts.get("health"),
+    }
+
+
+def require_database_intact(
+    case_id: str, before: Dict[str, Any], after: Dict[str, Any], what: str,
+) -> Dict[str, Any]:
+    """The database lost no table and no row, and what the Panel added is named.
+
+    Two statements are kept apart on purpose. A failed backup can only destroy,
+    so destruction is asserted: the integrity check, every table that was there,
+    and every row it held. Growth is the Panel's own writing — its heartbeat, a
+    traffic sample, the rows a fresh process writes on startup — and is reported
+    as evidence rather than refused, because a window in which the Panel served
+    cannot have a stable dump and a case that pretended otherwise would fail on
+    the Panel's schedule instead of on the backup's behaviour.
+    """
+    database_before = before.get("database") or {}
+    database_after = after.get("database") or {}
+    require(
+        case_id, database_after.get("integrity") == "ok",
+        f"the database does not pass integrity_check {what}: "
+        f"{database_after.get('integrity')!r}",
+    )
+    tables_before = [str(name) for name in database_before.get("tables") or []]
+    tables_after = [str(name) for name in database_after.get("tables") or []]
+    require(
+        case_id, bool(tables_before),
+        f"the database listed no table before the fault, so nothing about its schema "
+        f"could be compared: {database_before!r}",
+    )
+    missing = [name for name in tables_before if name not in tables_after]
+    require(
+        case_id, not missing,
+        f"the database {what} no longer holds {missing!r}, which it held before",
+    )
+    rows_before = database_before.get("rows") or {}
+    rows_after = database_after.get("rows") or {}
+    unreadable = [name for name in tables_before if not isinstance(rows_after.get(name), int)]
+    require(
+        case_id, not unreadable,
+        f"the rows of {unreadable!r} could not be counted {what}, so a table that "
+        f"cannot be read is not a table that survived: {rows_after!r}",
+    )
+    lost = {
+        name: [rows_before.get(name), rows_after.get(name)]
+        for name in tables_before
+        if isinstance(rows_before.get(name), int) and rows_after[name] < rows_before[name]
+    }
+    require(
+        case_id, not lost,
+        f"the database {what} lost rows the Panel stored (before, after): {lost!r}",
+    )
+    return {
+        "tables": len(tables_before),
+        "tables_added": [name for name in tables_after if name not in tables_before],
+        "rows_before": sum(
+            value for value in rows_before.values() if isinstance(value, int)
+        ),
+        "rows_after": sum(value for value in rows_after.values() if isinstance(value, int)),
+    }
+
+
+def require_served_surface_unchanged(
+    case_id: str, captured: Dict[str, Any], surface: Dict[str, Any], what: str,
+) -> Dict[str, Any]:
+    """The Panel serves the client it served before, byte for byte.
+
+    This is the database claim read from the side a client reads it: the client
+    list and the digest of every representation the default client fetches. A
+    backup that damaged the rows would change one of them, and neither moves on
+    the Panel's own schedule.
+    """
+    require(
+        case_id, surface.get("inventory_identical") is True,
+        f"{what} changed the client inventory: {surface.get('users')!r} clients after "
+        f"{surface.get('users_captured')!r} before",
+    )
+    require(
+        case_id, surface.get("user_present") is True,
+        "the client the Panel served before the fault is gone from its inventory",
+    )
+    identical = surface.get("representations_identical") or {}
+    require(
+        case_id, identical and all(identical.values()),
+        f"{what} changed the bytes the Panel serves its client: "
+        f"{surface.get('representations')!r}",
+    )
+    return {
+        "users": surface.get("users"),
+        "users_captured": surface.get("users_captured"),
+        "representations_identical": len(
+            [name for name, same in identical.items() if same]
+        ),
+    }
+
+
+# ------------------------------------------------------------- fault contracts
+FAULT_CONFIGURATION_FIELDS = (
+    ("env_digest", "the environment file"),
+    ("binary", "the Panel binary"),
+    ("frontend", "the frontend tree"),
+    ("frontend_index", "the frontend document"),
+    ("state", "state.json"),
+    ("nginx", "the NGINX tree"),
+    ("nginx_conf", "the NGINX configuration"),
+    ("letsencrypt", "the ACME tree"),
+    ("lineage_chain", "the ACME lineage chain"),
+)
+
+
+def require_configuration_unchanged(
+    case_id: str, before: Dict[str, Any], after: Dict[str, Any], what: str,
+) -> None:
+    """Nothing the operator owns moved while the fault was in place.
+
+    The database is read by its integrity only. A running Panel writes to SQLite
+    on its own schedule, so its rows are a moving target outside the one case
+    that stops the Panel first; that case compares the rows separately, because
+    there nothing can have written them.
+    """
+    require(
+        case_id, after.get("database", {}).get("integrity") == "ok",
+        f"the database does not pass integrity_check {what}: "
+        f"{after.get('database', {}).get('integrity')!r}",
+    )
+    for field, label in FAULT_CONFIGURATION_FIELDS:
+        require(
+            case_id, after.get(field) == before.get(field) and before.get(field),
+            f"{what} changed {label}: {after.get(field)!r} vs {before.get(field)!r}",
+        )
+
+
+# --------------------------------------------------------------- Panel outage
+PANEL_FAULT_CASE_ID = "AIO-FAULT-PANEL"
+PANEL_FAULT_TIMEOUT_SECONDS = 900
+PANEL_SERVICE = "gowave.service"
+# What NGINX answers for a vhost whose upstream refuses the connection.
+PANEL_FAULT_UNAVAILABLE_STATUS = 502
+
+
+def case_panel_service_down(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-PANEL: a Panel that is down takes its own surface, not the tunnels.
+
+    The Panel is the control plane: an operator restarting it, or a host that
+    lost it, must leave what is already configured working. The case stops the
+    unit and reads the result from both sides — NGINX still answers on 443, but
+    the Panel's own routes come back as a gateway error, while every served
+    outbound still carries a payload. Nothing on disk may move while the unit is
+    down, which is what separates a stopped control plane from a damaged one, and
+    the same client has to be served the same bytes once the unit is started.
+    """
+    host = product.require_installed()
+    case = PANEL_FAULT_CASE_ID
+    before = channel_state(product, case)
+    require(
+        case, before.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {before.get('unit', {}).get('ActiveState')!r} before the fault",
+    )
+    require(
+        case, before.get("health") == 200,
+        f"the Panel health route answered {before.get('health')!r} before the fault",
+    )
+    captured = channel_client_surface(product, case, "capture")
+    require(
+        case, captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        f"the Panel served no default client before the fault, so its return would prove "
+        f"nothing: {captured!r}",
+    )
+    product.wait_tunnel_ready(case)
+
+    stop = product.host_script(
+        f"systemctl stop {PANEL_SERVICE}; systemctl is-active {PANEL_SERVICE} || true",
+        timeout=120,
+    )
+    require(
+        case, stop.returncode == 0 and (stop.stdout or "").strip().endswith("inactive"),
+        f"{PANEL_SERVICE} did not stop: {(stop.stdout or stop.stderr or '').strip()[-600:]!r}",
+    )
+
+    down: Dict[str, Any] = {}
+    page: Dict[str, Any] = {}
+    subscription: Dict[str, Any] = {}
+    during: Dict[str, Any] = {}
+    try:
+        down = channel_state(product, case)
+        require(
+            case, down.get("unit", {}).get("ActiveState") == "inactive",
+            f"{PANEL_SERVICE} is {down.get('unit', {}).get('ActiveState')!r} after the stop",
+        )
+        require(
+            case, down.get("health") != 200,
+            f"the Panel health route still answered {down.get('health')!r} with the unit stopped",
+        )
+        require_configuration_unchanged(case, before, down, "while the Panel was stopped")
+
+        page = host.client_http(f"{PUBLIC_PANEL}/", timeout=30)
+        require(
+            case, page["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
+            f"the public Panel surface answered {page['probe'].get('status')!r} with the unit "
+            f"stopped, expected NGINX's {PANEL_FAULT_UNAVAILABLE_STATUS}: "
+            f"{(page.get('stderr') or page.get('stdout') or '').strip()[-600:]!r}",
+        )
+        # The route a client fetches its configuration from is the Panel's too, so it
+        # has to fail with the same gateway error rather than with a subscription.
+        subscription = host.client_http(f"{PUBLIC_PANEL}/api/sub/000000000000", timeout=30)
+        require(
+            case, subscription["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
+            f"the subscription route answered {subscription['probe'].get('status')!r} with the "
+            f"Panel stopped, expected {PANEL_FAULT_UNAVAILABLE_STATUS}: "
+            f"{(subscription.get('stderr') or subscription.get('stdout') or '').strip()[-600:]!r}",
+        )
+        # The vhost adds these with ``always``, so the gateway error a pasted link
+        # receives carries them too. A 502 a cache could keep, or a 502 a crawler
+        # may index, would outlive the outage it belongs to.
+        headers = subscription["probe"].get("headers") or {}
+        require(
+            case, "no-store" in str(headers.get("cache-control") or "").lower(),
+            f"the gateway answer carries Cache-Control {headers.get('cache-control')!r}; "
+            f"a cached 502 is what a pasted link would keep",
+        )
+        require(
+            case, headers.get("x-robots-tag") == SUBSCRIPTION_ROBOTS_TAG,
+            f"the gateway answer lost X-Robots-Tag: {headers.get('x-robots-tag')!r} instead of "
+            f"{SUBSCRIPTION_ROBOTS_TAG!r}",
+        )
+
+        # The data plane is the node's, not the Panel's: the tunnels that were already
+        # configured must keep carrying payload while the control plane is down.
+        during = require_channel_traffic(product, case, host)
+
+        # Nothing read above reached the Panel — the two requests stopped at NGINX and
+        # the transfers went to the node — so a stopped control plane cannot have
+        # written a row since the state read after the stop. That is what separates a
+        # Panel that is down from a database that is damaged.
+        idle = channel_state(product, case)
+        require(
+            case, idle.get("database", {}).get("logical") == down.get("database", {}).get("logical"),
+            "the stopped Panel changed the rows it had stored: "
+            f"{idle.get('database', {}).get('logical')!r} vs "
+            f"{down.get('database', {}).get('logical')!r}",
+        )
+
+    finally:
+        # A case that failed above must not leave the host without its control
+        # plane: every case after this one reads the Panel.
+        start = product.host_script(f"systemctl start {PANEL_SERVICE}", timeout=120)
+    require(
+        case, start.returncode == 0,
+        f"{PANEL_SERVICE} did not start: {(start.stderr or start.stdout or '').strip()[-600:]!r}",
+    )
+    health = wait_for_channel_health(product, case)
+    require(case, health == "200", f"the Panel health route answered {health!r} after the restart")
+
+    surface = channel_client_surface(product, case, "verify")
+    require(
+        case, surface.get("inventory_identical") is True,
+        f"the outage changed the client inventory: {surface.get('users')!r} clients after "
+        f"{surface.get('users_captured')!r} before",
+    )
+    require(
+        case, surface.get("user_present") is True,
+        "the client the Panel served before the outage is gone from its inventory afterwards",
+    )
+    identical = surface.get("representations_identical") or {}
+    require(
+        case, identical and all(identical.values()),
+        f"the Panel did not come back serving the same bytes: {surface.get('representations')!r}",
+    )
+
+    after = channel_state(product, case)
+    require(
+        case, after.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {after.get('unit', {}).get('ActiveState')!r} after the restart",
+    )
+    require_configuration_unchanged(case, before, after, "after the Panel came back")
+    recovered = require_channel_traffic(product, case, host)
+
+    return {
+        "public_status_with_panel_down": page["probe"].get("status"),
+        "subscription_status_with_panel_down": subscription["probe"].get("status"),
+        "subscription_cache_control_with_panel_down": (
+            (subscription.get("probe") or {}).get("headers", {}).get("cache-control")
+        ),
+        "subscription_robots_tag_with_panel_down": (
+            (subscription.get("probe") or {}).get("headers", {}).get("x-robots-tag")
+        ),
+        "health_with_panel_down": str(down.get("health"))[:120],
+        "unit_sub_state_with_panel_down": down.get("unit", {}).get("SubState"),
+        "rows_stable_with_panel_down": str(
+            idle.get("database", {}).get("logical") == down.get("database", {}).get("logical")
+        ).lower(),
+        "transfers_with_panel_down": during.get("transfer_count"),
+        "health_after": str(after.get("health")),
+        "inventory_identical": str(surface.get("inventory_identical")).lower(),
+        "representations_identical": str(bool(identical) and all(identical.values())).lower(),
+        "transfers_after": recovered.get("transfer_count"),
+    }
+
+
+# ------------------------------------------------------------- core supervision
+CORE_FAULT_CASE_ID = "AIO-FAULT-XRAY"
+CORE_FAULT_TIMEOUT_SECONDS = 900
+CORE_FAULT_RESTART_TIMEOUT_SECONDS = 120
+CORE_FAULT_UNIT = "gowave-node.service"
+CORE_FAULT_CORE_NAMES = ("rw-core", "xray")
+
+CORE_FAULT_PROBE = r"""
+import json, os, signal, subprocess, sys, time
+
+MODE, unit, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+PROC = "/proc"
+NAMES = set("CORE_NAMES_PLACEHOLDER".split(","))
+
+
+def text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def parent_of(pid):
+    for line in text("%s/%d/status" % (PROC, pid)).splitlines():
+        if line.startswith("PPid:"):
+            return int(line.split()[1])
+    return 0
+
+
+def unit_facts():
+    show = subprocess.run(
+        ["systemctl", "show", unit, "-p", "Id", "-p", "ActiveState", "-p", "SubState",
+         "-p", "MainPID", "-p", "NRestarts", "-p", "ActiveEnterTimestamp"],
+        capture_output=True, text=True,
+    )
+    fields = {}
+    for line in (show.stdout or "").splitlines():
+        key, _, value = line.partition("=")
+        fields[key] = value
+    return fields
+
+
+def supervising_units():
+    listing = subprocess.run(
+        ["systemctl", "list-units", "--all", "--type=service", "--no-legend", "--plain"],
+        capture_output=True, text=True,
+    )
+    names = []
+    for line in (listing.stdout or "").splitlines():
+        columns = line.split()
+        if columns and "xray" in columns[0].lower():
+            names.append(columns[0])
+    return sorted(names)
+
+
+def scan():
+    found = []
+    for entry in os.listdir(PROC):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        comm = text("%s/%d/comm" % (PROC, pid)).strip()
+        if comm not in NAMES:
+            continue
+        found.append({
+            "pid": pid,
+            "comm": comm,
+            "ppid": parent_of(pid),
+            "in_unit": unit in text("%s/%d/cgroup" % (PROC, pid)),
+        })
+    return sorted(found, key=lambda item: item["pid"])
+
+
+report = {"unit_before": unit_facts(), "xray_units": supervising_units(), "cores_before": scan()}
+if MODE != "restart":
+    print(json.dumps(report, sort_keys=True))
+    raise SystemExit(0)
+
+cores = report["cores_before"]
+if len(cores) != 1 or not cores[0]["in_unit"]:
+    report["error"] = (
+        "expected exactly one core process inside %s, saw %s" % (unit, json.dumps(cores))
+    )
+    print(json.dumps(report, sort_keys=True))
+    raise SystemExit(0)
+
+killed = cores[0]["pid"]
+started = time.monotonic()
+os.kill(killed, signal.SIGKILL)
+cores_after = []
+while time.monotonic() - started < timeout:
+    cores_after = scan()
+    if cores_after and all(item["pid"] != killed for item in cores_after):
+        break
+    time.sleep(1)
+report["killed_pid"] = killed
+report["cores_after"] = cores_after
+report["restart_seconds"] = round(time.monotonic() - started, 2)
+report["unit_after"] = unit_facts()
+print(json.dumps(report, sort_keys=True))
+"""
+
+
+def core_fault_script(mode: str, timeout: float) -> str:
+    """Kill the node's core, or only look at it, without going through a unit."""
+    return (
+        "python3 - "
+        + " ".join([
+            shlex.quote(mode), shlex.quote(CORE_FAULT_UNIT), shlex.quote(str(timeout)),
+        ])
+        + " <<'PY'\n"
+        + CORE_FAULT_PROBE.replace("CORE_NAMES_PLACEHOLDER", ",".join(CORE_FAULT_CORE_NAMES)).strip()
+        + "\nPY\n"
+    )
+
+
+def case_core_process_killed(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-XRAY: the node replaces a killed core, and no unit of its own appears.
+
+    Xray is supervised by ``gowave-node`` and by nothing else. Killing the core
+    with SIGKILL is the fault the policy exists for: the node has to bring it
+    back inside its own unit, systemd must not have restarted the node to do it,
+    and no separate xray unit may appear. The case is read from the host's own
+    process table and cgroups, and the data plane is exercised afterwards because
+    a node that respawns its core without reapplying users would otherwise look
+    recovered.
+    """
+    host = product.require_installed()
+    case = CORE_FAULT_CASE_ID
+    before = channel_state(product, case)
+    product.wait_tunnel_ready(case)
+
+    scan = probe_json(case, "the core scan", product.host_script(core_fault_script("scan", 0)))
+    # The unit that has to survive the kill is the node's, read from the same
+    # probe that finds the core: the Panel may already be down for its own
+    # reasons, and the core this case kills does not depend on it.
+    require(
+        case, (scan.get("unit_before") or {}).get("ActiveState") == "active",
+        f"{CORE_FAULT_UNIT} is {(scan.get('unit_before') or {}).get('ActiveState')!r} before "
+        "the fault",
+    )
+    cores = scan.get("cores_before") or []
+    require(
+        case, len(cores) == 1 and cores[0].get("in_unit"),
+        f"expected one core process inside {CORE_FAULT_UNIT}, saw {cores!r}",
+    )
+    require(
+        case, not (scan.get("xray_units") or []),
+        f"a unit of its own supervises the core: {scan.get('xray_units')!r}",
+    )
+
+    facts = probe_json(
+        case, "the core fault",
+        product.host_script(
+            core_fault_script("restart", CORE_FAULT_RESTART_TIMEOUT_SECONDS),
+            timeout=CORE_FAULT_TIMEOUT_SECONDS,
+        ),
+    )
+    require(
+        case, not facts.get("error"),
+        f"the fault could not be injected: {facts.get('error')!r}",
+    )
+    killed = facts.get("killed_pid")
+    after_cores = facts.get("cores_after") or []
+    require(
+        case, len(after_cores) == 1 and after_cores[0].get("pid") != killed,
+        f"the core the case killed (pid {killed!r}) was not replaced inside "
+        f"{CORE_FAULT_RESTART_TIMEOUT_SECONDS}s: {after_cores!r}",
+    )
+    require(
+        case, after_cores[0].get("in_unit"),
+        f"the replacement core runs outside {CORE_FAULT_UNIT}: {after_cores[0]!r}",
+    )
+    unit_before = facts.get("unit_before") or {}
+    unit_after = facts.get("unit_after") or {}
+    require(
+        case,
+        unit_after.get("MainPID") == unit_before.get("MainPID")
+        and unit_after.get("ActiveEnterTimestamp") == unit_before.get("ActiveEnterTimestamp")
+        and unit_after.get("NRestarts") == unit_before.get("NRestarts"),
+        "the node's own unit was restarted to bring the core back: "
+        f"MainPID {unit_before.get('MainPID')!r} -> {unit_after.get('MainPID')!r}, "
+        f"NRestarts {unit_before.get('NRestarts')!r} -> {unit_after.get('NRestarts')!r}",
+    )
+    require(
+        case, unit_after.get("ActiveState") == "active",
+        f"{CORE_FAULT_UNIT} is {unit_after.get('ActiveState')!r} after the core was replaced",
+    )
+
+    traffic = require_channel_traffic(product, case, host)
+    after = channel_state(product, case)
+    require_configuration_unchanged(case, before, after, "while the core was replaced")
+
+    return {
+        "core_comm": (facts.get("cores_before") or [{}])[0].get("comm"),
+        "killed_pid": killed,
+        "core_pid_after": after_cores[0].get("pid"),
+        "core_ppid_after": after_cores[0].get("ppid"),
+        "restart_seconds": facts.get("restart_seconds"),
+        "node_main_pid": unit_after.get("MainPID"),
+        "node_restarts": unit_after.get("NRestarts"),
+        "xray_units": ",".join(facts.get("xray_units") or []),
+        "transfer_count": traffic.get("transfer_count"),
+    }
+
+
+# ----------------------------------------------------------------- latency fault
+LATENCY_FAULT_CASE_ID = "AIO-FAULT-LATENCY"
+LATENCY_FAULT_TIMEOUT_SECONDS = 900
+LATENCY_FAULT_DELAY_MS = 300
+LATENCY_FAULT_SAMPLES = 3
+# One request pays the delay on several server-to-client flights (handshake and
+# response), so the observable rise is well above the configured 300 ms; the
+# floor is kept under it so a slower machine cannot turn the case red.
+LATENCY_FAULT_MINIMUM_RISE_SECONDS = 0.45
+LATENCY_FAULT_BASELINE_TOLERANCE_SECONDS = 0.2
+
+LATENCY_FAULT_APPLY_SCRIPT = r"""
+ifaces=""
+remove() {
+    for applied in $ifaces; do
+        tc qdisc del dev "$applied" root 2>/dev/null || true
+    done
+}
+for path in /sys/class/net/*; do
+    name=$(basename "$path")
+    if [[ "$name" == "lo" ]]; then
+        continue
+    fi
+    if ! tc qdisc replace dev "$name" root netem delay DELAY_PLACEHOLDER 2>/dev/null; then
+        remove
+        echo "latency could not be injected on $name" >&2
+        exit 1
+    fi
+    ifaces="$ifaces $name"
+done
+echo "delayed:$ifaces"
+tc qdisc show | sed -n '1,40p'
+"""
+
+LATENCY_FAULT_CLEAR_SCRIPT = r"""
+for path in /sys/class/net/*; do
+    name=$(basename "$path")
+    if [[ "$name" == "lo" ]]; then
+        continue
+    fi
+    tc qdisc del dev "$name" root 2>/dev/null || true
+done
+echo "cleared"
+tc qdisc show | sed -n '1,20p'
+"""
+
+
+def latency_fault_apply_script() -> str:
+    return LATENCY_FAULT_APPLY_SCRIPT.replace("DELAY_PLACEHOLDER", f"{LATENCY_FAULT_DELAY_MS}ms").strip()
+
+
+def public_latency(
+    product: AioProduct, host: topology.AioTopology, case_id: str,
+) -> List[float]:
+    """Time the public Panel surface from the Control Machine, not from the host."""
+    samples: List[float] = []
+    for _ in range(LATENCY_FAULT_SAMPLES):
+        report = host.client_http(f"{PUBLIC_PANEL}/", timeout=60)
+        status = report["probe"].get("status")
+        require(
+            case_id, status == 200,
+            f"the public Panel surface answered {status!r} while it was being timed: "
+            f"{(report.get('stderr') or report.get('stdout') or '').strip()[-600:]!r}",
+        )
+        seconds = report["probe"].get("seconds")
+        require(
+            case_id, isinstance(seconds, (int, float)),
+            f"the HTTP probe reported no elapsed time: {report['probe']!r}",
+        )
+        samples.append(float(seconds))
+    return samples
+
+
+def case_public_latency(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-LATENCY: a slower host still works, and the delay is provably gone.
+
+    The fault is a netem delay on every interface of the host under test, which is
+    what a degraded link looks like to the client: the Panel answers and the
+    tunnels carry payload, only slower. The claim is measured on both sides —
+    the request time the Control Machine observes and the transfers the endpoint
+    confirms — and the delay is removed in the case's own ``finally``, so a case
+    that fails part-way cannot leave the next one measuring a host it slowed.
+    """
+    host = product.require_installed()
+    case = LATENCY_FAULT_CASE_ID
+    before = channel_state(product, case)
+    require(
+        case, before.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {before.get('unit', {}).get('ActiveState')!r} before the fault",
+    )
+    baseline = public_latency(product, host, case)
+    traffic: Dict[str, Any] = {}
+    cleared: Any = None
+    try:
+        applied = product.host_script(latency_fault_apply_script(), timeout=120)
+        require(
+            case, applied.returncode == 0 and "delayed:" in (applied.stdout or ""),
+            f"the latency fault could not be injected: "
+            f"{(applied.stderr or applied.stdout or '').strip()[-800:]!r}",
+        )
+        delayed = public_latency(product, host, case)
+        traffic = require_channel_traffic(product, case, host)
+    finally:
+        cleared = product.host_script(LATENCY_FAULT_CLEAR_SCRIPT.strip(), timeout=120)
+    require(
+        case, cleared is not None and cleared.returncode == 0,
+        f"the injected delay could not be removed: "
+        f"{(getattr(cleared, 'stderr', '') or '').strip()[-800:]!r}",
+    )
+
+    recovered = public_latency(product, host, case)
+    baseline_median = _median(baseline)
+    delayed_median = _median(delayed)
+    recovered_median = _median(recovered)
+    require(
+        case, delayed_median - baseline_median >= LATENCY_FAULT_MINIMUM_RISE_SECONDS,
+        f"the injected {LATENCY_FAULT_DELAY_MS} ms delay did not reach the client: "
+        f"{delayed_median:.3f}s against {baseline_median:.3f}s before it",
+    )
+    require(
+        case, recovered_median <= baseline_median + LATENCY_FAULT_BASELINE_TOLERANCE_SECONDS,
+        f"the client still waits {recovered_median:.3f}s after the delay was removed, "
+        f"against {baseline_median:.3f}s before it",
+    )
+
+    after = channel_state(product, case)
+    require(
+        case, after.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {after.get('unit', {}).get('ActiveState')!r} after the fault",
+    )
+    require(
+        case, after.get("health") == 200,
+        f"the Panel health route answered {after.get('health')!r} after the fault",
+    )
+    require_configuration_unchanged(case, before, after, "while the host was delayed")
+
+    return {
+        "delay_ms": str(LATENCY_FAULT_DELAY_MS),
+        "baseline_seconds": ",".join(f"{value:.3f}" for value in baseline),
+        "delayed_seconds": ",".join(f"{value:.3f}" for value in delayed),
+        "recovered_seconds": ",".join(f"{value:.3f}" for value in recovered),
+        "transfers_with_delay": traffic.get("transfer_count"),
+        "health_after": str(after.get("health")),
+    }
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
 def case_negative_destination(product: AioProduct) -> Dict[str, Any]:
     """AIO-NEG-DEST: a destination the product's egress policy excludes is denied.
 
@@ -2342,6 +4544,57 @@ def case_acme_fail_closed(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def case_installer_pin(product: AioProduct) -> Dict[str, Any]:
+    """AIO-NEG-PIN: a floating branch or an unverified installer never runs.
+
+    Both halves of the pin are asserted, because either one alone leaves the hole
+    open: a branch name must be refused even when a digest is configured, and bytes
+    that do not match the digest must be refused even when the commit is a real
+    SHA. The last probe calls the product's own install entrypoint with a scratch
+    SCRIPT_DIR, so what is proven is that the refusal happens before the installer
+    runs — not merely that a validator returns non-zero.
+    """
+    result = product.host_script(INSTALLER_PIN_SCRIPT, timeout=240)
+    require("AIO-NEG-PIN", result.returncode == 0,
+            f"the installer-pin probe failed: {(result.stderr or result.stdout or '').strip()[-600:]}")
+    values = _parse_key_values(result.stdout or "")
+    require("AIO-NEG-PIN", values.get("floating_commit") == "refused",
+            "a floating installer branch was accepted as a pinned commit")
+    require("AIO-NEG-PIN", values.get("missing_digest") == "refused",
+            "a pinned commit was accepted without the mandatory installer digest")
+    require("AIO-NEG-PIN", values.get("short_digest") == "refused",
+            "an installer digest that is not a 64-hex SHA-256 was accepted")
+    require("AIO-NEG-PIN", values.get("pinned_pair") == "accepted",
+            "a 40-hex commit with a 64-hex digest was refused, so the pin is unsatisfiable")
+    require("AIO-NEG-PIN", values.get("url_names_commit") == "yes",
+            "the derived installer URL does not name the pinned commit")
+    require("AIO-NEG-PIN", values.get("matching_bytes") == "accepted",
+            "an installer whose bytes match the configured digest was refused")
+    require("AIO-NEG-PIN", values.get("mismatched_bytes") == "refused",
+            "an installer whose bytes do not match the configured digest was accepted")
+    require("AIO-NEG-PIN", values.get("scratch_carries_bundle") == "no",
+            "the scratch directory carried a bundled installer, so the pinned branch was not the one exercised")
+    require("AIO-NEG-PIN", values.get("node_binary_present") == "yes",
+            "the node binary was not found, so an untouched installer proves nothing")
+    require("AIO-NEG-PIN", values.get("install_refused") == "yes",
+            f"install_local_node accepted a floating installer branch as a pin: {values.get('refusal_text', '')}")
+    require("AIO-NEG-PIN", values.get("refusal_names_pin") == "yes",
+            f"the install was refused, but not by the installer pin: {values.get('refusal_text', '')}")
+    require("AIO-NEG-PIN", values.get("installer_untouched") == "yes",
+            "the node binary or its unit changed, so an installer ran despite the refused pin")
+    return {
+        "floating_commit": values.get("floating_commit"),
+        "missing_digest": values.get("missing_digest"),
+        "short_digest": values.get("short_digest"),
+        "pinned_pair": values.get("pinned_pair"),
+        "url_names_commit": values.get("url_names_commit"),
+        "matching_bytes": values.get("matching_bytes"),
+        "mismatched_bytes": values.get("mismatched_bytes"),
+        "install_refused": values.get("install_refused"),
+        "installer_untouched": values.get("installer_untouched"),
+    }
+
+
 def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
     """AIO-NEG-DEP: the public surface fails with its NGINX dependency and recovers.
 
@@ -2387,6 +4640,209 @@ def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
         "public_without_dependency": "failed",
         "panel_loopback_login": values.get("login"),
         "public_after_recovery": 200,
+    }
+
+
+VISION_FAILURE_CASE_ID = "VIS-05"
+# A name inside the fixture zone that answers, and answers nowhere the run listens:
+# the Vision validation of that lineage is what fails. The address has to resolve,
+# because a name the resolver does not answer is refused by the direct-DNS
+# preflight before any ACME stage runs, and this case would then measure a refusal
+# that is not the one it is about. The offset is above every fixture the topology
+# places, so nothing in the run binds it and the HTTP-01 request cannot complete.
+VISION_FAILURE_DOMAIN = "vision-failed.testbed.internal"
+VISION_FAILURE_ADDRESS_OFFSET = 250
+# The failed attempt repeats the operator's install, so it runs the same stages
+# and gets the same hang ceiling rather than a shorter one that would read a slow
+# package step as a defect.
+VISION_FAILURE_TIMEOUT_SECONDS = INSTALL_TIMEOUT_SECONDS
+
+
+def vision_failure_inventory(host: Any, domain: str) -> str:
+    """The files a failed Vision stage must leave exactly as it found them.
+
+    Every value is a digest or a single word, because the case compares two runs
+    of this script and a prose answer cannot be compared. The lineages are the
+    certificate material the rollback has to preserve, the deploy hook and its
+    ownership record are the two files the ACME stage owns, and the NGINX digests
+    are the tree a half-applied Vision route would show up in.
+    """
+    lineages = [("panel", host.panel_domain), ("reality", host.reality_domain)]
+    if host.vision_domain:
+        lineages.append(("vision", host.vision_domain))
+    script = [
+        "set -uo pipefail",
+        "digest_of() {",
+        '    if [[ -f "$1" ]]; then sha256sum -- "$1" | cut -d" " -f1; else printf absent; fi',
+        "}",
+        "lineage_digest() {",
+        '    local live="/etc/letsencrypt/live/$1"',
+        '    if [[ -f "$live/fullchain.pem" && -f "$live/privkey.pem" ]]; then',
+        '        cat "$live/fullchain.pem" "$live/privkey.pem" | sha256sum | cut -d" " -f1',
+        "    else",
+        "        printf absent",
+        "    fi",
+        "}",
+    ]
+    for role, name in lineages:
+        script.append(f'echo "lineage_{role}=$(lineage_digest {shlex.quote(name)})"')
+    failed = shlex.quote(domain)
+    script += [
+        f"if [[ -e /etc/letsencrypt/renewal/{domain}.conf"
+        f" || -d /etc/letsencrypt/live/{domain} || -d /etc/letsencrypt/archive/{domain} ]]; then",
+        '    echo "failed_lineage=present"',
+        "else",
+        '    echo "failed_lineage=absent"',
+        "fi",
+        'echo "deploy_hook=$(digest_of /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh)"',
+        'echo "ownership_record=$(digest_of /var/lib/gowave-auto-nginx/recovery/deploy-hook-ownership.json)"',
+        'echo "stream_config=$(digest_of /etc/nginx/stream-enabled/gowave-stream.conf)"',
+        'echo "http_vhost=$(digest_of /etc/nginx/conf.d/gowave-http.conf)"',
+        'if [[ -e /etc/nginx/conf.d/gowave-vision-fallback.conf ]]; then',
+        '    echo "vision_fallback=present"',
+        "else",
+        '    echo "vision_fallback=absent"',
+        "fi",
+        'if [[ -e /etc/nginx/conf.d/00-bootstrap-acme.conf ]]; then',
+        '    echo "bootstrap_vhost=present"',
+        "else",
+        '    echo "bootstrap_vhost=absent"',
+        "fi",
+        f'echo "failed_domain_mentions=$(grep -rF -- {failed} /etc/nginx/stream-enabled'
+        ' /etc/nginx/conf.d 2>/dev/null | wc -l)"',
+        'echo "nginx_active=$(systemctl is-active nginx 2>/dev/null || true)"',
+        'if nginx -t -q >/dev/null 2>&1; then echo "nginx_test=0"; else echo "nginx_test=1"; fi',
+    ]
+    return "\n".join(script) + "\n"
+
+
+def vision_failure_facts(product: AioProduct, host: Any, domain: str) -> Dict[str, str]:
+    result = product.host_script(vision_failure_inventory(host, domain))
+    require(VISION_FAILURE_CASE_ID, result.returncode == 0,
+            f"the Vision-failure inventory probe exited {result.returncode}: "
+            f"{(result.stderr or result.stdout or '').strip()[-800:]}")
+    return _parse_key_values(result.stdout or "")
+
+
+def case_vision_certificate_failure(product: AioProduct) -> Dict[str, Any]:
+    """VIS-05: a Vision certificate failure aborts the attempt and leaves nothing behind.
+
+    The attempt is the operator's own install command, repeated on a host that
+    already carries the product, asking for a Vision domain the fixture resolver
+    deliberately does not answer. That puts the failure in the Vision stage — the
+    sentence this case is about — and it puts the failure after the Panel and
+    REALITY lineages were already in place, so a rollback that deleted them shows
+    up as a changed digest instead of as a file nobody expected to find.
+
+    Both halves are asserted. The stage has to fail: a nonzero exit whose last
+    word is the Vision acquisition, followed by a rollback that reports itself
+    complete. And it has to leave nothing advertising the endpoint: no lineage for
+    the failed name, no deploy-hook or ownership change, no NGINX file rewritten,
+    no bootstrap vhost left behind, no Panel inventory change, and the Panel still
+    answering the request the failed attempt did not take down.
+    """
+    host = product.require_installed()
+    before = vision_failure_facts(product, host, VISION_FAILURE_DOMAIN)
+    require(VISION_FAILURE_CASE_ID, before.get("lineage_panel") not in (None, "", "absent"),
+            f"the installed host carries no Panel lineage for the rollback to preserve: "
+            f"{before.get('lineage_panel')!r}")
+    require(VISION_FAILURE_CASE_ID, before.get("lineage_reality") not in (None, "", "absent"),
+            "the installed host carries no REALITY lineage for the rollback to preserve")
+    require(VISION_FAILURE_CASE_ID, before.get("failed_lineage") == "absent",
+            f"the host already has a lineage for {VISION_FAILURE_DOMAIN}, so a rollback could not "
+            "be told from an attempt that never issued anything")
+    require(VISION_FAILURE_CASE_ID, before.get("deploy_hook") not in (None, "", "absent"),
+            "the host carries no managed deploy hook, so the ACME stage owes nothing to restore")
+    require(VISION_FAILURE_CASE_ID, before.get("nginx_active") == "active",
+            f"NGINX reports {before.get('nginx_active')!r} before the failed attempt")
+    baseline = (_panel_facts(product, VISION_FAILURE_CASE_ID, "surface") or {}).get("surface") or {}
+
+    # The name has to answer for the failure to land in the Vision stage: the
+    # direct-DNS preflight refuses an unresolvable one before ACME is reached.
+    import ipaddress
+
+    zone = host.zone()
+    black_hole = str(
+        ipaddress.ip_network(host.plan.subnet, strict=False).network_address
+        + VISION_FAILURE_ADDRESS_OFFSET
+    )
+    steered = json.loads(json.dumps(zone))
+    steered.setdefault("records", {})[VISION_FAILURE_DOMAIN] = {"A": [black_hole]}
+    host.write_dns_zone(steered)
+    try:
+        attempt = host.install_vision_failure(VISION_FAILURE_DOMAIN)
+    finally:
+        host.write_dns_zone(zone)
+    output = f"{attempt.stdout}\n{attempt.stderr}"
+    require(VISION_FAILURE_CASE_ID, not attempt.ok,
+            f"the install asking for a Vision domain that cannot be validated exited 0:\n"
+            f"{attempt.tail(4000)}")
+    require(VISION_FAILURE_CASE_ID,
+            f"Acquiring Let's Encrypt TLS certificate for VLESS Vision ({VISION_FAILURE_DOMAIN})"
+            in output,
+            "the attempt never reached the Vision certificate stage, so the failure measured here "
+            f"is not the one this case is about:\n{attempt.tail(4000)}")
+    require(VISION_FAILURE_CASE_ID, "ACME certificate lineage rollback completed successfully." in output,
+            "the failed Vision stage did not report a complete lineage rollback:\n"
+            + attempt.tail(4000))
+    require(VISION_FAILURE_CASE_ID, "CRITICAL: ACME rollback incomplete" not in output,
+            "the failed Vision stage reported an incomplete rollback, so a side effect of the "
+            f"attempt survived it:\n{attempt.tail(4000)}")
+
+    after = vision_failure_facts(product, host, VISION_FAILURE_DOMAIN)
+    for role in ("panel", "reality", "vision"):
+        was, now = before.get(f"lineage_{role}"), after.get(f"lineage_{role}")
+        require(VISION_FAILURE_CASE_ID, was == now,
+                f"the rollback changed the pre-existing {role} certificate lineage: {was} -> {now}")
+    require(VISION_FAILURE_CASE_ID, after.get("failed_lineage") == "absent",
+            f"the failed attempt left a certificate lineage for {VISION_FAILURE_DOMAIN}")
+    require(VISION_FAILURE_CASE_ID, after.get("deploy_hook") == before.get("deploy_hook"),
+            "the failed attempt changed or removed the managed deploy hook")
+    require(VISION_FAILURE_CASE_ID, after.get("ownership_record") == before.get("ownership_record"),
+            "the failed attempt rewrote the deploy-hook ownership record")
+    require(VISION_FAILURE_CASE_ID, after.get("stream_config") == before.get("stream_config"),
+            "the failed attempt rewrote the stream SNI map")
+    require(VISION_FAILURE_CASE_ID, after.get("http_vhost") == before.get("http_vhost"),
+            "the failed attempt rewrote the HTTP vhost")
+    require(VISION_FAILURE_CASE_ID, after.get("failed_domain_mentions") in ("0", 0),
+            f"the failed attempt left {after.get('failed_domain_mentions')!r} reference(s) to "
+            f"{VISION_FAILURE_DOMAIN} in the NGINX tree")
+    require(VISION_FAILURE_CASE_ID, after.get("vision_fallback") == before.get("vision_fallback"),
+            "the failed attempt created or removed the 9444 fallback vhost")
+    require(VISION_FAILURE_CASE_ID, after.get("bootstrap_vhost") == before.get("bootstrap_vhost"),
+            "the failed attempt left a bootstrap ACME vhost behind")
+    require(VISION_FAILURE_CASE_ID, after.get("nginx_active") == "active",
+            f"NGINX reports {after.get('nginx_active')!r} after the failed attempt")
+    require(VISION_FAILURE_CASE_ID, after.get("nginx_test") == "0",
+            "the configuration in force does not pass `nginx -t` after the failed attempt")
+
+    current = (_panel_facts(product, VISION_FAILURE_CASE_ID, "surface") or {}).get("surface") or {}
+    for area in ("nodes", "profiles", "squads", "hosts"):
+        was = (baseline.get(area) or {}).get("count")
+        now = (current.get(area) or {}).get("count")
+        require(VISION_FAILURE_CASE_ID, was == now,
+                f"the failed attempt changed the Panel's {area} inventory: {was} -> {now}")
+
+    public = host.client_http(f"{PUBLIC_PANEL}/", expect_status=200, timeout=30)
+    require(VISION_FAILURE_CASE_ID, public["returncode"] == 0,
+            "the Panel's public surface stopped answering after the failed attempt: "
+            f"{public['probe'].get('error')}")
+    loopback = _parse_key_values(product.host_script(panel_probe_script()).stdout or "")
+    require(VISION_FAILURE_CASE_ID, loopback.get("login") == "200",
+            f"the Panel's own API stopped answering after the failed attempt: "
+            f"login {loopback.get('login')!r}")
+    return {
+        "attempt_returncode": attempt.returncode,
+        "attempt_seconds": round(attempt.duration, 1),
+        "vision_stage": "reached",
+        "rollback": "complete",
+        "failed_lineage": after.get("failed_lineage"),
+        "lineage_panel": after.get("lineage_panel") == before.get("lineage_panel"),
+        "lineage_reality": after.get("lineage_reality") == before.get("lineage_reality"),
+        "deploy_hook": after.get("deploy_hook") == before.get("deploy_hook"),
+        "failed_domain_mentions": after.get("failed_domain_mentions"),
+        "bootstrap_vhost": after.get("bootstrap_vhost"),
+        "public_panel": public["probe"].get("status"),
     }
 
 
@@ -2534,12 +4990,17 @@ def _restore_nginx_configuration(
 
     This runs from a ``finally`` block, so it reports its own failure instead of
     raising: the case's primary assertion is what the operator needs to read.
+    The runner's deadline is the exception — it says the harness, not the
+    product, ran out of time, so it passes through and the case is finished by
+    the runner's budget branch instead of being turned into a restore failure.
     """
     try:
         result = podman.exec_bash(
             container, ngx_config_script("restore", primary_domain), check=False,
             timeout=NGX_CONFIG_PROBE_TIMEOUT_SECONDS,
         )
+    except CaseTimeout:
+        raise
     except Exception as error:  # noqa: BLE001 - cleanup must not hide the primary finding
         return {"error": f"{type(error).__name__}: {error}"}
     detail = (result.stderr or result.stdout or "").strip()[-600:]
@@ -2736,8 +5197,10 @@ def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str
         str(renewal.get("stdout") or ""),
         str(renewal.get("stderr") or ""),
     ])
+    attempts = renewal.get("attempts") or []
     require(case_id, f"http-01 challenge for {domain}" in transcript,
-            f"{role}: the renewal for {domain} did not perform an HTTP-01 challenge, so the "
+            f"{role}: the renewal for {domain} performed no HTTP-01 challenge in "
+            f"{len(attempts)} attempt(s) ({[item.get('returncode') for item in attempts]}), so the "
             f"challenge route this case validates is not the one that was used (a CA that "
             f"reuses a valid authorization asks for no challenge at all): "
             f"{transcript.strip()[-800:]}")
@@ -2763,6 +5226,8 @@ def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str
         "returncode": renewal.get("returncode"),
         "duration_seconds": renewal.get("duration_seconds"),
         "challenge": f"http-01 for {domain}",
+        "attempts": len(attempts),
+        "authorization_reused": len(attempts) > 1,
         "installed_certificates_before": len(before),
         "installed_certificates_after": len(after),
         "serial_before": old.get("serial"),
@@ -3693,6 +6158,15 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     facts = product.collect_subscriptions("SUB-SERVED")
     require("SUB-SERVED", int(facts.get("short_uuid_length") or 0) > 0,
             "the default client has no shortUuid, so no subscription could be fetched")
+    # A scan with nothing to look for passes for the wrong reason. The values a
+    # leak would hand an attacker — the administrator's password, the Panel's
+    # signing key and, on an All-in-One host, the Node's key — are each readable
+    # on the host the probe ran on, so the probe has to have found more than the
+    # one value it could always fall back on before its counts mean anything.
+    require("SUB-SERVED", int(facts.get("secret_needles") or 0) >= 2,
+            f"the secret scan looked for {facts.get('secret_needles')!r} value(s), so a zero hit "
+            "count is not evidence: the administrator's password and the keys in the product's "
+            "environment files are readable on the host the probe ran on")
 
     served = facts.get("representations") or {}
     for name in REPRESENTATIONS:
@@ -3701,8 +6175,47 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
                 f"GET /api/sub/<shortUuid>/{name} returned {record.get('status')!r} instead of 200")
         require("SUB-SERVED", int(record.get("bytes") or 0) > 0,
                 f"the {name} representation is empty")
-        require("SUB-SERVED", bool(record.get("content_type")),
-                f"the {name} representation came back without a media type")
+        # The type is a claim about which importer the bytes belong to, so a
+        # generic or wrong one is not a cosmetic difference: a client selects on
+        # the type before it parses.
+        expected_type = REPRESENTATION_MEDIA_TYPES[name]
+        require("SUB-SERVED", record.get("content_type") == expected_type,
+                f"the {name} representation came back as media type "
+                f"{record.get('content_type')!r} instead of {expected_type!r}")
+        require("SUB-SERVED", int(record.get("secret_hits") or 0) == 0,
+                f"the {name} representation carries {record.get('secret_hits')!r} server-side "
+                f"secret(s) out of the {facts.get('secret_needles')!r} the probe looked for, so a "
+                f"client that stores its subscription stores the server's credentials too")
+        # The vhost disables caching on /api/sub/, because a cached list would
+        # keep working after the client it describes was revoked. The Panel
+        # process itself sends no Cache-Control, so the header is read through
+        # the public edge — the response a client actually receives — and the
+        # loopback value is recorded beside it to show which side adds it.
+        edge_control = str(record.get("edge_cache_control") or "")
+        require("SUB-SERVED", record.get("edge_status") == 200,
+                f"the public edge answered GET /api/sub/<shortUuid>/{name} with "
+                f"{record.get('edge_status')!r} instead of 200, so the headers a client receives "
+                f"could not be read")
+        require("SUB-SERVED", "no-store" in edge_control.lower(),
+                f"the public edge answered the {name} representation with Cache-Control "
+                f"{edge_control!r} (the Panel process itself answered "
+                f"{record.get('cache_control')!r}), which lets a cache serve a subscription the "
+                f"Panel no longer stands behind")
+        require("SUB-SERVED", record.get("edge_identical") is True,
+                f"the public edge served different bytes for the {name} representation than the "
+                f"Panel issued, so the Cache-Control header describes a body no engine consumed")
+        # The pinned policy is "a non-empty header", not "a header naming this
+        # format". Sending a header that names no client family is the only way
+        # to keep the suite from turning client identification into a server
+        # requirement the Panel never had.
+        require("SUB-SERVED", record.get("foreign_status") == 200,
+                f"GET /api/sub/<shortUuid>/{name} answered {record.get('foreign_status')!r} to "
+                f"User-Agent {panel_surface.FOREIGN_USER_AGENT!r}, which names no client family; "
+                f"the Panel requires a non-empty header, not a format")
+        require("SUB-SERVED", record.get("foreign_identical") is True,
+                f"the {name} representation answers User-Agent {panel_surface.FOREIGN_USER_AGENT!r} "
+                f"with different bytes than the header of the client that consumes it, so the header "
+                f"is selecting the representation instead of identifying the client")
 
     loaded = product.engine_facts("SUB-SERVED", "representations")
 
@@ -3730,6 +6243,77 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
             f"a served Xray {shape} profile needed {xray_json.get('wrapped')!r} runtime wrapper(s) "
             "before Xray accepted it, so it is not a runnable config")
 
+    # The matrix names the protocol/transport/security tuple and the client
+    # fingerprint each inbound is issued for, so the served outbound has to dial
+    # that same tuple: a client that imports the subscription can only reach the
+    # host the pair describes. The expectation is read from the subscription's
+    # own inbound set, so a matrix edit moves it instead of leaving a hand list
+    # behind.
+    inbounds = product.subscription_inbounds()
+    expected_transports = sorted({
+        f"{str(inbound.get('subscription_protocol') or inbound.get('protocol'))}"
+        f"/{inbound.get('transport')}/{inbound.get('security')}"
+        for inbound in inbounds
+    })
+    expected_fingerprints = sorted({str(inbound.get("fingerprint") or "") for inbound in inbounds})
+    require("SUB-SERVED", sorted(xray_json.get("transports") or []) == expected_transports,
+            f"the Xray profiles dial {xray_json.get('transports')!r} instead of the matrix's own "
+            f"transport set {expected_transports!r}, so a served outbound names a transport no "
+            "inbound was issued for")
+    require("SUB-SERVED", sorted(xray_json.get("fingerprints") or []) == expected_fingerprints,
+            f"the Xray profiles carry fingerprints {xray_json.get('fingerprints')!r} instead of "
+            f"the matrix's own {expected_fingerprints!r}")
+    require("SUB-SERVED", xray_json.get("sni_missing") == 0,
+            f"{xray_json.get('sni_missing')!r} served Xray outbound(s) carry no SNI, so the "
+            "certificate the client presents its name to is the wrong one")
+
+    # Every served outbound has to dial a host the Panel itself records, or the
+    # client reaches a name the fleet does not describe. The comparison is with
+    # `GET /api/hosts` — the document the Panel derives a client's config from —
+    # and not with the projection the installer posted, which would agree with
+    # itself. Address and SNI are what the clause names; the path or gRPC service
+    # name is what tells two inbounds sharing one name apart.
+    def dial_path(dial: Dict[str, Any]) -> str:
+        return str(dial.get("path") or dial.get("service_name") or "")
+
+    hosts = facts.get("hosts") or {}
+    records = [record for record in hosts.get("records") or [] if isinstance(record, dict)]
+    require("SUB-SERVED", hosts.get("status") == 200,
+            f"GET /api/hosts answered {hosts.get('status')!r}, so the served subscription could "
+            "not be compared with the records it is supposed to describe")
+    require("SUB-SERVED", bool(records),
+            "GET /api/hosts returned no Host record, so a subscription that agrees with nothing "
+            "would pass the comparison")
+    dials = [dial for dial in xray_json.get("dials") or [] if isinstance(dial, dict)]
+    require("SUB-SERVED", len(dials) == product.subscription_inbound_count,
+            f"{len(dials)} served Xray outbound(s) carry a dial tuple, expected one per inbound "
+            f"({product.subscription_inbound_count})")
+    unrecorded = []
+    mispathed = []
+    for dial in dials:
+        candidates = [
+            record for record in records
+            if record.get("address") == dial.get("address") and record.get("sni") == dial.get("sni")
+        ]
+        if not candidates:
+            unrecorded.append(dial)
+        elif dial_path(dial) and not any(record.get("path") == dial_path(dial) for record in candidates):
+            mispathed.append(dial)
+    described = ", ".join(
+        f"{record.get('remark')!r} {record.get('address')!r}/{record.get('sni')!r}"
+        f"{' path ' + repr(record.get('path')) if record.get('path') else ''}"
+        for record in records
+    )
+    require("SUB-SERVED", not unrecorded,
+            "the subscription dials "
+            + ", ".join(f"{dial.get('tag')!r} at {dial.get('address')!r}/{dial.get('sni')!r}"
+                        for dial in unrecorded)
+            + f", which no Host record names (records: {described})")
+    require("SUB-SERVED", not mispathed,
+            "the subscription dials "
+            + ", ".join(f"{dial.get('tag')!r} at path {dial_path(dial)!r}" for dial in mispathed)
+            + f", which no Host record on that address and SNI names (records: {described})")
+
     # Clash keeps only the trojan subset, and each node issues one, so a cluster
     # serves one Clash proxy per node rather than the single one an All-in-One
     # install serves.
@@ -3748,8 +6332,24 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         require("SUB-SERVED", sorted(record.get("proxy_types") or []) == list(expected_types),
                 f"the {name} YAML declares proxy types {record.get('proxy_types')!r}, expected "
                 f"{list(expected_types)!r}")
-        require("SUB-SERVED", record.get("match_rule"),
-                f"the {name} YAML has no MATCH rule, so a client would route nothing through it")
+        require("SUB-SERVED", record.get("duplicate_names") == 0,
+                f"the {name} YAML declares {record.get('duplicate_names')!r} duplicate proxy "
+                "name(s), so a client would route to one of two entries by the same name")
+        # A representation the engine loads but never routes through is not a
+        # working subscription, so a routing rule has to exist. Either family is
+        # accepted: the pinned Panel's Mihomo template ships `GEOIP,LAN,DIRECT`
+        # followed by `MATCH`, while the live contract names
+        # `GEOIP,private,DIRECT,no-resolve`, and the live runner accepts either.
+        rule_names = record.get("rule_names") or []
+        require("SUB-SERVED", record.get("match_rule") or "GEOIP" in rule_names,
+                f"the {name} YAML has no MATCH and no GEOIP rule (rules {rule_names!r}), so a "
+                "client would route nothing through it")
+
+    mihomo = loaded.get("mihomo") or {}
+    require("SUB-SERVED", sorted(mihomo.get("client_fingerprints") or []) == expected_fingerprints,
+            f"the Mihomo YAML carries client-fingerprint {mihomo.get('client_fingerprints')!r} "
+            f"instead of the matrix's own {expected_fingerprints!r}, so the uTLS preset a "
+            "REALITY host authenticates is not the one the fleet was configured with")
 
     # A subscription that loads is not yet a subscription for this cluster: the
     # YAML has to address the Worker too, or the client would only ever reach the
@@ -3768,26 +6368,63 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     require("SUB-SERVED", int(singbox.get("outbounds") or 0) > 0,
             "the sing-box JSON carries no outbounds")
 
+    # The private half of REALITY never leaves the Panel: a client is issued
+    # `publicKey` and has no reader for the other one, so a document that carries
+    # it hands every subscriber the server's own key. The count is of key names in
+    # the served bytes, which is why a Trojan password — legitimate client
+    # material — is not mistaken for one.
+    private_documents = (
+        ("base64", base64), ("xray-json", xray_json),
+        ("mihomo", mihomo), ("clash", loaded.get("clash") or {}), ("singbox", singbox),
+    )
+    for name, record in private_documents:
+        require("SUB-SERVED", int(record.get("private_keys") or 0) == 0,
+                f"the {name} representation carries {record.get('private_keys')!r} server-side "
+                "private key field(s), so every client that imports it holds the server's key")
+
     evidence: Dict[str, Any] = {"short_uuid_length": facts.get("short_uuid_length")}
+    evidence["secret_needles"] = facts.get("secret_needles")
     for name in REPRESENTATIONS:
         record = served.get(name) or {}
         evidence[f"{name}_status"] = record.get("status")
         evidence[f"{name}_content_type"] = record.get("content_type")
+        evidence[f"{name}_secret_hits"] = record.get("secret_hits")
+        evidence[f"{name}_cache_control"] = record.get("edge_cache_control")
+        evidence[f"{name}_backend_cache_control"] = record.get("cache_control")
+        evidence[f"{name}_edge_status"] = record.get("edge_status")
+        evidence[f"{name}_edge_identical"] = record.get("edge_identical")
         evidence[f"{name}_bytes"] = record.get("bytes")
+        evidence[f"{name}_foreign_status"] = record.get("foreign_status")
+        evidence[f"{name}_foreign_identical"] = record.get("foreign_identical")
+    evidence["ua_foreign"] = panel_surface.FOREIGN_USER_AGENT
     evidence["base64_link_count"] = base64.get("link_count")
     evidence["base64_schemes"] = ",".join(base64.get("schemes") or [])
     evidence["xray_json_shape"] = shape
     evidence["xray_json_entries"] = xray_json.get("entries")
     evidence["xray_json_wrapped"] = xray_json.get("wrapped")
     evidence["xray_json_protocols"] = ",".join(xray_json.get("protocols") or [])
+    evidence["xray_json_transports"] = ",".join(xray_json.get("transports") or [])
+    evidence["xray_json_fingerprints"] = ",".join(xray_json.get("fingerprints") or [])
+    evidence["xray_json_sni_missing"] = xray_json.get("sni_missing")
+    evidence["xray_json_expected_transports"] = ",".join(expected_transports)
+    evidence["xray_json_dials"] = len(dials)
+    evidence["host_records"] = len(records)
+    evidence["host_record_mismatches"] = len(unrecorded) + len(mispathed)
+    evidence["xray_json_private_keys"] = xray_json.get("private_keys")
     for name in ("mihomo", "clash"):
         record = loaded.get(name) or {}
         evidence[f"{name}_proxies"] = record.get("proxies")
         evidence[f"{name}_proxy_types"] = ",".join(record.get("proxy_types") or [])
         evidence[f"{name}_groups"] = record.get("groups")
         evidence[f"{name}_match_rule"] = record.get("match_rule")
+        evidence[f"{name}_rule_names"] = ",".join(record.get("rule_names") or [])
+        evidence[f"{name}_duplicate_names"] = record.get("duplicate_names")
+        evidence[f"{name}_client_fingerprints"] = ",".join(record.get("client_fingerprints") or [])
+        evidence[f"{name}_private_keys"] = record.get("private_keys")
     evidence["mihomo_servers"] = ",".join(sorted(mihomo_servers))
+    evidence["base64_private_keys"] = base64.get("private_keys")
     evidence["singbox_outbounds"] = singbox.get("outbounds")
+    evidence["singbox_private_keys"] = singbox.get("private_keys")
     return evidence
 
 
@@ -3818,6 +6455,534 @@ def case_user_agent_absent(product: AioProduct) -> Dict[str, Any]:
 def case_user_agent_blank(product: AioProduct) -> Dict[str, Any]:
     """SUB-UA-BLANK: a subscription request with an explicitly blank header is refused."""
     return _user_agent_case(product, "SUB-UA-BLANK", "ua-blank", "blank")
+
+
+SUB_EDGE_CASE_ID = "SUB-EDGE"
+SUB_EDGE_FORGERY_CASE_ID = "SUB-EDGE-BAD"
+SUB_EDGE_TIMEOUT_SECONDS = 300
+# The two headers the shipped subscription location attaches to every answer it
+# sends. ``always`` is what makes them survive a refusal the Panel itself
+# produced, so the absent-header answer is read for them too.
+SUBSCRIPTION_CACHE_CONTROL = "no-store"
+SUBSCRIPTION_ROBOTS_TAG = "noindex, nofollow, noarchive, nosnippet"
+# The access log is read as a whole: a served subscription must leave no line
+# with a one-segment ``/api/sub/<shortUuid>`` target, while a refused raw target
+# must leave one. The refused target is the probe's own invention and carries no
+# client credential, which is why it may be looked for by its tail.
+SUB_EDGE_ACCESS_LOG_PROBE = r"""
+python3 - <<'PY'
+import json, re
+
+path = "/var/log/nginx/access.log"
+served = re.compile(r'"(?:GET|HEAD) /api/sub/[A-Za-z0-9_-]{16,}(?:\?[^"]*)? HTTP/[0-9.]+"')
+try:
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        lines = handle.read().splitlines()
+except OSError:
+    print(json.dumps({"present": False, "lines": 0, "served": 0,
+                      "refused_dot_segment": 0, "refused_encoded_separator": 0}))
+else:
+    print(json.dumps({
+        "present": True,
+        "lines": len(lines),
+        "served": sum(1 for line in lines if served.search(line)),
+        "refused_dot_segment": sum(
+            1 for line in lines if "/../x HTTP/" in line and '" 444 ' in line
+        ),
+        "refused_encoded_separator": sum(
+            1 for line in lines if "%2Fv2ray-json HTTP/" in line and '" 444 ' in line
+        ),
+    }))
+PY
+"""
+
+
+def case_subscription_edge(product: AioProduct) -> Dict[str, Any]:
+    """SUB-EDGE: the subscription surface answers crawlers and clients differently.
+
+    A subscription URL is what a client keeps on its phone, so it is also what
+    gets pasted into a chat. The listener therefore has to answer three audiences
+    differently: a client gets the bytes the Panel issued, a link-preview crawler
+    gets an empty ``204`` that unfurls into nothing, and a headerless request gets
+    whatever the Panel itself decides. The Panel's own request counter is read on
+    both sides of the crawler sweep, because the Panel is the process that would
+    have served them and it counts them whether or not its request log is enabled.
+    A loopback fetch after the sweep is the control that proves the counter moves.
+
+    The forged targets are the refusal case's subject; this one reads only the
+    answers a client and a crawler are meant to receive.
+    """
+    case = SUB_EDGE_CASE_ID
+    edge = _subscription_edge_facts(product, case)
+
+    served = edge.get("served") or {}
+    require(case, served.get("status") == 200,
+            f"a client fetch of the subscription answered {served.get('status')!r} instead of 200")
+    require(case, served.get("bytes", 0) > 0, "the subscription body was empty for a real client")
+    require(case, SUBSCRIPTION_CACHE_CONTROL in str(served.get("cache_control") or "").lower(),
+            f"the served subscription carries Cache-Control {served.get('cache_control')!r}, "
+            f"which would let a pasted link be cached")
+    require(case, (served.get("x_robots_tag") or "") == SUBSCRIPTION_ROBOTS_TAG,
+            f"the served subscription carries X-Robots-Tag {served.get('x_robots_tag')!r} "
+            f"instead of {SUBSCRIPTION_ROBOTS_TAG!r}")
+    require(case, edge.get("served_identical_to_loopback") is True,
+            "the edge did not hand the client the bytes the Panel issued")
+
+    foreign = edge.get("foreign") or {}
+    require(case, foreign.get("status") == 200,
+            f"a header naming no client family answered {foreign.get('status')!r}: the "
+            f"listener is selecting a representation from the header instead of the path")
+    require(case, edge.get("foreign_identical") is True,
+            "the same path answered a foreign User-Agent with different bytes")
+
+    absent = edge.get("absent") or {}
+    require(case, absent.get("status") == panel_surface.SUBSCRIPTION_ABSENT_HEADER_STATUS,
+            f"a request with no User-Agent answered {absent.get('status')!r} instead of the "
+            f"Panel's own {panel_surface.SUBSCRIPTION_ABSENT_HEADER_STATUS}")
+    require(case, SUBSCRIPTION_CACHE_CONTROL in str(absent.get("cache_control") or "").lower()
+            and (absent.get("x_robots_tag") or "") == SUBSCRIPTION_ROBOTS_TAG,
+            f"the Panel's refusal lost the transport headers: {absent.get('cache_control')!r} / "
+            f"{absent.get('x_robots_tag')!r}")
+
+    previews = edge.get("previews") or {}
+    require(case, set(previews) == set(panel_surface.PREVIEW_USER_AGENTS),
+            f"the probe classified {len(previews)} preview families instead of "
+            f"{len(panel_surface.PREVIEW_USER_AGENTS)}")
+    served_previews = sorted(
+        agent for agent, answer in previews.items()
+        if answer.get("status") != panel_surface.SUBSCRIPTION_PREVIEW_STATUS
+    )
+    require(case, not served_previews,
+            f"the listener answered {', '.join(served_previews)} with a subscription instead "
+            f"of {panel_surface.SUBSCRIPTION_PREVIEW_STATUS}")
+    leaked = sorted(agent for agent, answer in previews.items() if answer.get("bytes"))
+    require(case, not leaked, f"the empty answer carried a body for {', '.join(leaked)}")
+    missing_headers = sorted(
+        agent for agent, answer in previews.items()
+        if SUBSCRIPTION_CACHE_CONTROL not in str(answer.get("cache_control") or "").lower()
+        or (answer.get("x_robots_tag") or "") != SUBSCRIPTION_ROBOTS_TAG
+    )
+    require(case, not missing_headers,
+            f"the empty answer lost the transport headers for {', '.join(missing_headers)}")
+
+    counters = edge.get("counters") or {}
+    before = (counters.get("before") or {}).get("counts") or {}
+    after = (counters.get("after") or {}).get("counts") or {}
+    control = (counters.get("control") or {}).get("counts") or {}
+    require(case, (counters.get("before") or {}).get("status") == 200,
+            f"the Panel's route counters answered {(counters.get('before') or {}).get('status')!r}")
+    require(case, before == after,
+            f"the preview sweep reached the Panel: {after!r} vs {before!r}")
+    added = sum(int(control.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS) \
+        - sum(int(after.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS)
+    require(case, added == 1,
+            f"the control fetch moved the Panel's counter by {added!r}; without it the quiet "
+            f"sweep above would be an instrument that never moves")
+    require(case, counters.get("control_status") == 200,
+            f"the control fetch answered {counters.get('control_status')!r}")
+
+    return {
+        "served_status": served.get("status"),
+        "served_cache_control": served.get("cache_control"),
+        "served_x_robots_tag": served.get("x_robots_tag"),
+        "served_bytes": served.get("bytes"),
+        "foreign_status": foreign.get("status"),
+        "absent_status": absent.get("status"),
+        "preview_count": len(previews),
+        "preview_statuses": ",".join(sorted({str(answer.get("status")) for answer in previews.values()})),
+        "preview_bytes": max((int(answer.get("bytes") or 0) for answer in previews.values()), default=0),
+        "panel_requests_added_by_previews": (
+            sum(int(after.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS)
+            - sum(int(before.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS)
+        ),
+        "panel_requests_added_by_control": added,
+    }
+
+
+def case_subscription_edge_forgery(product: AioProduct) -> Dict[str, Any]:
+    """SUB-EDGE-BAD: a target the Panel never sees is closed, and the log says so.
+
+    The rule reads the raw request target, so it is only observable where the
+    target still exists: a client library normalises ``/x/../y`` and decodes
+    ``%2F`` before sending, and the request would then look like an ordinary
+    subscription. Both targets here go on the wire verbatim, and neither may be
+    answered with a status.
+
+    The access log is read from the same host as the pair that makes it evidence.
+    The refused targets have to appear — otherwise the log is off and its silence
+    about the served fetch proves nothing — and no served ``/api/sub/<shortUuid>``
+    line may appear, because that path is where a client's credential would be
+    written down.
+    """
+    case = SUB_EDGE_FORGERY_CASE_ID
+    edge = _subscription_edge_facts(product, case)
+
+    refused = edge.get("refused") or {}
+    for label, description in (
+        ("dot_segment", "a dot-segment target"),
+        ("encoded_separator", "an encoded separator"),
+    ):
+        answer = refused.get(label) or {}
+        require(case, answer.get("closed") is True and answer.get("bytes") == 0,
+                f"{description} was answered with {answer.get('status')!r} and "
+                f"{answer.get('bytes')!r} bytes instead of a closed connection")
+
+    log = probe_json(case, "the NGINX access log", product.host_script(SUB_EDGE_ACCESS_LOG_PROBE))
+    require(case, log.get("present") is True and int(log.get("lines") or 0) > 0,
+            f"the NGINX access log is absent or empty, so its silence proves nothing: {log!r}")
+    require(case, int(log.get("served") or 0) == 0,
+            f"the access log holds {log.get('served')!r} served subscription lines; a fetch of "
+            f"/api/sub/<shortUuid> must leave none")
+    require(case, int(log.get("refused_dot_segment") or 0) >= 1
+            and int(log.get("refused_encoded_separator") or 0) >= 1,
+            f"the access log did not record both refused targets, so it cannot be the log that "
+            f"would have recorded a served one: {log!r}")
+
+    return {
+        "refused_dot_segment": "closed" if (refused.get("dot_segment") or {}).get("closed") else "answered",
+        "refused_encoded_separator": (
+            "closed" if (refused.get("encoded_separator") or {}).get("closed") else "answered"
+        ),
+        "access_log_lines": log.get("lines"),
+        "access_log_served_lines": log.get("served"),
+        "access_log_refused_lines": (
+            int(log.get("refused_dot_segment") or 0) + int(log.get("refused_encoded_separator") or 0)
+        ),
+    }
+
+
+def _subscription_edge_facts(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Run the edge-contract probe once and return the block the two cases read."""
+    host = product.require_installed()
+    ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+    facts = panel_probe(
+        product, case_id, "edge-contract",
+        f"--edge-base https://{host.panel_domain} --ca {ca_file}",
+    )
+    edge = facts.get("edge") or {}
+    require(case_id, int(edge.get("short_uuid_length") or 0) > 0,
+            "the Panel served no default client, so there is no subscription to read")
+    return edge
+
+
+NGX_HYGIENE_CASE_ID = "NGX-HYGIENE"
+NGX_SCANNER_CASE_ID = "NGX-SCANNER"
+NGX_HYGIENE_TIMEOUT_SECONDS = 300
+
+
+def _panel_hygiene_facts(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Run the vhost-hygiene probe once and return the block both cases read."""
+    host = product.require_installed()
+    ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+    facts = panel_probe(
+        product, case_id, "vhost-hygiene",
+        f"--edge-base https://{host.panel_domain} --ca {ca_file}",
+    )
+    hygiene = facts.get("hygiene") or {}
+    require(case_id, int(hygiene.get("short_uuid_length") or 0) > 0,
+            "the Panel served no default client, so no request could be recorded against one")
+    return hygiene
+
+
+def case_ngx_hygiene(product: AioProduct) -> Dict[str, Any]:
+    """NGX-HYGIENE: the edge hides its build and passes on only the peer address.
+
+    Two audiences share one listener: an operator's scanner, which sorts hosts by
+    the version they announce, and the Panel, which believes whichever client
+    address it is handed and uses it for rate limits, login records and
+    notifications. The build therefore has to be absent from every answer NGINX
+    writes — including the error page it produces before a request reaches a
+    route — and the address the Panel records has to be the peer, whatever header
+    the client sends. Each header the Panel prefers over the socket is forged in
+    turn, because a listener that clears eight of nine would otherwise read as
+    correct; the subscription history is the Panel's own record of that address.
+    """
+    case = NGX_HYGIENE_CASE_ID
+    hygiene = _panel_hygiene_facts(product, case)
+
+    answers = hygiene.get("server") or {}
+    answered = answers.get("answered") or {}
+    unmatched = answers.get("unmatched") or {}
+    require(case, answered.get("status") == 200,
+            f"the Panel health route answered {answered.get('status')!r} through the edge")
+    # The Panel serves its own frontend for a path no route occupies, so the
+    # second reading is a 200 the upstream wrote. A 404 there would be the
+    # listener's page, which is what a path that stopped being proxied looks
+    # like.
+    require(case, unmatched.get("status") == 200,
+            f"a path no Panel route occupies answered {unmatched.get('status')!r} through the "
+            f"edge; the Panel serves its frontend there, so anything else is the listener "
+            f"answering in the product's place")
+    for label, entry in (("a served answer", answered), ("the frontend answer", unmatched)):
+        build = panel_surface.NGINX_VERSION.search(str(entry.get("server") or ""))
+        require(case, build is None,
+                f"{label} names the build in Server: {entry.get('server')!r}")
+
+    page = hygiene.get("error_page") or {}
+    require(case, page.get("status") == 414,
+            f"a request line past the header buffer was answered {page.get('status')!r}, so this "
+            f"run read no error page NGINX wrote itself")
+    build = panel_surface.NGINX_VERSION.search(str(page.get("server") or ""))
+    require(case, build is None,
+            f"NGINX's own error page carries its version in Server: {page.get('server')!r}")
+    require(case, not page.get("version_in_body"),
+            f"NGINX's own error page states its version in the body ({page.get('bytes')!r} bytes)")
+
+    peer = str(hygiene.get("peer_recorded_ip") or "")
+    source = str(hygiene.get("probe_source_ip") or "")
+    require(case, source,
+            "the probe could not read the source address its own request carries, so the "
+            "recorded address has nothing to be compared with")
+    require(case, peer == source,
+            f"the Panel recorded {peer!r} for a request carrying no forged header, not the "
+            f"address that request's own connection carried ({source!r})")
+    recorded = hygiene.get("client_ip") or {}
+    require(case, set(recorded) == set(panel_surface.PANEL_CLIENT_IP_HEADERS),
+            f"the probe read {sorted(recorded)} instead of every header the Panel prefers over "
+            f"the socket")
+    for header in panel_surface.PANEL_CLIENT_IP_HEADERS:
+        entry = recorded.get(header) or {}
+        with_header = f"a request carrying {header}: {panel_surface.FORGED_CLIENT_IP}"
+        require(case, entry.get("status") == 200,
+                f"{with_header} was answered {entry.get('status')!r} rather than served")
+        require(case, not entry.get("forged_was_recorded"),
+                f"the Panel recorded the address {with_header} supplied")
+        require(case, entry.get("recorded_is_peer"),
+                f"{with_header} was recorded against {entry.get('recorded_ip')!r} instead of the "
+                f"peer {peer!r}")
+
+    routes = hygiene.get("product_routes") or {}
+    require(case, set(routes) == {label for label, _, _ in panel_surface.PANEL_PRODUCT_ROUTE_PROBES}
+            | {"subscription"},
+            f"the probe read {sorted(routes)} rather than every product surface")
+    # The Panel's own refusals on the two API routes: a status it chose proves the
+    # request reached it, which is what "still proxied" means for a route behind
+    # an authenticated surface.
+    for label, expected in (("rest-api", (401, 403)), ("subscription", (200,))):
+        entry = routes.get(label) or {}
+        require(case, entry.get("status") in expected,
+                f"the {label} route answered {entry.get('status')!r} through the edge instead of "
+                f"{expected}")
+    for label, _, _ in panel_surface.PANEL_PRODUCT_ROUTE_PROBES:
+        if label == "rest-api":
+            continue
+        entry = routes.get(label) or {}
+        require(case, entry.get("closed") is False,
+                f"the {label} surface was closed instead of proxied")
+        require(case, entry.get("status") not in (0, 444),
+                f"the {label} surface answered {entry.get('status')!r}, which is the scanner rule "
+                f"and not the upstream")
+
+    observed = {label: (entry or {}).get("status") for label, entry in routes.items()}
+    return {
+        "server_answered": answered.get("server", ""),
+        "server_unmatched": unmatched.get("server", ""),
+        "error_page_status": page.get("status"),
+        "peer_recorded_ip": peer,
+        "probe_source_ip": source,
+        "headers_forged": " ".join(sorted(recorded)),
+        "product_routes": " ".join(f"{label}={observed[label]}" for label in sorted(observed)),
+    }
+
+
+def case_ngx_scanner(product: AioProduct) -> Dict[str, Any]:
+    """NGX-SCANNER: a scanner target is closed at the edge, the product is not.
+
+    The refusal is only worth reading next to a control: the same client, on a
+    path the Panel answers, has to reach the Panel. Without that half a listener
+    that closed every connection would pass, and the rule that made the host
+    quieter would have been indistinguishable from one that broke it.
+    """
+    case = NGX_SCANNER_CASE_ID
+    hygiene = _panel_hygiene_facts(product, case)
+
+    scanner = hygiene.get("scanner") or {}
+    require(case, set(scanner) == set(panel_surface.PANEL_SCANNER_PATHS),
+            f"the probe read {sorted(scanner)} rather than the shipped scanner set")
+    for path in panel_surface.PANEL_SCANNER_PATHS:
+        entry = scanner.get(path) or {}
+        require(case, entry.get("closed") is True,
+                f"{path} was answered with status {entry.get('status')!r} instead of a closed "
+                f"connection")
+        require(case, entry.get("status") == 0 and entry.get("bytes") == 0,
+                f"{path} closed after sending {entry.get('bytes')!r} bytes with status "
+                f"{entry.get('status')!r}")
+
+    control = hygiene.get("scanner_control") or {}
+    require(case, control.get("closed") is False,
+            "the control request on a proxied path was closed too, so the refusals prove nothing")
+    require(case, control.get("status") in (401, 403),
+            f"an anonymous /api/nodes answered {control.get('status')!r} through the edge, not "
+            f"the Panel's own refusal")
+
+    return {
+        "refused": " ".join(sorted(scanner)),
+        "control_status": control.get("status"),
+    }
+
+
+PRE_INPUTS_CASE_ID = "PRE-INPUTS"
+PRE_INPUTS_BAD_CASE_ID = "PRE-INPUTS-BAD"
+PRE_INPUTS_TIMEOUT_SECONDS = 300
+
+
+def preflight_inputs_script() -> str:
+    """Two install requests that must be refused before the host is touched.
+
+    Both are the operator's own command run against the host this run already
+    installed, so the control is the product itself: the first stops short of the
+    ACME contact, the second fills every position with a value that is not an
+    address. Neither may reach the NGINX stop or a managed path, which is why the
+    probe ends by reading the Panel back — an install that refused after stopping
+    NGINX would otherwise be indistinguishable from one that refused early.
+    """
+    quoted = " ".join(shlex.quote(value) for value in (PANEL_DOMAIN, REALITY_DOMAIN))
+    return (
+        "set -uo pipefail\n"
+        "ask() {\n"
+        '    local prefix="$1"\n'
+        "    shift\n"
+        "    bash " + topology.REPO_IN_CONTAINER + "/gowave-auto.sh install \"$@\""
+        ' </dev/null >"/tmp/${prefix}.log" 2>&1\n'
+        "    local status=$?\n"
+        "    printf '%s_rc=%s\\n' \"$prefix\" \"$status\"\n"
+        '    sed -n "s/^Error: /${prefix}_message=/p" "/tmp/${prefix}.log" | head -n 1\n'
+        "}\n"
+        f"ask missing {quoted}\n"
+        f"ask malformed {quoted} not-an-email\n"
+        + panel_probe_script()
+        + "printf 'nginx=%s\\n' \"$(systemctl is-active nginx.service 2>/dev/null | head -n 1)\"\n"
+    )
+
+
+def _preflight_inputs_facts(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Run both refused requests once and return the block both cases read.
+
+    The two refusal sentences are read line by line: the shared token parser
+    keeps one word per value, and a message the case has to compare word for word
+    would otherwise arrive truncated to ``install``.
+    """
+    result = product.host_script(preflight_inputs_script(), timeout=PRE_INPUTS_TIMEOUT_SECONDS)
+    require(case_id, result.returncode == 0,
+            "the input-contract probe failed: "
+            f"{(result.stderr or result.stdout or '').strip()[-800:]}")
+    facts = _parse_key_values(result.stdout or "")
+    for line in (result.stdout or "").splitlines():
+        for key in ("missing_message", "malformed_message"):
+            prefix = f"{key}="
+            if line.startswith(prefix):
+                facts[key] = line[len(prefix):].strip()
+    require(case_id, bool(facts.get("missing_rc")) and bool(facts.get("malformed_rc")),
+            f"the probe reported no refusal for one of the two requests: {sorted(facts)}")
+    return facts
+
+
+def _inventory_changes(before: Dict[str, List[str]],
+                       after: Dict[str, List[str]]) -> List[str]:
+    """Name every resource area the two inventories disagree about, with its diff."""
+    changes: List[str] = []
+    for section in sorted(set(before) | set(after)):
+        old = before.get(section) or []
+        new = after.get(section) or []
+        if old == new:
+            continue
+        removed = [line for line in old if line not in new]
+        added = [line for line in new if line not in old]
+        detail = "; ".join(
+            [f"added {line}" for line in added[:3]] + [f"removed {line}" for line in removed[:3]]
+        )
+        changes.append(f"{section} ({detail})")
+    return changes
+
+
+def case_preflight_inputs(product: AioProduct) -> Dict[str, Any]:
+    """PRE-INPUTS: an incomplete request is refused and the installed host is untouched.
+
+    The refusal is only worth reading against the state it must not disturb: the
+    contract runs before the NGINX stop and before any managed path is written, so
+    a request that stops short of a required value has to leave the product
+    serving and its inventory byte-identical. The Panel is read back afterwards,
+    because a listener left stopped is the failure this ordering exists to avoid.
+    """
+    case = PRE_INPUTS_CASE_ID
+    before = system_inventory(product, case)
+    facts = _preflight_inputs_facts(product, case)
+    after = system_inventory(product, case)
+
+    message = str(facts.get("missing_message") or "")
+    require(case, facts.get("missing_rc") == "2",
+            f"an install request that stopped short of the ACME contact exited "
+            f"{facts.get('missing_rc')!r} instead of refusing")
+    # The positional entry point names the field in its own usage vocabulary
+    # ("the acme email"), while the shared input contract names it "the ACME
+    # contact email". Both are the product's own words on two different paths,
+    # so the case asks that the missing field is named at all, in either.
+    lowered = message.lower()
+    require(case, "acme" in lowered and "email" in lowered,
+            f"the refusal does not name the missing input: {message!r}")
+
+    changes = _inventory_changes(before, after)
+    require(case, not changes,
+            "the refused request rewrote the host it was supposed to leave alone: "
+            + " | ".join(changes))
+
+    require(case, facts.get("nginx") == "active",
+            f"NGINX was {facts.get('nginx')!r} after the refusal, not still serving")
+    require(case, facts.get("login") == "200" and facts.get("api") == "200",
+            f"the Panel answered login={facts.get('login')!r} api={facts.get('api')!r} after the "
+            f"refusal")
+
+    return {
+        "missing_status": facts.get("missing_rc"),
+        "missing_names": message,
+        "nginx": facts.get("nginx"),
+        "panel_login": facts.get("login"),
+        "panel_api": facts.get("api"),
+        "inventory_unchanged": not changes,
+    }
+
+
+def case_preflight_inputs_bad(product: AioProduct) -> Dict[str, Any]:
+    """PRE-INPUTS-BAD: a value that is present but malformed is refused on its field.
+
+    A contract that only counted arguments would accept this request and fail
+    later, inside a step that has already stopped NGINX. The value is quoted back
+    in the refusal so the operator can see which input was rejected, and the host
+    is inventoried again for the same reason the missing-input case does it.
+    """
+    case = PRE_INPUTS_BAD_CASE_ID
+    before = system_inventory(product, case)
+    facts = _preflight_inputs_facts(product, case)
+    after = system_inventory(product, case)
+
+    message = str(facts.get("malformed_message") or "")
+    require(case, facts.get("malformed_rc") == "2",
+            f"an install request carrying a malformed ACME contact exited "
+            f"{facts.get('malformed_rc')!r} instead of refusing")
+    require(case, "acme contact email" in message.lower(),
+            f"the refusal does not name the rejected input: {message!r}")
+    require(case, "not-an-email" in message,
+            f"the refusal does not quote the rejected value: {message!r}")
+
+    changes = _inventory_changes(before, after)
+    require(case, not changes,
+            "the refused request rewrote the host it was supposed to leave alone: "
+            + " | ".join(changes))
+
+    require(case, facts.get("nginx") == "active",
+            f"NGINX was {facts.get('nginx')!r} after the refusal, not still serving")
+    require(case, facts.get("login") == "200" and facts.get("api") == "200",
+            f"the Panel answered login={facts.get('login')!r} api={facts.get('api')!r} after the "
+            f"refusal")
+
+    return {
+        "malformed_status": facts.get("malformed_rc"),
+        "malformed_names": message,
+        "nginx": facts.get("nginx"),
+        "panel_login": facts.get("login"),
+        "panel_api": facts.get("api"),
+        "inventory_unchanged": not changes,
+    }
 
 
 def case_share_links(product: AioProduct) -> Dict[str, Any]:
@@ -3903,11 +7068,17 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
 
 def case_data_plane(
     product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
+    deployed_core: str = "",
 ) -> Dict[str, Any]:
     """One matrix tuple carries a payload through the product it belongs to.
 
     The case id comes from the matrix topology the product names (``AIO-DP-…``
     for one host, ``MN-DP-<node>-…`` for a cluster).
+
+    ``deployed_core`` is the Xray core of the node that serves this tuple, when
+    the caller can name it: in a cluster the Master and the Worker each run their
+    own, and the client core is compared with the one whose inbound carried the
+    payload rather than with whichever host happened to be interrogated.
 
     The engines run from the Control Machine, so a transfer that shows up at the
     endpoint with the installed host as its source address traversed the product.
@@ -3927,7 +7098,39 @@ def case_data_plane(
                              node=node)
     product.subscription_payloads(case_id)
     expectations = matrix_expectations(product, inbound, node)
-    facts = product.transfer_facts(case_id, str(inbound["id"]), client, node=node)
+    # DP-03: the engine that carries the payload reports its own version, and an
+    # Xray client core has to be the build the node deployed. Read before the
+    # transfer, so the tuple records the core it ran under rather than the one the
+    # image was built with.
+    engine = product.engine_version(case_id, client)
+    if client == "xray":
+        serving_core = deployed_core or product.server_core_version
+        require(case_id, bool(serving_core),
+                f"the {node or 'local'} node's Xray core version was never read, so the client "
+                "core cannot be compared with it")
+        require(case_id, engine["engine_version"] == serving_core,
+                f"the {client} client core is {engine['engine_version']!r} while the "
+                f"{node or 'local'} node deployed {serving_core!r}, so this tuple ran an "
+                "unmatched core")
+    # The request runs inside a capture on every host that could have taken it,
+    # so the endpoint's account of the payload is joined by the hosts' account of
+    # the connection: which of them the client's packets reached, from which
+    # address, and with nothing persisted to read it back from later.
+    measurement = product.bracket_request(
+        lambda: product.transfer_facts(case_id, str(inbound["id"]), client, node=node),
+        inbound, node,
+    )
+    facts = measurement.request
+    packets = ingress.evaluate(measurement)
+    if packets["verdict"] != ingress.PASS:
+        # A capture that does not decide in the product's favour is exactly the
+        # case whose evidence the runner cannot keep: it attaches evidence only
+        # to a passing case, and this one is about to fail on the line below.
+        # The measurement is written here instead, so a red tuple is attributable
+        # from its own artifacts rather than from a rerun.
+        product.context.evidence_text(
+            f"{case_id.lower()}-ingress.txt", ingress.account(measurement, packets),
+        )
 
     transport = f"{inbound['transport']}/{inbound['security']}"
     require(case_id, int(facts.get("outbounds") or 0) == 1,
@@ -3951,6 +7154,44 @@ def case_data_plane(
     require(case_id, facts.get("sni") == expectations["sni"],
             f"the served {client} outbound carries SNI {facts.get('sni')!r} instead of the "
             f"{expectations['sni']!r} the {inbound['id']} inbound was issued for")
+    # Two budgets, not one: the handshake may spend half the request's allowance
+    # and never less than the floor, so one slow resolver answer costs the
+    # handshake rather than the exchange.
+    connect_budget = int(facts.get("connect_budget_seconds") or 0)
+    transfer_budget = int(facts.get("transfer_budget_seconds") or 0)
+    require(case_id, connect_budget >= traffic_probe.MIN_CONNECT_BUDGET_SECONDS,
+            f"the {inbound['id']} request gave its handshake {connect_budget}s, below the "
+            f"{traffic_probe.MIN_CONNECT_BUDGET_SECONDS}s a resolver stall needs")
+    require(case_id, 2 * connect_budget >= transfer_budget,
+            f"the {inbound['id']} request gave its handshake {connect_budget}s of a "
+            f"{transfer_budget}s transfer budget, less than half of it")
+    if client == "mihomo":
+        # The config Mihomo was launched with is read back from the file it
+        # loaded, so this states what the engine bound rather than what the
+        # preparation meant to bind. The scalar is reported as the document
+        # spells it: a verdict under this key read as "allow-lan is on".
+        require(case_id, facts.get("mihomo_allow_lan") == "false",
+                f"the Mihomo config that carried the {inbound['id']} payload declares "
+                f"allow-lan {facts.get('mihomo_allow_lan')!r} instead of 'false'")
+        require(case_id, str(facts.get("mihomo_controller") or "").startswith("127.0.0.1:"),
+                f"the Mihomo controller that served the {inbound['id']} payload is bound to "
+                f"{facts.get('mihomo_controller')!r} instead of 127.0.0.1")
+        require(case_id, facts.get("mihomo_preserved") is True,
+                "the launched Mihomo config does not preserve every served proxy, group and rule")
+        listeners = {
+            key: facts.get(f"mihomo_{key}_port")
+            for key in ("mixed", "socks", "redir")
+            if facts.get(f"mihomo_{key}_port") is not None
+        }
+        require(case_id, len(set(listeners.values())) == len(listeners),
+                f"the Mihomo listeners share a port: {listeners}")
+
+    # Last, because a payload the endpoint never accepted has a clearer reason
+    # than the capture that bracketed it, and the first failure is the one worth
+    # reading. A request that reached the wrong host is a FAIL from here; a
+    # capture that could not account for the request is INCOMPLETE, which is not
+    # a pass and does not excuse the case.
+    ingress.require(case_id, packets)
 
     evidence = {
         "inbound": inbound["id"],
@@ -3962,7 +7203,21 @@ def case_data_plane(
         "status": facts.get("status"),
         "source_ip": facts.get("source_ip"),
         "outbounds": facts.get("outbounds"),
+        "connect_budget_seconds": facts.get("connect_budget_seconds"),
+        "transfer_budget_seconds": facts.get("transfer_budget_seconds"),
+        "engine_version": engine["engine_version"],
+        "engine_version_expected": engine["engine_version_expected"],
+        "engine_binary": engine["engine_binary"],
     }
+    evidence.update(ingress.evidence(packets))
+    if client == "mihomo":
+        evidence["mihomo_allow_lan"] = facts.get("mihomo_allow_lan")
+        evidence["mihomo_controller"] = facts.get("mihomo_controller")
+        evidence["mihomo_mixed_port"] = facts.get("mihomo_mixed_port")
+        evidence["mihomo_socks_port"] = facts.get("mihomo_socks_port")
+        evidence["mihomo_redir_port"] = facts.get("mihomo_redir_port")
+        evidence["mihomo_proxies"] = facts.get("mihomo_proxies")
+        evidence["mihomo_rules"] = facts.get("mihomo_rules")
     if node:
         evidence["node"] = node
     return evidence
@@ -3970,12 +7225,23 @@ def case_data_plane(
 
 def _data_plane_case(
     product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
+    deployed_core: str = "",
 ) -> Dict[str, Any]:
-    """Run one matrix tuple and record its own verdict for the count case."""
+    """Run one matrix tuple and record its own verdict for the count case.
+
+    A capture that could not account for the request is recorded as INCOMPLETE
+    rather than FAIL: the case has not shown the product wrong, it has failed to
+    show it right, and the count case reports the two separately because only one
+    of them is a defect in the deployment.
+    """
     case_id = matrix.case_id(product.matrix, product.case_topology, str(inbound["id"]), client,
                              node=node)
     try:
-        evidence = case_data_plane(product, inbound, client, node=node)
+        evidence = case_data_plane(product, inbound, client, node=node,
+                                   deployed_core=deployed_core)
+    except CaseIncomplete:
+        product.record_data_plane(case_id, "INCOMPLETE")
+        raise
     except AssertionError:
         product.record_data_plane(case_id, "FAIL")
         raise
@@ -4016,7 +7282,13 @@ def case_matrix(product: AioProduct) -> Dict[str, Any]:
     not_run = [case_id for case_id in expected_ids if case_id not in executed]
     require("AIO-MATRIX", not not_run,
             f"{len(not_run)} matrix case(s) produced no result: {', '.join(not_run)}")
-    failed = sorted(case_id for case_id, status in executed.items() if status != "PASS")
+    incomplete = sorted(case_id for case_id, status in executed.items()
+                        if status == "INCOMPLETE")
+    require("AIO-MATRIX", not incomplete,
+            f"{len(incomplete)} matrix case(s) could not account for the request they measured: "
+            f"{', '.join(incomplete)}")
+    failed = sorted(case_id for case_id, status in executed.items()
+                    if status not in ("PASS", "INCOMPLETE"))
     require("AIO-MATRIX", not failed,
             f"{len(failed)} matrix case(s) did not pass: {', '.join(failed)}")
     require("AIO-MATRIX", len(executed) == declared_count,
@@ -4031,6 +7303,134 @@ def case_matrix(product: AioProduct) -> Dict[str, Any]:
         "declared_cases": len(declared),
         "executed_cases": len(executed),
         "passed_cases": sum(1 for status in executed.values() if status == "PASS"),
+        "incomplete_cases": len(incomplete),
+    }
+
+
+PKT_INCOMPLETE_CASE_ID = "AIO-PKT-02"
+# A port every host leaves closed, so the identity connection is refused rather
+# than answered: the live requirement's "no target-reported source-IP identity".
+PKT_SILENT_PORT = 9
+# A path the repository mount does not carry: `podman exec` starts, python3
+# exits, and no capture is ever armed. The live analogue is tcpdump missing.
+PKT_MISSING_PROBE = "/repo/tools/podman_e2e/absent_ingress_probe.py"
+# A window shorter than the request it brackets, so the capture ends on its own
+# instead of being stopped by the harness, and the wait that lets it close.
+PKT_SHORT_WINDOW_SECONDS = 1
+PKT_SLOW_REQUEST_SECONDS = 3
+PKT_INCOMPLETE_TIMEOUT_SECONDS = DATA_PLANE_TIMEOUT_SECONDS + 300
+
+
+def wait_past_capture_window(seconds: float) -> None:
+    """Outlast a deliberately short capture window before the request is issued.
+
+    The window branch is a case only if nothing is armed when the payload moves:
+    a probe still capturing would make the run a race the transfer happens to
+    lose, and the summary would be a valid one the harness stopped. The wait is
+    the degradation, and ``PKT_SHORT_WINDOW_SECONDS`` is the bound it clears.
+    """
+    time.sleep(seconds)
+
+
+def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
+    """PKT-02: evidence that is unavailable makes the case INCOMPLETE, not a pass.
+
+    The live sentence lists four ways a packet capture can fail to account for a
+    request, and this case produces each of them against a real transfer rather
+    than restating them: a capture tool that is not there, a host that cannot say
+    who the client is, a capture that ran out its own window, and a client whose
+    identity connection does not travel the path the request takes — the container
+    analogue of a NAT or a split tunnel, which is what makes an address the target
+    reports differ from the address its capture saw.
+
+    Every one of them has to come back INCOMPLETE. A PASS would mean the evidence
+    that is missing was not needed, and a FAIL would mean the product was blamed
+    for the runner's own blindness. The aggregate counters are the trap this
+    closes: the tool-missing run counts nothing, and the window run may count
+    plenty, and neither may be read as an answer. Finally the hosts are searched
+    for a capture file or a saved payload, because a summary that only exists in a
+    process's memory cannot leave one behind.
+    """
+    host = product.require_installed()
+    inbound = matrix.inbound(product.matrix, "REALITY")
+
+    def request() -> Dict[str, Any]:
+        return product.transfer_facts(PKT_INCOMPLETE_CASE_ID, str(inbound["id"]), "xray")
+
+    def slow_request() -> Dict[str, Any]:
+        # The capture has to end before the request it was armed for starts, or
+        # the window branch is a race with the transfer instead of a case.
+        wait_past_capture_window(PKT_SLOW_REQUEST_SECONDS)
+        return request()
+
+    degradations = {
+        "no_capture_tool": product.bracket_request(
+            request, inbound, probe_script=PKT_MISSING_PROBE,
+        ),
+        "no_identity": product.bracket_request(
+            request, inbound, identity_port=PKT_SILENT_PORT,
+        ),
+        "window_expired": product.bracket_request(
+            slow_request, inbound, window=PKT_SHORT_WINDOW_SECONDS,
+        ),
+        "foreign_source_only": product.bracket_request(
+            request, inbound, identity_engine=host.client_name,
+        ),
+    }
+
+    verdicts = {}
+    reasons = {}
+    for name, measurement in degradations.items():
+        facts = ingress.evaluate(measurement)
+        verdicts[name] = facts["verdict"]
+        reasons[name] = facts["reason"]
+        require(PKT_INCOMPLETE_CASE_ID, measurement.request is not None,
+                f"the {name} run never completed its request, so it measured no traffic at all")
+        require(PKT_INCOMPLETE_CASE_ID, facts["verdict"] == ingress.INCOMPLETE,
+                f"the {name} run came back {facts['verdict']} instead of INCOMPLETE: "
+                f"{facts['reason'] or 'no reason was given'}")
+        require(PKT_INCOMPLETE_CASE_ID, bool(facts["reason"]),
+                f"the {name} run is INCOMPLETE without naming what was missing")
+
+    # The two degradations whose verdict depends on a count that exists: the one
+    # where no counter moved at all, and the one where the only counted address is
+    # not the client's. Both are still INCOMPLETE, which is the sentence.
+    tool_less = ingress.evaluate(degradations["no_capture_tool"])
+    require(PKT_INCOMPLETE_CASE_ID, tool_less["intended_captured"] == 0,
+            f"the tool-missing run counted {tool_less['intended_captured']} segment(s), so it was "
+            "not the case it claims to be")
+    foreign = ingress.evaluate(degradations["foreign_source_only"])
+    require(PKT_INCOMPLETE_CASE_ID, not degradations["foreign_source_only"].identity_error,
+            "the wrong-vantage run could not identify the client at all, so a differing address "
+            f"was never the reason: {degradations['foreign_source_only'].identity_detail}")
+    require(PKT_INCOMPLETE_CASE_ID, bool(foreign["foreign"]),
+            "the foreign-source run recorded no non-matching source address, so it did not "
+            "reproduce an address the target reports differently from the one it captured")
+
+    persisted = host.podman.exec(
+        host.target_name,
+        ["bash", "-lc",
+         "find /run /tmp /var/tmp -maxdepth 3 "
+         "\\( -name '*.pcap' -o -name '*.pcapng' -o -name 'gowave-e2e-ingress*' \\) -print "
+         "2>/dev/null"],
+        check=False,
+        timeout=60,
+    )
+    strays = persisted.stdout.strip()
+    require(PKT_INCOMPLETE_CASE_ID, not strays,
+            f"the capture left {strays!r} on {host.target_name}; packet evidence is reported, "
+            "never persisted")
+
+    return {
+        "degradations": ",".join(sorted(degradations)),
+        "verdicts": ",".join(verdicts[name] for name in sorted(verdicts)),
+        "tool_less_captured": tool_less["intended_captured"],
+        "foreign_sources": foreign["foreign"],
+        "persisted_files": strays,
+        "no_capture_tool_reason": reasons["no_capture_tool"],
+        "no_identity_reason": reasons["no_identity"],
+        "window_expired_reason": reasons["window_expired"],
+        "foreign_source_reason": reasons["foreign_source_only"],
     }
 
 
@@ -4080,10 +7480,11 @@ def case_json_shapes(product: AioProduct) -> Dict[str, Any]:
 
 DECOY_CASE_ID = "DECOY-01"
 # Every path the panel vhost is generated with, plus the two a scanner tries
-# first. Each one is answered by a management process on the panel's own name,
-# so a camouflage listener that answers any of them has published what the
-# deployment really is. ``/`` is deliberately absent: the cover site's own front
-# page is served there, and the case measures that separately.
+# first, plus the closed scanner set the panel vhost refuses outright. Each one
+# is answered by a management process on the panel's own name, so a camouflage
+# listener that answers any of them has published what the deployment really is.
+# ``/`` is deliberately absent: the cover site's own front page is served there,
+# and the case measures that separately.
 DECOY_MANAGEMENT_PATHS: Sequence[str] = (
     "/api/",
     "/api/sub/",
@@ -4094,6 +7495,13 @@ DECOY_MANAGEMENT_PATHS: Sequence[str] = (
     "/trojan-grpc",
     "/metrics",
     "/server-status",
+    "/.env",
+    "/.git/config",
+    "/.ds_store",
+    "/wp-login.php",
+    "/wp-admin/",
+    "/phpmyadmin/",
+    "/actuator/health",
 )
 # A path no cover site ships, so the answer to it is the site's own 404 page.
 DECOY_MISSING_PATH = "/e2e-no-such-cover-page"
@@ -4342,6 +7750,2330 @@ def case_decoy(product: AioProduct) -> Dict[str, Any]:
     return decoy_isolation_contract(product, DECOY_CASE_ID)
 
 
+VISION_ROUTE_CASE_ID = "NGX-04"
+VISION_BACKEND_PORT = 8444
+VISION_FALLBACK_PORT = 9444
+# Where the install sends the delegated name, and the listener its fallback vhost
+# is generated with. Both are read out of the running configuration: the map the
+# stream module loaded decides where a ClientHello goes, and the `listen` line
+# decides whether the fallback accepts anything but a PROXY-aware sender.
+VISION_MAP_TARGET = f"127.0.0.1:{VISION_BACKEND_PORT}"
+VISION_FALLBACK_LISTEN = f"127.0.0.1:{VISION_FALLBACK_PORT} proxy_protocol"
+# One `nginx -T` dump and one socket table; the ceiling guards a stalled NGINX.
+VISION_CONTOUR_TIMEOUT_SECONDS = 60
+# One page, one management read and two loopback attempts, each one a separate
+# process in another container: the ceiling is a hang guard, not an expectation.
+VISION_PROBE_TIMEOUT_SECONDS = 30
+VISION_ROUTE_TIMEOUT_SECONDS = 300
+
+VISION_CONTOUR_SCRIPT = r"""python3 - VISION_DOMAIN_PLACEHOLDER <<'PY'
+import json, subprocess, sys
+
+domain = sys.argv[1]
+
+
+def run(argv):
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    return (done.stdout or "") + (done.stderr or ""), done.returncode
+
+
+dump, dump_status = run(["nginx", "-T"])
+
+# The server-name map is the routing rule itself. Reading it out of the dump
+# rather than out of the file that generated it is what makes the answer about
+# the configuration in force, reloaded or not.
+routes = {}
+maps = 0
+inside = False
+for line in dump.splitlines():
+    stripped = line.strip()
+    if not inside:
+        if stripped.startswith("map ") and "$ssl_preread_server_name" in stripped:
+            inside = True
+            maps += 1
+        continue
+    if stripped == "}":
+        inside = False
+        continue
+    parts = stripped.split()
+    if len(parts) == 2 and not stripped.startswith("#"):
+        # The terminating semicolon is the directive's punctuation, not part of
+        # the backend it names; keeping it would make every target a string no
+        # contract could compare an address against.
+        routes[parts[0]] = parts[1].rstrip(";")
+
+# The fallback vhost is the server block that owns the PROXY-protocol listener,
+# and its root is the document tree that listener hands out. The dump prints the
+# directive as the file writes it, `listen` keyword included.
+lines = dump.splitlines()
+fallback_listen = 0
+fallback_root = ""
+listen_line = "listen FALLBACK_LISTEN_PLACEHOLDER;"
+for index, line in enumerate(lines):
+    if line.strip() != listen_line:
+        continue
+    fallback_listen += 1
+    for following in lines[index + 1:]:
+        if following.strip() == "}":
+            break
+        if following.strip().startswith("root "):
+            fallback_root = following.strip().split(None, 1)[1].rstrip(";")
+            break
+
+# The socket table says whether the two ports exist and what they are bound to:
+# a loopback-only endpoint is a target, a wildcard one is a public surface.
+sockets, _ = run(["ss", "-Hltn"])
+bound = {"8444": [], "9444": []}
+for line in sockets.splitlines():
+    fields = line.split()
+    if len(fields) >= 4 and fields[3].rsplit(":", 1)[-1] in bound:
+        bound[fields[3].rsplit(":", 1)[-1]].append(fields[3])
+
+print(json.dumps({
+    "dump_returncode": dump_status,
+    "dump_bytes": len(dump),
+    "stream_maps": maps,
+    "routes": routes,
+    "fallback_listen": fallback_listen,
+    "fallback_root": fallback_root,
+    "bound": bound,
+}, sort_keys=True))
+PY
+"""
+
+# A raw HTTP request, sent with and without the PROXY v1 line the Vision inbound
+# writes. The bare form is the control: the vhost is generated with
+# `proxy_protocol`, so a request that carries no header must not be served.
+VISION_FALLBACK_PROBE = r"""python3 - VISION_DOMAIN_PLACEHOLDER VISION_PROXIED_PLACEHOLDER <<'PY'
+import hashlib, json, socket, sys
+
+domain, proxied = sys.argv[1], sys.argv[2] == "1"
+prefix = "PROXY TCP4 198.51.100.7 127.0.0.1 45678 VISION_PORT_PLACEHOLDER\r\n" if proxied else ""
+request = (prefix + f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n").encode()
+raw = b""
+error = ""
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(10)
+try:
+    sock.connect(("127.0.0.1", VISION_PORT_PLACEHOLDER))
+    sock.sendall(request)
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        raw += chunk
+except Exception as caught:  # noqa: BLE001 - the probe reports, the case decides
+    error = type(caught).__name__ + ": " + str(caught)
+finally:
+    sock.close()
+
+head, _, body = raw.partition(b"\r\n\r\n")
+lines = head.split(b"\r\n")
+print(json.dumps({
+    "status": lines[0].decode("latin-1") if lines and lines[0] else "",
+    "bytes": len(body),
+    "sha256": hashlib.sha256(body).hexdigest() if body else "",
+    "error": error,
+}, sort_keys=True))
+PY
+"""
+
+
+def vision_contour_script(domain: str) -> str:
+    return (
+        VISION_CONTOUR_SCRIPT
+        .replace("VISION_DOMAIN_PLACEHOLDER", shlex.quote(domain))
+        .replace("FALLBACK_LISTEN_PLACEHOLDER", VISION_FALLBACK_LISTEN)
+    )
+
+
+def vision_fallback_script(domain: str, proxied: bool) -> str:
+    return (
+        VISION_FALLBACK_PROBE
+        .replace("VISION_DOMAIN_PLACEHOLDER", shlex.quote(domain))
+        .replace("VISION_PROXIED_PLACEHOLDER", "1" if proxied else "0")
+        .replace("VISION_PORT_PLACEHOLDER", str(VISION_FALLBACK_PORT))
+    )
+
+
+def _vision_fetch(
+    case_id: str, label: str, client_http: Any, name: str, path: str, status: int,
+) -> Dict[str, Any]:
+    """One fetch from the independent client, or a failure naming what it asked."""
+    report = client_http(
+        f"https://{name}{path}", expect_status=status, timeout=VISION_PROBE_TIMEOUT_SECONDS,
+    )
+    probe = report.get("probe") or {}
+    require(
+        case_id,
+        report.get("returncode") == 0,
+        f"{label}: GET https://{name}{path} did not answer as the Vision contour should: "
+        f"{probe.get('error') or report.get('stderr') or 'the probe printed no report'}",
+    )
+    return probe
+
+
+def vision_route_contract(
+    case_id: str, label: str, domain: str, enabled: bool, run: Any, client_http: Any,
+) -> Dict[str, Any]:
+    """What one host owes the delegated name, in the configuration it is running.
+
+    Three layers make the Vision contour one route rather than a second public
+    surface. The stream map gives the name its own backend; that backend and the
+    fallback it falls back to are loopback-only sockets, so neither port is
+    reachable from a client network; and the fallback is a vhost generated with
+    `proxy_protocol`, so only a sender that writes the PROXY v1 line — the
+    inbound — is served, while a bare HTTP request is not.
+
+    The traffic legs are what tell the contour from a plausible dump. A client
+    that trusts only the run's CA fetches the delegated name over 443: the
+    certificate it receives has to name the domain, because the stream sends that
+    name to the inbound, which terminates TLS with its own lineage — the decoy
+    and the REALITY listeners hold the other lineups. The same page is then asked
+    for directly on the fallback port twice: with the PROXY v1 line it must be
+    the document the routed leg served, and without it must not be served at all.
+
+    A host installed without a delegated name owes the opposite, and it is read
+    the same way: no route for the name, no listener on either port, no
+    PROXY-protocol vhost in the dump.
+    """
+    contour = probe_json(
+        case_id, f"{label}'s Vision contour", run(vision_contour_script(domain)),
+    )
+    require(
+        case_id,
+        contour.get("dump_returncode") == 0 and int(contour.get("dump_bytes") or 0) > 0,
+        f"{label}: `nginx -T` produced no configuration dump",
+    )
+    require(
+        case_id,
+        contour.get("stream_maps") == 1,
+        f"{label}'s running configuration carries {contour.get('stream_maps')!r} ssl_preread "
+        "server-name maps, not one, so the route below could be read from a map that is not "
+        "the one deciding the traffic",
+    )
+    routes = dict(contour.get("routes") or {})
+    bound = contour.get("bound") or {}
+    evidence = {
+        "combination": "enabled" if enabled else "disabled",
+        "vision_domain": domain,
+        "routes": routes,
+        "bound": bound,
+        "fallback_listen": contour.get("fallback_listen"),
+        "fallback_root": contour.get("fallback_root"),
+    }
+
+    if not enabled:
+        require(
+            case_id,
+            domain not in routes,
+            f"{label} is installed without a Vision domain and still routes {domain} to "
+            f"{routes.get(domain)!r}",
+        )
+        for port in (VISION_BACKEND_PORT, VISION_FALLBACK_PORT):
+            listeners = bound.get(str(port)) or []
+            require(
+                case_id,
+                not listeners,
+                f"{label} is installed without a Vision domain and still listens on {port}: "
+                f"{listeners}",
+            )
+        require(
+            case_id,
+            contour.get("fallback_listen") == 0,
+            f"{label} is installed without a Vision domain and its running configuration still "
+            f"carries {contour.get('fallback_listen')!r} {VISION_FALLBACK_LISTEN}; listeners",
+        )
+        return evidence
+
+    require(
+        case_id,
+        routes.get(domain) == VISION_MAP_TARGET,
+        f"{label} routes {domain} to {routes.get(domain)!r} instead of {VISION_MAP_TARGET}, so "
+        "the delegated name does not reach the Vision inbound (map: "
+        f"{sorted(routes.items())})",
+    )
+    for port, wanted in (
+        (VISION_BACKEND_PORT, VISION_MAP_TARGET),
+        (VISION_FALLBACK_PORT, f"127.0.0.1:{VISION_FALLBACK_PORT}"),
+    ):
+        listeners = bound.get(str(port)) or []
+        require(
+            case_id,
+            listeners == [wanted],
+            f"{label}'s Vision contour listens on {listeners or 'nothing'} for port {port} "
+            f"instead of exactly {wanted}, so that port is not the loopback endpoint the "
+            "contour names",
+        )
+    require(
+        case_id,
+        contour.get("fallback_listen") == 1,
+        f"{label}'s running configuration carries {contour.get('fallback_listen')!r} listeners "
+        f"on {VISION_FALLBACK_LISTEN}, not one, so the fallback is not the PROXY-protocol vhost "
+        "the inbound hands over to",
+    )
+    require(
+        case_id,
+        contour.get("fallback_root"),
+        f"{label}'s {VISION_FALLBACK_PORT} vhost serves no document root, so it has no site to "
+        "hand out",
+    )
+
+    route = _vision_fetch(case_id, label, client_http, domain, "/", 200)
+    sans = list((route.get("peer") or {}).get("san") or [])
+    require(
+        case_id,
+        domain in sans,
+        f"https://{domain}/ was served a certificate that does not name {domain}: {sans}. The "
+        "stream sends that name to the Vision inbound, which terminates TLS with its own "
+        "lineage; any other certificate means the request never reached it",
+    )
+    routed_sha = route.get("body_sha256") or ""
+    require(
+        case_id,
+        int(route.get("body_length") or 0) > 0,
+        f"https://{domain}/ answered {route.get('status')!r} with an empty body, so the routed "
+        "leg served no site",
+    )
+
+    proxied = probe_json(
+        case_id, f"the {VISION_FALLBACK_PORT} vhost with a PROXY header",
+        run(vision_fallback_script(domain, True)),
+    )
+    bare = probe_json(
+        case_id, f"the {VISION_FALLBACK_PORT} vhost without one",
+        run(vision_fallback_script(domain, False)),
+    )
+    proxied_status = str(proxied.get("status") or "")
+    bare_status = str(bare.get("status") or "")
+    require(
+        case_id,
+        proxied_status.startswith("HTTP/1.1 200"),
+        f"{label}'s {VISION_FALLBACK_PORT} vhost refused a request carrying a PROXY v1 header "
+        f"with {proxied_status!r}: {proxied.get('error') or 'no error reported'}",
+    )
+    require(
+        case_id,
+        proxied.get("sha256") == routed_sha,
+        f"the fallback leg served {proxied.get('sha256')} and the routed leg {routed_sha}, so "
+        "the delegated name and the fallback do not hand out one document",
+    )
+    require(
+        case_id,
+        not bare_status.startswith("HTTP/1.1 200"),
+        f"{label}'s {VISION_FALLBACK_PORT} vhost answered {bare_status!r} to a request that "
+        "carried no PROXY header, so the listener accepts a plain HTTP client and the PROXY "
+        "protocol the contour documents is not enforced",
+    )
+    require(
+        case_id,
+        bare.get("sha256") != routed_sha,
+        f"the bare request received the routed leg's document ({bare.get('sha256')}), so the "
+        "fallback served a plain HTTP client as if the inbound had spoken for it",
+    )
+
+    cover = topology.COVER_APEX
+    decoy = _vision_fetch(case_id, label, client_http, cover, "/", 200)
+    require(
+        case_id,
+        decoy.get("body_sha256") == routed_sha,
+        f"https://{cover}/ serves {decoy.get('body_sha256')} while the Vision route serves "
+        f"{routed_sha}, so the fallback does not hand out the camouflage site the decoy renders",
+    )
+
+    management = _vision_fetch(case_id, label, client_http, domain, "/api/nodes", 404)
+    evidence["route_status"] = route.get("status")
+    evidence["route_san"] = sans
+    evidence["route_sha256"] = routed_sha
+    evidence["proxied_status"] = proxied_status
+    evidence["proxied_sha256"] = proxied.get("sha256")
+    evidence["bare_status"] = bare_status
+    evidence["bare_sha256"] = bare.get("sha256")
+    evidence["decoy_sha256"] = decoy.get("body_sha256")
+    evidence["management_status"] = management.get("status")
+    return evidence
+
+
+def case_vision_route(product: AioProduct) -> Dict[str, Any]:
+    """NGX-04: the delegated name reaches its inbound, and its fallback is PROXY-only.
+
+    The Vision route is the optional third contour of the deployment: the stream
+    hands the delegated name to a fifth inbound on ``127.0.0.1:8444``, and a
+    client the inbound does not authenticate is handed to a cleartext vhost on
+    ``127.0.0.1:9444`` that accepts only the PROXY v1 line Xray writes.
+
+    The case asks the shipped host both halves of that — the contour, when the
+    install was given the domain, and its absence when it was not — because a run
+    without the domain is a configured deployment too, and a listener left behind
+    on either port would be a public surface nothing declares.
+    """
+    host = product.require_installed()
+    evidence = vision_route_contract(
+        VISION_ROUTE_CASE_ID, "the Master", topology.VISION_DOMAIN, bool(product.vision),
+        product.host_script, host.client_http,
+    )
+    # The route's other half is the count it belongs to: a contour that reached
+    # the stream without the Panel declaring the inbound it fronts, or a Panel
+    # declaring one the host does not run, is two records disagreeing about the
+    # same endpoint. The matrix's own case count is read here for the same reason.
+    evidence.update(vision_policy.endpoint_contract(
+        VISION_ROUTE_CASE_ID,
+        vision_policy.cluster_document(
+            VISION_ROUTE_CASE_ID,
+            panel_probe(product, VISION_ROUTE_CASE_ID, "cluster"),
+        ),
+        (("master", None, product.inbound_count),),
+        len(matrix.clients(product.matrix)),
+        matrix.positive_count(product.matrix, matrix.AIO, product.vision),
+    ))
+    return evidence
+
+
+CHANNEL_NOOP_CASE_ID = "AIO-CHANNEL-NOOP"
+CHANNEL_DEV_CASE_ID = "AIO-CHANNEL-DEV"
+CHANNEL_ROLLBACK_CASE_ID = "AIO-CHANNEL-ROLLBACK"
+CHANNEL_INTERRUPT_CASE_ID = "AIO-INTERRUPT"
+
+# One switch captures a snapshot, rewrites the channel, restarts the panel and
+# polls its health for thirty seconds before it commits or restores the whole
+# tree, so the ceiling covers the failure path and not the happy one.
+CHANNEL_TIMEOUT_SECONDS = 1200
+CHANNEL_RECOVERY_ROOT = "/var/lib/gowave-auto-nginx/recovery"
+CHANNEL_ONCE_FAIL_UNIT = "/etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf"
+CHANNEL_ONCE_FAIL_EXEC = "/usr/local/sbin/gowave-e2e-once-fail"
+CHANNEL_ONCE_FAIL_MARKER = "/root/gowave-e2e-once.marker"
+# systemd gives a unit's ExecStartPre /dev/null on standard input, so the damage
+# is done by a file the hook executes rather than by a program streamed into
+# `python3 -` from the hook's own body.
+CHANNEL_SABOTAGE_EXEC = "/usr/local/sbin/gowave-e2e-sabotage.py"
+# The interruption case holds the restarted Panel at a one-shot ExecStartPre hook,
+# so the kill lands inside the product's APPLYING state instead of racing the few
+# hundred milliseconds between the environment rewrite and the commit.
+CHANNEL_HOLD_UNIT = "/etc/systemd/system/gowave.service.d/99-e2e-hold.conf"
+CHANNEL_HOLD_EXEC = "/usr/local/sbin/gowave-e2e-hold"
+CHANNEL_HOLD_MARKER = "/root/gowave-e2e-hold.started"
+CHANNEL_INTERRUPT_PID = "/tmp/gowave-e2e-interrupt.pid"
+
+
+def channel_state_paths(base: str = "") -> Dict[str, str]:
+    """The files a channel switch snapshots, read from the live tree or a snapshot.
+
+    A snapshot is laid out as ``<root>/.env``, ``<root>/gowave.db``, ... while the
+    live product keeps them under ``/opt/gowave`` and the state directory, so the
+    same probe can compare both without knowing which one it was handed.
+    """
+    if base:
+        return {
+            "env": f"{base}/.env",
+            "db": f"{base}/gowave.db",
+            "binary": f"{base}/gowave-server",
+            "frontend": f"{base}/frontend",
+            "state": f"{base}/state.json",
+            "nginx": f"{base}/etc/nginx",
+            "letsencrypt": f"{base}/etc/letsencrypt",
+            "journal": "",
+            "recovery_root": "",
+        }
+    return {
+        "env": "/opt/gowave/.env",
+        "db": "/opt/gowave/gowave.db",
+        "binary": "/opt/gowave/gowave-server",
+        "frontend": "/opt/gowave/frontend",
+        "state": "/var/lib/gowave-auto-nginx/state.json",
+        "nginx": "/etc/nginx",
+        "letsencrypt": "/etc/letsencrypt",
+        "journal": f"{CHANNEL_RECOVERY_ROOT}/journal.json",
+        "recovery_root": CHANNEL_RECOVERY_ROOT,
+    }
+
+
+CHANNEL_STATE_PROBE = r"""
+import hashlib, json, os, sqlite3, subprocess, sys, urllib.request
+
+paths = json.loads(sys.argv[1])
+
+
+def digest_file(path):
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def digest_tree(root):
+    if not root or not os.path.isdir(root):
+        return None
+    digest = hashlib.sha256()
+    for base, directories, files in os.walk(root):
+        directories.sort()
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            relative = os.path.relpath(path, root)
+            digest.update(b"f\0" + relative.encode() + b"\0")
+            if os.path.islink(path):
+                digest.update(b"L" + os.readlink(path).encode())
+            else:
+                digest.update((digest_file(path) or "").encode())
+        for name in directories:
+            relative = os.path.relpath(os.path.join(base, name), root)
+            digest.update(b"d\0" + relative.encode() + b"\0")
+    return digest.hexdigest()
+
+
+def database(path):
+    if not path or not os.path.isfile(path):
+        return {}
+    record = {"bytes": digest_file(path)}
+    try:
+        connection = sqlite3.connect("file:" + path + "?mode=ro", uri=True)
+        try:
+            record["integrity"] = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            names = [
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+                )
+            ]
+            record["tables"] = names
+            record["rows"] = {}
+            for name in names:
+                quoted = '"' + name.replace('"', '""') + '"'
+                try:
+                    record["rows"][name] = connection.execute(
+                        "SELECT COUNT(*) FROM " + quoted
+                    ).fetchone()[0]
+                except sqlite3.Error as error:
+                    record["rows"][name] = "error: " + str(error)
+            dump = "\n".join(connection.iterdump())
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        record["integrity"] = "error: " + str(error)
+        return record
+    record["logical"] = hashlib.sha256(dump.encode()).hexdigest()
+    return record
+
+
+def environment(path):
+    values = {}
+    if not path or not os.path.isfile(path):
+        return values
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.rstrip("\n").split("=", 1)
+                values[key] = value
+    return {
+        key: values.get(key)
+        for key in ("GOWAVE_CHANNEL", "APP_HOST", "APP_PORT", "E2E_CHANNEL_SABOTAGE")
+    }
+
+
+def first_chain(root):
+    live = os.path.join(root or "", "live")
+    if not root or not os.path.isdir(live):
+        return ""
+    for name in sorted(os.listdir(live)):
+        candidate = os.path.join(live, name, "fullchain.pem")
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+journal = {}
+if paths.get("journal") and os.path.isfile(paths["journal"]):
+    try:
+        with open(paths["journal"], encoding="utf-8") as handle:
+            journal = json.load(handle)
+    except ValueError:
+        journal = {"invalid": True}
+
+snapshots = []
+root = paths.get("recovery_root") or ""
+if root and os.path.isdir(root):
+    snapshots = sorted(name for name in os.listdir(root) if name.startswith("update-"))
+
+unit = {}
+show = subprocess.run(
+    ["systemctl", "show", "gowave.service", "-p", "ActiveState", "-p", "SubState",
+     "-p", "MainPID", "-p", "ActiveEnterTimestamp"],
+    capture_output=True, text=True,
+)
+for line in show.stdout.splitlines():
+    key, _, value = line.partition("=")
+    unit[key] = value
+
+health = None
+try:
+    with urllib.request.urlopen(
+        "http://127.0.0.1:3000/api/system/health", timeout=5
+    ) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - the probe reports, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+print(json.dumps({
+    "environment": environment(paths.get("env")),
+    "env_digest": digest_file(paths.get("env")),
+    "binary": digest_file(paths.get("binary")),
+    "database": database(paths.get("db")),
+    "frontend": digest_tree(paths.get("frontend")),
+    # The Panel resolves ./frontend/dist before ./dist, so the document the tree
+    # above holds sits one level below it.
+    "frontend_index": digest_file(
+        os.path.join(paths.get("frontend") or "", "dist", "index.html")
+    ),
+    "state": digest_file(paths.get("state")),
+    "nginx": digest_tree(paths.get("nginx")),
+    "nginx_conf": digest_file(os.path.join(paths.get("nginx") or "", "nginx.conf")),
+    "letsencrypt": digest_tree(paths.get("letsencrypt")),
+    "lineage_chain": digest_file(first_chain(paths.get("letsencrypt"))),
+    "journal": journal,
+    "snapshots": snapshots,
+    "unit": unit,
+    "health": health,
+}, sort_keys=True))
+"""
+
+
+def channel_state(product: AioProduct, case_id: str, base: str = "") -> Dict[str, Any]:
+    """Read the files a switch snapshots and restores, plus the unit and API that use them."""
+    payload = shlex.quote(json.dumps(channel_state_paths(base), sort_keys=True))
+    script = f"python3 - {payload} <<'PY'\n{CHANNEL_STATE_PROBE}\nPY"
+    return probe_json(case_id, "the channel state probe", product.host_script(script))
+
+
+def channel_command(action: str) -> str:
+    return f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh channel {action}"
+
+
+def channel_health(product: AioProduct) -> str:
+    """The Panel's own health route, as the switch's post-restart probe reads it."""
+    result = product.host_script(
+        "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "
+        "http://127.0.0.1:3000/api/system/health || true"
+    )
+    return (result.stdout or "").strip()
+
+
+def wait_for_channel_health(product: AioProduct, case_id: str, timeout: int = 180) -> str:
+    observed = {"health": ""}
+
+    def answers() -> bool:
+        observed["health"] = channel_health(product)
+        return observed["health"] == "200"
+
+    wait_until(answers, timeout, f"{case_id} Panel health", interval_seconds=2)
+    return observed["health"]
+
+
+def channel_client_surface(product: AioProduct, case_id: str, step: str) -> Dict[str, Any]:
+    """Read what the Panel serves its client, before a switch and after it.
+
+    What a switch or a rollback did to the database is read through this surface
+    rather than from the file: the Panel keeps writing to SQLite while it runs, so
+    a byte or dump comparison would be measuring its write log. The client list and
+    the bytes each representation serves are what a client can actually observe.
+    """
+    return panel_probe(
+        product, case_id, "channel", f"--step {step} --payload-dir {topology.PAYLOAD_MOUNT}",
+    ).get("channel") or {}
+
+
+def require_channel_snapshot(
+    case_id: str, before: Dict[str, Any], snapshot: Dict[str, Any], snapshot_path: str,
+) -> None:
+    """The snapshot must hold the pre-switch state, not what the switch wrote over it.
+
+    The database is compared by its integrity and by having a logical dump at
+    all, never by its bytes against the live file: the product takes the snapshot
+    through the SQLite online backup API, which writes the same content in a
+    different page layout. That the content really is the pre-switch content is
+    established by the caller, which reads the client surface the Panel serves
+    before the switch and again after the rollback restored this very file.
+    """
+    require(
+        case_id, snapshot.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the snapshot in {snapshot_path} records channel "
+        f"{snapshot.get('environment', {}).get('GOWAVE_CHANNEL')!r} instead of the stable channel "
+        "the host was on before the switch",
+    )
+    require(
+        case_id, snapshot.get("database", {}).get("integrity") == "ok",
+        f"the snapshot database in {snapshot_path} does not pass integrity_check: "
+        f"{snapshot.get('database', {}).get('integrity')!r}",
+    )
+    require(
+        case_id, bool(snapshot.get("database", {}).get("logical")),
+        f"the snapshot database in {snapshot_path} has no readable schema, so it is not a "
+        "database the Panel can be started on",
+    )
+    for field, label in (
+        ("env_digest", "the environment file"),
+        ("binary", "the Panel binary"),
+        ("frontend", "the frontend tree"),
+        ("frontend_index", "the frontend document"),
+        ("state", "state.json"),
+        ("nginx", "the NGINX tree"),
+        ("nginx_conf", "the NGINX configuration"),
+        ("letsencrypt", "the ACME tree"),
+        ("lineage_chain", "the ACME lineage chain"),
+    ):
+        require(
+            case_id, snapshot.get(field) == before.get(field) and before.get(field),
+            f"the snapshot in {snapshot_path} does not preserve {label}: "
+            f"{snapshot.get(field)!r} vs {before.get(field)!r}",
+        )
+
+
+def require_channel_traffic(
+    product: AioProduct, case_id: str, host: topology.AioTopology,
+) -> Dict[str, Any]:
+    """Both engines must still carry a payload through every served outbound afterwards.
+
+    The restart the switch performs makes the node apply its users again, so the
+    readiness wait runs first: a transport that is still warming up must not be
+    read as a switch that broke the data plane.
+    """
+    tunnel = product.wait_tunnel_ready(case_id)
+    facts = product.traffic_facts(case_id, "traffic")
+    facts["tunnel_network"] = tunnel.get("network")
+    expected = product.inbound_count * len(TRAFFIC_ENGINES)
+    require(
+        case_id, int(facts.get("transfer_count") or 0) == expected,
+        f"{facts.get('transfer_count')!r} transports carried a payload after the switch, "
+        f"expected {expected}",
+    )
+    require(
+        case_id, int(facts.get("missing_request_ids") or 0) == 0,
+        f"the endpoint never saw {facts.get('missing_request_ids')!r} requests after the switch",
+    )
+    unverified = [
+        item["tag"] for item in facts.get("transfers") or []
+        if not (item.get("request_id_match") and item.get("body_match"))
+    ]
+    require(
+        case_id, not unverified,
+        f"the endpoint did not echo the payload after the switch for: {', '.join(unverified)}",
+    )
+    require(
+        case_id, facts.get("source_ips") == [host.plan.data_target_ip],
+        f"the recovered payload left from {facts.get('source_ips')!r} instead of the installed "
+        f"host {host.plan.data_target_ip}",
+    )
+    return facts
+
+
+def case_channel_noop(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CHANNEL-NOOP: asking for the channel already configured is not a switch.
+
+    The command returns before it snapshots or restarts anything, so the proof is
+    an unchanged host: no new snapshot directory, the same journal, the same
+    environment, and the same running Panel process. A no-op that restarted the
+    service would still be a mutation the operator did not ask for.
+    """
+    product.require_installed()
+    before = channel_state(product, CHANNEL_NOOP_CASE_ID)
+    require(
+        CHANNEL_NOOP_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so "
+        "the same-channel no-op has nothing to compare",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, before.get("unit", {}).get("ActiveState") == "active",
+        f"gowave.service is {before.get('unit', {}).get('ActiveState')!r} before the no-op",
+    )
+
+    repeat = product.host_script(channel_command("stable"), timeout=300)
+    require(
+        CHANNEL_NOOP_CASE_ID, repeat.returncode == 0,
+        f"`gowave-auto.sh channel stable` on the stable channel exited "
+        f"{repeat.returncode}: {(repeat.stderr or repeat.stdout or '').strip()[-600:]}",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, "already on channel 'stable'" in (repeat.stdout or ""),
+        "the same-channel invocation did not report that the host was already on the channel: "
+        f"{(repeat.stdout or repeat.stderr or '').strip()[-600:]}",
+    )
+
+    after = channel_state(product, CHANNEL_NOOP_CASE_ID)
+    require(
+        CHANNEL_NOOP_CASE_ID, after.get("snapshots") == before.get("snapshots"),
+        f"the same-channel invocation took a snapshot: {after.get('snapshots')!r} vs "
+        f"{before.get('snapshots')!r}",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, after.get("journal") == before.get("journal"),
+        "the same-channel invocation rewrote the recovery journal",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, after.get("env_digest") == before.get("env_digest"),
+        "the same-channel invocation rewrote /opt/gowave/.env",
+    )
+    for field in ("MainPID", "ActiveEnterTimestamp"):
+        require(
+            CHANNEL_NOOP_CASE_ID,
+            after.get("unit", {}).get(field) == before.get("unit", {}).get(field),
+            f"the same-channel invocation changed gowave.service {field}: "
+            f"{after.get('unit', {}).get(field)!r} vs {before.get('unit', {}).get(field)!r}",
+        )
+    return {
+        "channel": before.get("environment", {}).get("GOWAVE_CHANNEL"),
+        "snapshots_before": len(before.get("snapshots") or []),
+        "snapshots_after": len(after.get("snapshots") or []),
+        "journal_state": (before.get("journal") or {}).get("state"),
+        "main_pid": before.get("unit", {}).get("MainPID"),
+        "message": (repeat.stdout or "").strip()[-200:],
+    }
+
+
+CHANNEL_ROLLBACK_BODY = r"""
+rm -f /root/gowave-e2e-once.marker /tmp/gowave-e2e-sabotage.json \
+      /tmp/gowave-e2e-hook.err /tmp/gowave-e2e-sabotage.err
+install -d -m 0755 /usr/local/sbin
+cat > /usr/local/sbin/gowave-e2e-sabotage.py <<'PY'
+import hashlib, json, os
+
+root = "/var/lib/gowave-auto-nginx/recovery"
+snapshots = sorted(
+    os.path.join(root, name) for name in os.listdir(root) if name.startswith("update-")
+)
+if not snapshots:
+    raise SystemExit("the channel switch restarted without taking a snapshot")
+snapshot = snapshots[-1]
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def replace(path, data, mode=0o644):
+    # A file the running Panel owns may refuse an in-place rewrite even to root,
+    # while the directory it sits in still allows a rename, so the staging route
+    # is the second attempt rather than a separate branch of the case.
+    try:
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, mode)
+    except OSError:
+        staging = path + ".e2e-sabotage"
+        with open(staging, "wb") as handle:
+            handle.write(data)
+        os.chmod(staging, mode)
+        os.replace(staging, path)
+
+
+# Every lineage on the host is damaged, because the probe that reports this
+# digest takes the first fullchain.pem it finds under live/ and the rollback
+# restores the whole tree; picking one name here would leave the case's
+# reading of "was the chain restored" hinging on the sort order.
+chains = []
+live = "/etc/letsencrypt/live"
+if os.path.isdir(live):
+    for name in sorted(os.listdir(live)):
+        candidate = os.path.join(live, name, "fullchain.pem")
+        if os.path.isfile(candidate):
+            chains.append(candidate)
+lineage = chains[0] if chains else ""
+
+replace("/opt/gowave/gowave-server", b"#!/bin/sh\nexit 1\n", 0o755)
+replace("/opt/gowave/gowave.db", b"this is not a sqlite database\n")
+if os.path.isfile("/opt/gowave/frontend/dist/index.html"):
+    replace("/opt/gowave/frontend/dist/index.html", b"<html>e2e sabotage</html>\n")
+with open("/opt/gowave/.env", "rb") as handle:
+    environment = handle.read()
+replace("/opt/gowave/.env", environment + b"E2E_CHANNEL_SABOTAGE=1\n", 0o640)
+replace("/var/lib/gowave-auto-nginx/state.json", b"{}\n")
+replace("/etc/nginx/nginx.conf", b"# e2e sabotage\n")
+for chain_path in chains:
+    with open(chain_path, "rb") as handle:
+        chain = handle.read()
+    replace(chain_path, chain + b"\n# e2e sabotage\n")
+
+targets = {
+    "binary": "/opt/gowave/gowave-server",
+    "database": "/opt/gowave/gowave.db",
+    "frontend_index": "/opt/gowave/frontend/dist/index.html",
+    "environment": "/opt/gowave/.env",
+    "state": "/var/lib/gowave-auto-nginx/state.json",
+    "nginx_conf": "/etc/nginx/nginx.conf",
+    "lineage_chain": lineage,
+}
+record = {
+    "snapshot": snapshot,
+    "targets": {
+        name: digest(path) for name, path in targets.items() if path and os.path.isfile(path)
+    },
+}
+with open("/tmp/gowave-e2e-sabotage.json", "w", encoding="utf-8") as handle:
+    json.dump(record, handle, sort_keys=True)
+PY
+chmod 0755 /usr/local/sbin/gowave-e2e-sabotage.py
+cat > /usr/local/sbin/gowave-e2e-once-fail <<'ONCE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec 2>>/tmp/gowave-e2e-hook.err
+echo "hook started in uid $(id -u)" >&2
+marker=/root/gowave-e2e-once.marker
+if [[ -e "$marker" ]]; then
+    exit 0
+fi
+touch "$marker"
+# The gowave unit's sandbox reaches this hook even with the '+' prefix: measured
+# in the testbed, root inside it cannot rewrite a gowave-owned database. The
+# damage therefore runs as a transient unit, which systemd starts with the
+# manager's own privileges, and only falls back to the hook's sandbox if that
+# unit cannot be created at all.
+if ! systemd-run --wait --collect --quiet --unit=gowave-e2e-sabotage \
+        /bin/bash -c 'python3 /usr/local/sbin/gowave-e2e-sabotage.py 2>>/tmp/gowave-e2e-sabotage.err' \
+        2>>/tmp/gowave-e2e-hook.err; then
+    echo "the transient sabotage unit failed; retrying inside the hook" >&2
+    python3 /usr/local/sbin/gowave-e2e-sabotage.py 2>>/tmp/gowave-e2e-sabotage.err || true
+fi
+exit 1
+ONCE
+chmod 0755 /usr/local/sbin/gowave-e2e-once-fail
+install -d -m 0755 /etc/systemd/system/gowave.service.d
+cat > /etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf <<'UNIT'
+[Service]
+# `+` runs the hook with full privileges: gowave.service is User=gowave, and the
+# files the rollback has to restore are root-owned.
+ExecStartPre=+/usr/local/sbin/gowave-e2e-once-fail
+UNIT
+systemctl daemon-reload
+# Read the unit as systemd parsed it, before the fault is disarmed: a drop-in that
+# never reached the unit is why a hook would not run at all.
+configured=$(systemctl show gowave.service -p ExecStartPre -p ActiveState)
+sandbox=$(systemctl show gowave.service -p CapabilityBoundingSet -p ProtectSystem -p ReadWritePaths -p PrivateTmp -p NoNewPrivileges)
+
+rc=0
+bash "$repo/gowave-auto.sh" channel dev >/tmp/gowave-e2e-channel.out 2>/tmp/gowave-e2e-channel.err || rc=$?
+
+rm -f /etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf
+systemctl daemon-reload
+
+CONFIGURED="$configured" SANDBOX="$sandbox" RC="$rc" python3 - <<'PY'
+import json, os, subprocess, urllib.request
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-4000:]
+    except OSError:
+        return ""
+
+
+def journal():
+    try:
+        with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+unit = {}
+show = subprocess.run(
+    ["systemctl", "show", "gowave.service", "-p", "ActiveState", "-p", "SubState",
+     "-p", "MainPID"],
+    capture_output=True, text=True,
+)
+for line in show.stdout.splitlines():
+    key, _, value = line.partition("=")
+    unit[key] = value
+
+health = None
+try:
+    with urllib.request.urlopen(
+        "http://127.0.0.1:3000/api/system/health", timeout=5
+    ) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - reported, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+sabotage = {}
+try:
+    with open("/tmp/gowave-e2e-sabotage.json", encoding="utf-8") as handle:
+        sabotage = json.load(handle)
+except (OSError, ValueError):
+    sabotage = {}
+
+print(json.dumps({
+    "returncode": int(os.environ["RC"]),
+    "stdout": read("/tmp/gowave-e2e-channel.out"),
+    "stderr": read("/tmp/gowave-e2e-channel.err"),
+    "sabotage": sabotage,
+    "journal": journal(),
+    "unit": unit,
+    "health": health,
+    # The injected fault leaves three traces that tell its own story: the unit
+    # as systemd parsed it, whether the hook was ever entered, and whether the
+    # sabotage record it writes came out.
+    "configured": os.environ.get("CONFIGURED", ""),
+    "sandbox": os.environ.get("SANDBOX", ""),
+    "hook_log": read("/tmp/gowave-e2e-hook.err"),
+    "sabotage_log": read("/tmp/gowave-e2e-sabotage.err"),
+    "sabotage_present": os.path.isfile("/tmp/gowave-e2e-sabotage.json"),
+}, sort_keys=True))
+PY
+"""
+
+
+def channel_rollback_script() -> str:
+    """Run the real switch with a one-shot start failure that fires after the snapshot.
+
+    The injected fault is the documented trigger — a release that cannot start —
+    and it is also the only fault that can carry sabotage: an ``ExecStartPre``
+    hook runs after the snapshot and after the environment rewrite, so everything
+    it damages is restored from the snapshot rather than from the state it left.
+    The hook fails once and succeeds afterwards, which lets the rollback's own
+    restart bring the Panel back; the sabotage record tells the case which bytes
+    the rollback had to undo. The damage itself is handed to a transient unit,
+    because the started unit's sandbox also covers its own ``ExecStartPre``.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        "umask 077\n"
+        f"repo={shlex.quote(topology.REPO_IN_CONTAINER)}\n"
+        f"{CHANNEL_ROLLBACK_BODY.strip()}\n"
+    )
+
+
+def channel_rollback_cleanup_script() -> str:
+    """Remove the injected fault and let the product recover if its switch did not.
+
+    Cleanup runs even when the case has already failed, so an unfixed abort cannot
+    leave every later case measuring a broken panel. The product's own boot
+    recovery command is the healer, not a harness restore.
+    """
+    return f"""set -Eeuo pipefail
+rm -f {shlex.quote(CHANNEL_ONCE_FAIL_UNIT)} {shlex.quote(CHANNEL_ONCE_FAIL_EXEC)} \
+{shlex.quote(CHANNEL_SABOTAGE_EXEC)} {shlex.quote(CHANNEL_ONCE_FAIL_MARKER)}
+systemctl reset-failed gowave-e2e-sabotage.service >/dev/null 2>&1 || true
+systemctl daemon-reload
+state=$(python3 - <<'PY' || true
+import json
+try:
+    with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+        print(json.load(handle).get("state", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+if [[ -n "$state" && "$state" != "ROLLED_BACK" && "$state" != "COMMITTED" ]]; then
+    bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh recover --boot-files || true
+fi
+systemctl start gowave.service || true
+systemctl is-active gowave.service || true
+"""
+
+
+def case_channel_dev(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CHANNEL-DEV: the supported stable-to-dev transition is a snapshot and a restart.
+
+    The shipped command does not download a release; it records the channel,
+    restarts the Panel under it and commits only after the service answers. The
+    case therefore asserts exactly that contract: the snapshot holds the
+    pre-switch tree, the journal ends COMMITTED, the unit is active, both engines
+    still carry a payload, and the guarded dev-to-stable direction stays refused
+    without ``--force`` because no safe downgrade contract exists.
+    """
+    host = product.require_installed()
+    before = channel_state(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so "
+        "a stable-to-dev transition has nothing to switch",
+    )
+    product.subscription_payloads(CHANNEL_DEV_CASE_ID)
+    captured = channel_client_surface(product, CHANNEL_DEV_CASE_ID, "capture")
+    require(
+        CHANNEL_DEV_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        "the Panel served no default client before the switch, so there is nothing for it to keep: "
+        f"{captured!r}",
+    )
+
+    switch = product.host_script(channel_command("dev"), timeout=CHANNEL_TIMEOUT_SECONDS)
+    require(
+        CHANNEL_DEV_CASE_ID, switch.returncode == 0,
+        f"`gowave-auto.sh channel dev` exited {switch.returncode}:\n"
+        f"{(switch.stderr or switch.stdout or '').strip()[-2000:]}",
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, "Switched to channel 'dev' successfully." in (switch.stdout or ""),
+        "the switch did not report the committed transition: "
+        f"{(switch.stdout or switch.stderr or '').strip()[-600:]}",
+    )
+
+    after = channel_state(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID,
+        after.get("environment", {}).get("GOWAVE_CHANNEL") == "dev",
+        f"/opt/gowave/.env records channel "
+        f"{after.get('environment', {}).get('GOWAVE_CHANNEL')!r} after switching to dev",
+    )
+    created = sorted(set(after.get("snapshots") or []) - set(before.get("snapshots") or []))
+    require(
+        CHANNEL_DEV_CASE_ID, len(created) == 1,
+        f"the switch left {len(created)} new snapshots ({created!r}) instead of one",
+    )
+    snapshot_path = f"{CHANNEL_RECOVERY_ROOT}/{created[0]}"
+    journal = after.get("journal") or {}
+    require(
+        CHANNEL_DEV_CASE_ID,
+        journal.get("state") == "COMMITTED"
+        and journal.get("snapshot_dir") == snapshot_path
+        and journal.get("target_version") == "dev",
+        f"the journal after the switch is {journal!r} instead of a COMMITTED dev transition "
+        f"naming {snapshot_path}",
+    )
+    snapshot = channel_state(product, CHANNEL_DEV_CASE_ID, base=snapshot_path)
+    require_channel_snapshot(CHANNEL_DEV_CASE_ID, before, snapshot, snapshot_path)
+
+    # A channel label is not a data migration: the Panel must come back serving
+    # the same client, with the same inventory and every representation it served
+    # before. The database is read through that surface rather than by its bytes.
+    require(
+        CHANNEL_DEV_CASE_ID, after.get("database", {}).get("integrity") == "ok",
+        f"the database the switch left behind does not pass integrity_check: "
+        f"{after.get('database', {}).get('integrity')!r}",
+    )
+    surface = channel_client_surface(product, CHANNEL_DEV_CASE_ID, "verify")
+    require(
+        CHANNEL_DEV_CASE_ID, surface.get("inventory_identical") is True,
+        f"the switch changed the client inventory: {surface.get('users')!r} clients after "
+        f"{surface.get('users_captured')!r} before",
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, surface.get("user_present") is True,
+        "the client the Panel served before the switch is gone from its inventory afterwards",
+    )
+    unserved = sorted(
+        name for name, entry in (surface.get("representations") or {}).items()
+        if entry.get("status") != 200
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, not unserved,
+        f"the Panel stopped serving {', '.join(unserved)} after the switch: "
+        f"{surface.get('representations')!r}",
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+        f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the switch",
+    )
+    health = wait_for_channel_health(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID, health == "200",
+        f"the Panel health route answered {health!r} after the switch",
+    )
+    traffic = require_channel_traffic(product, CHANNEL_DEV_CASE_ID, host)
+
+    # The reverse direction is documented as unsafe without --force; the case
+    # records the refusal as the reason dev-to-stable is not an automatic
+    # rollback scenario, and checks that the refusal changed nothing.
+    refusal = product.host_script(channel_command("stable"), timeout=300)
+    require(
+        CHANNEL_DEV_CASE_ID, refusal.returncode != 0,
+        "`gowave-auto.sh channel stable` without --force switched off the dev channel, so the "
+        "documented downgrade guardrail is not enforced",
+    )
+    guard = (refusal.stderr or "") + (refusal.stdout or "")
+    require(
+        CHANNEL_DEV_CASE_ID, "irreversible database migrations" in guard and "--force" in guard,
+        "the dev-to-stable refusal did not name the irreversible migrations and the --force "
+        f"confirmation: {guard.strip()[-600:]}",
+    )
+    guarded = channel_state(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID,
+        guarded.get("environment", {}).get("GOWAVE_CHANNEL") == "dev"
+        and guarded.get("env_digest") == after.get("env_digest")
+        and guarded.get("snapshots") == after.get("snapshots"),
+        "the refused downgrade still changed the channel, the environment or the snapshots",
+    )
+    return {
+        "channel_before": "stable",
+        "channel_after": after.get("environment", {}).get("GOWAVE_CHANNEL"),
+        "snapshot": created[0],
+        "journal_state": journal.get("state"),
+        "snapshot_target_version": journal.get("target_version"),
+        "unit_state": after.get("unit", {}).get("ActiveState"),
+        "health": health,
+        "clients_served": surface.get("users"),
+        "transfer_count": traffic.get("transfer_count"),
+        "source_ips": ",".join(traffic.get("source_ips") or []),
+        "downgrade_refused": refusal.returncode,
+        "downgrade_message": guard.strip()[-300:],
+    }
+
+
+def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CHANNEL-ROLLBACK: a release that cannot start is undone from the snapshot.
+
+    Every area ``prepare_update_snapshot`` captures is overwritten by the injected
+    start hook and has to come back byte for byte: the Panel binary, the database,
+    the frontend, the environment, state.json, the NGINX tree and the ACME
+    lineage. The database is read by its integrity and by the inventory the Panel
+    serves from it, because a running Panel writes to the file between two reads.
+    The sabotage digests prove the rollback had something to restore rather than
+    finding the tree already intact; the API and both client engines prove the
+    restored tree is a working Panel and not only a matching hash.
+    """
+    host = product.require_installed()
+    product.subscription_payloads(CHANNEL_ROLLBACK_CASE_ID)
+    before = channel_state(product, CHANNEL_ROLLBACK_CASE_ID)
+    require(
+        CHANNEL_ROLLBACK_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so a "
+        "failed stable-to-dev switch would not be a stable-to-dev switch",
+    )
+    # The client surface is what proves the database really came back: the file is
+    # compared by its integrity, and the content is compared by what the Panel
+    # serves from it, because a running Panel writes to its database between reads.
+    captured = channel_client_surface(product, CHANNEL_ROLLBACK_CASE_ID, "capture")
+    require(
+        CHANNEL_ROLLBACK_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        "the Panel served no default client before the switch, so a restored database would "
+        f"have nothing to prove: {captured!r}",
+    )
+    try:
+        switch = probe_json(
+            CHANNEL_ROLLBACK_CASE_ID, "the injected channel switch",
+            product.host_script(channel_rollback_script(), timeout=CHANNEL_TIMEOUT_SECONDS),
+        )
+        sabotage = switch.get("sabotage") or {}
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, sabotage.get("targets"),
+            "the injected start hook never ran after the switch took its snapshot, so the "
+            "rollback had nothing to restore: "
+            f"unit configured as {(switch.get('configured') or '').strip()!r}, "
+            f"sandbox {(switch.get('sandbox') or '').strip()!r}, "
+            f"hook log {(switch.get('hook_log') or '<empty>').strip()[-600:]!r}, "
+            f"sabotage log {(switch.get('sabotage_log') or '<empty>').strip()[-600:]!r}, "
+            f"switch stderr {(switch.get('stderr') or '').strip()[-500:]!r}, "
+            f"unit {switch.get('unit')!r}",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, switch.get("returncode") not in (None, 0),
+            "the channel switch reported success although the restarted Panel never started",
+        )
+        journal = switch.get("journal") or {}
+        snapshot_name = (sabotage.get("snapshot") or "").rsplit("/", 1)[-1]
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, journal.get("state") == "ROLLED_BACK",
+            f"the failed switch left the journal at {journal.get('state')!r} instead of "
+            f"ROLLED_BACK: {(switch.get('stderr') or '').strip()[-800:]}",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, snapshot_name and journal.get("snapshot_dir", "").endswith(
+                snapshot_name
+            ),
+            f"the rolled-back journal names {journal.get('snapshot_dir')!r}, not the snapshot "
+            f"the sabotage was taken against ({snapshot_name!r})",
+        )
+        evidence = (switch.get("stderr") or "") + (switch.get("stdout") or "")
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, "File rollback completed and services verified." in evidence,
+            "the switch did not report a completed file rollback: "
+            f"{evidence.strip()[-800:]}",
+        )
+
+        after = channel_state(product, CHANNEL_ROLLBACK_CASE_ID)
+        require(
+            CHANNEL_ROLLBACK_CASE_ID,
+            after.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+            "the rollback did not restore the pre-switch channel in /opt/gowave/.env",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID,
+            after.get("environment", {}).get("E2E_CHANNEL_SABOTAGE") is None,
+            "the marker the sabotage appended to /opt/gowave/.env survived the rollback",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID,
+            after.get("database", {}).get("integrity") == "ok",
+            f"the restored database does not pass integrity_check: "
+            f"{after.get('database', {}).get('integrity')!r}",
+        )
+        # What the sabotage changed, read from the same probe the case uses: the
+        # digests are taken by the injected hook itself, so a target it could not
+        # reach would otherwise let an untouched file look restored.
+        before_digest = {
+            "binary": before.get("binary"),
+            "database": before.get("database", {}).get("bytes"),
+            "frontend_index": before.get("frontend_index"),
+            "environment": before.get("env_digest"),
+            "state": before.get("state"),
+            "nginx_conf": before.get("nginx_conf"),
+            "lineage_chain": before.get("lineage_chain"),
+        }
+        for injected, label, mandatory in (
+            ("binary", "the Panel binary", True),
+            ("database", "the database file", True),
+            ("environment", "the environment file", True),
+            ("state", "state.json", True),
+            # The remaining areas exist on an installed host but are read from the
+            # tree, so the hook reports them only where the file is really there.
+            ("frontend_index", "the frontend document", False),
+            ("nginx_conf", "the NGINX configuration", False),
+            ("lineage_chain", "the ACME lineage chain", False),
+        ):
+            if before_digest[injected] is None and not mandatory:
+                continue
+            require(
+                CHANNEL_ROLLBACK_CASE_ID,
+                sabotage["targets"].get(injected)
+                and sabotage["targets"].get(injected) != before_digest[injected],
+                f"the sabotage did not change {label}, so its restoration is unproven: "
+                f"{sabotage['targets'].get(injected)!r} vs {before_digest[injected]!r}",
+            )
+        restored = {
+            "env_digest": "the environment file",
+            "binary": "the Panel binary",
+            "frontend": "the frontend tree",
+            "frontend_index": "the frontend document",
+            "state": "state.json",
+            "nginx": "the NGINX tree",
+            "nginx_conf": "the NGINX configuration",
+            "letsencrypt": "the ACME tree",
+            "lineage_chain": "the ACME lineage chain",
+        }
+        for field, label in restored.items():
+            require(
+                CHANNEL_ROLLBACK_CASE_ID, after.get(field) == before.get(field),
+                f"the rollback did not restore {label}: {after.get(field)!r} vs "
+                f"{before.get(field)!r}",
+            )
+        snapshot = channel_state(
+            product, CHANNEL_ROLLBACK_CASE_ID, base=f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+        require_channel_snapshot(
+            CHANNEL_ROLLBACK_CASE_ID, before, snapshot,
+            f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+            f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the rollback",
+        )
+        surface = channel_client_surface(product, CHANNEL_ROLLBACK_CASE_ID, "verify")
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, surface.get("inventory_identical") is True,
+            f"the restored database serves {surface.get('users')!r} clients instead of the "
+            f"{surface.get('users_captured')!r} it held before the switch",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, surface.get("user_present") is True,
+            "the client the snapshot held is missing from the restored inventory",
+        )
+        changed_representations = sorted(
+            name for name, identical in (surface.get("representations_identical") or {}).items()
+            if not identical
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, not changed_representations,
+            f"the restored database serves different bytes for "
+            f"{', '.join(changed_representations)}: {surface.get('representations')!r}",
+        )
+        health = wait_for_channel_health(product, CHANNEL_ROLLBACK_CASE_ID)
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, health == "200",
+            f"the Panel health route answered {health!r} after the rollback",
+        )
+        traffic = require_channel_traffic(product, CHANNEL_ROLLBACK_CASE_ID, host)
+        return {
+            "switch_returncode": switch.get("returncode"),
+            "journal_state": journal.get("state"),
+            "snapshot": snapshot_name,
+            "sabotaged_targets": ",".join(sorted(sabotage["targets"])),
+            "channel_after": after.get("environment", {}).get("GOWAVE_CHANNEL"),
+            "unit_state": after.get("unit", {}).get("ActiveState"),
+            "health": health,
+            "clients_served": surface.get("users"),
+            "representations_identical": sum(
+                1 for identical in (surface.get("representations_identical") or {}).values()
+                if identical
+            ),
+            "transfer_count": traffic.get("transfer_count"),
+            "source_ips": ",".join(traffic.get("source_ips") or []),
+        }
+    finally:
+        healing = product.host_script(channel_rollback_cleanup_script(), timeout=CHANNEL_TIMEOUT_SECONDS)
+        healed = channel_state(product, CHANNEL_ROLLBACK_CASE_ID)
+        if healing.returncode != 0 or healed.get("unit", {}).get("ActiveState") != "active":
+            product.context.evidence_text(
+                "channel-rollback-cleanup.log",
+                f"exit {healing.returncode}\n{(healing.stdout or '')[-2000:]}\n"
+                f"{(healing.stderr or '')[-4000:]}\nunit {healed.get('unit')!r}",
+            )
+
+
+CHANNEL_INTERRUPT_BODY = r"""
+rm -f /tmp/gowave-e2e-interrupt.out /tmp/gowave-e2e-interrupt.err \
+      /tmp/gowave-e2e-interrupt.recovery.out /tmp/gowave-e2e-interrupt.recovery.err \
+      /tmp/gowave-e2e-interrupt.journal.json /tmp/gowave-e2e-interrupt.unit \
+      /tmp/gowave-e2e-hold.err /root/gowave-e2e-hold.started
+install -d -m 0755 /usr/local/sbin
+cat > /usr/local/sbin/gowave-e2e-hold <<'HOLD'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec 2>>/tmp/gowave-e2e-hold.err
+echo "hold entered in uid $(id -u)" >&2
+: >/root/gowave-e2e-hold.started
+# The operator is killed while the restarted Panel waits here. A restart of a
+# healthy Panel commits within milliseconds, so a kill timed against the journal
+# alone would usually land after the commit and prove nothing about an
+# interrupted transaction.
+exec sleep 120
+HOLD
+chmod 0755 /usr/local/sbin/gowave-e2e-hold
+install -d -m 0755 /etc/systemd/system/gowave.service.d
+cat > /etc/systemd/system/gowave.service.d/99-e2e-hold.conf <<'UNIT'
+[Service]
+# `+` runs the hook with the manager's own privileges, as the sabotage hook does:
+# holding the start must not depend on the gowave user's sandbox.
+ExecStartPre=+/usr/local/sbin/gowave-e2e-hold
+UNIT
+systemctl daemon-reload
+configured=$(systemctl show gowave.service -p ExecStartPre | tr '\n' ' ')
+
+setsid bash "$repo/gowave-auto.sh" channel dev \
+    >/tmp/gowave-e2e-interrupt.out 2>/tmp/gowave-e2e-interrupt.err &
+operator=$!
+echo "$operator" >/tmp/gowave-e2e-interrupt.pid
+
+started=$SECONDS
+deadline=$((SECONDS + 120))
+hold_started=0
+observed_state=""
+observed_channel=""
+while (( SECONDS < deadline )); do
+    if [[ -e /root/gowave-e2e-hold.started ]]; then
+        hold_started=1
+    fi
+    observed_channel=$(sed -n 's/^GOWAVE_CHANNEL=//p' /opt/gowave/.env 2>/dev/null | head -n 1 || true)
+    observed_state=$(python3 - <<'PY' || true
+import json
+try:
+    with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+        print(json.load(handle).get("state", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+    if (( hold_started == 1 )) && [[ "$observed_state" == "APPLYING" && "$observed_channel" == "dev" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+waited=$((SECONDS - started))
+systemctl show gowave.service -p ActiveState -p SubState -p MainPID \
+    >/tmp/gowave-e2e-interrupt.unit 2>&1 || true
+cp /var/lib/gowave-auto-nginx/recovery/journal.json /tmp/gowave-e2e-interrupt.journal.json 2>/dev/null || true
+
+# The process group, not only the leader: `channel` is one shell, but a signal sent
+# to the leader alone would leave a `systemctl` child of it running.
+kill -9 -- "-$operator" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    kill -0 "$operator" 2>/dev/null || break
+    sleep 0.1
+done
+operator_alive=0
+if kill -0 "$operator" 2>/dev/null; then
+    operator_alive=1
+fi
+set +e
+wait "$operator" 2>/dev/null
+operator_exit=$?
+set -e
+
+# Disarm the hold before the product's own recovery restarts the Panel: a hook
+# left in place would hold that restart the same way and blame the product for
+# this sleep. Stopping the unit is also what ends the held ExecStartPre.
+rm -f /etc/systemd/system/gowave.service.d/99-e2e-hold.conf /usr/local/sbin/gowave-e2e-hold
+systemctl daemon-reload
+systemctl stop gowave.service >/dev/null 2>&1 || true
+systemctl reset-failed gowave.service >/dev/null 2>&1 || true
+
+journal_valid=0
+if python3 "$repo/modules/recovery.py" --validate-journal \
+        /var/lib/gowave-auto-nginx/recovery/journal.json >/dev/null 2>&1; then
+    journal_valid=1
+fi
+# The killed operator died holding fd 9; an OS flock is released with the process,
+# so a fresh invocation must be able to take it. A surviving lease file is reported
+# with its holder, because a lease naming a dead pid is refused by the product.
+lock_free=0
+if flock -n /run/lock/gowave-managed-mutation.lock true >/dev/null 2>&1; then
+    lock_free=1
+fi
+
+set +e
+bash "$repo/gowave-auto.sh" recover --boot-files \
+    >/tmp/gowave-e2e-interrupt.recovery.out 2>/tmp/gowave-e2e-interrupt.recovery.err
+recovery_rc=$?
+set -e
+
+OPERATOR_PID="$operator" OPERATOR_ALIVE="$operator_alive" OPERATOR_EXIT="$operator_exit" \
+HOLD_STARTED="$hold_started" WAITED="$waited" OBSERVED_STATE="$observed_state" \
+OBSERVED_CHANNEL="$observed_channel" CONFIGURED="$configured" \
+JOURNAL_VALID="$journal_valid" LOCK_FREE="$lock_free" RECOVERY_RC="$recovery_rc" \
+python3 - <<'PY'
+import json, os, urllib.request
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-4000:]
+    except OSError:
+        return ""
+
+
+def journal(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+unit = {}
+for line in read("/tmp/gowave-e2e-interrupt.unit").splitlines():
+    key, _, value = line.partition("=")
+    if key.strip():
+        unit[key.strip()] = value.strip()
+
+lease = {}
+try:
+    with open("/run/lock/gowave-mutation-lease.json", encoding="utf-8") as handle:
+        lease = json.load(handle)
+except (OSError, ValueError):
+    lease = {}
+
+holder_alive = None
+holder = lease.get("holder_pid")
+if isinstance(holder, int) and holder > 0:
+    try:
+        os.kill(holder, 0)
+        holder_alive = True
+    except OSError:
+        holder_alive = False
+
+health = None
+try:
+    with urllib.request.urlopen(
+        "http://127.0.0.1:3000/api/system/health", timeout=5
+    ) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - the probe reports, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+switch_output = read("/tmp/gowave-e2e-interrupt.out") + read("/tmp/gowave-e2e-interrupt.err")
+print(json.dumps({
+    "operator_pid": int(os.environ["OPERATOR_PID"]),
+    "operator_alive": os.environ["OPERATOR_ALIVE"] == "1",
+    "operator_exit": int(os.environ["OPERATOR_EXIT"]),
+    "hold_started": os.environ["HOLD_STARTED"] == "1",
+    "waited_seconds": int(os.environ["WAITED"]),
+    "observed_journal_state": os.environ.get("OBSERVED_STATE", ""),
+    "observed_channel": os.environ.get("OBSERVED_CHANNEL", ""),
+    "configured": os.environ.get("CONFIGURED", ""),
+    "journal_at_kill": journal("/tmp/gowave-e2e-interrupt.journal.json"),
+    "journal_valid": os.environ["JOURNAL_VALID"] == "1",
+    "lock_free": os.environ["LOCK_FREE"] == "1",
+    "lease": lease,
+    "lease_holder_alive": holder_alive,
+    "unit_at_kill": unit,
+    "switch_stdout": read("/tmp/gowave-e2e-interrupt.out"),
+    "switch_stderr": read("/tmp/gowave-e2e-interrupt.err"),
+    "switch_reported_success": "Switched to channel 'dev' successfully." in switch_output,
+    "recovery_returncode": int(os.environ["RECOVERY_RC"]),
+    "recovery_output": read("/tmp/gowave-e2e-interrupt.recovery.out")
+    + read("/tmp/gowave-e2e-interrupt.recovery.err"),
+    "journal_after_recovery": journal("/var/lib/gowave-auto-nginx/recovery/journal.json"),
+    "health": health,
+}, sort_keys=True))
+PY
+"""
+
+
+def channel_interrupt_script() -> str:
+    """Run the real switch, then kill the operator inside its APPLYING state.
+
+    Everything happens in one payload because the kill needs the process group the
+    operator was started in: the entrypoint would otherwise be describing a
+    background pid to a second, unrelated shell. The hold hook is armed before the
+    switch starts, so the restart's ExecStartPre blocks and the transaction provably
+    stays at APPLYING until the SIGKILL lands.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        "umask 077\n"
+        f"repo={shlex.quote(topology.REPO_IN_CONTAINER)}\n"
+        f"{CHANNEL_INTERRUPT_BODY.strip()}\n"
+    )
+
+
+def channel_interrupt_cleanup_script() -> str:
+    """Disarm the hold and let the product recover, even when the case has failed.
+
+    Cleanup runs after the case and after an exception, so a failure between the
+    kill and the recovery cannot leave the hold armed, the Panel stopped, or an
+    operator still running for every later case to measure. The healer is the
+    product's own `recover --boot-files`, not a harness restore.
+    """
+    return f"""set -Eeuo pipefail
+pid=$(cat {shlex.quote(CHANNEL_INTERRUPT_PID)} 2>/dev/null || true)
+rm -f {shlex.quote(CHANNEL_HOLD_UNIT)} {shlex.quote(CHANNEL_HOLD_EXEC)} \
+{shlex.quote(CHANNEL_HOLD_MARKER)} {shlex.quote(CHANNEL_INTERRUPT_PID)}
+systemctl daemon-reload
+if [[ -n "$pid" ]] && ps -o args= -p "$pid" 2>/dev/null | grep -q 'gowave-auto.sh channel'; then
+    kill -9 -- "-$pid" 2>/dev/null || true
+fi
+systemctl stop gowave.service >/dev/null 2>&1 || true
+systemctl reset-failed gowave.service >/dev/null 2>&1 || true
+state=$(python3 - <<'PY' || true
+import json
+try:
+    with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+        print(json.load(handle).get("state", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+if [[ -n "$state" && "$state" != "ROLLED_BACK" && "$state" != "COMMITTED" ]]; then
+    bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh recover --boot-files || true
+fi
+systemctl start gowave.service >/dev/null 2>&1 || true
+systemctl is-active gowave.service || true
+"""
+
+
+def case_operator_interrupt(product: AioProduct) -> Dict[str, Any]:
+    """AIO-INTERRUPT: the operator is killed mid-switch and the product recovers.
+
+    `switch_channel` snapshots the tree, records APPLYING, rewrites the channel and
+    restarts the Panel; only then does it commit. This case kills the operator's
+    process group inside that window, with the restart held by a one-shot
+    ExecStartPre hook so the kill lands at APPLYING rather than racing the commit.
+
+    What the interruption leaves is read from the product's own side: the operator
+    is dead, its journal is schema-valid and still names the in-progress
+    transaction with the snapshot it took, the mutation lock it held is free, and
+    the switch never printed the success line it did not earn. The documented
+    recovery entrypoint `recover --boot-files` must then roll back that very
+    snapshot, restore the pre-switch tree and leave an active Panel serving the
+    same clients — the "subsequent supported retry or rollback" half of the
+    scenario. The snapshot tree is compared against the pre-switch state, so a
+    journal that names a snapshot the switch never finished taking is refused.
+    """
+    host = product.require_installed()
+    product.subscription_payloads(CHANNEL_INTERRUPT_CASE_ID)
+    before = channel_state(product, CHANNEL_INTERRUPT_CASE_ID)
+    require(
+        CHANNEL_INTERRUPT_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so "
+        "interrupting a stable-to-dev switch would interrupt a different transition",
+    )
+    captured = channel_client_surface(product, CHANNEL_INTERRUPT_CASE_ID, "capture")
+    require(
+        CHANNEL_INTERRUPT_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        "the Panel served no default client before the interrupt, so a restored database "
+        f"would have nothing to prove: {captured!r}",
+    )
+    try:
+        interrupted = probe_json(
+            CHANNEL_INTERRUPT_CASE_ID, "the interrupted channel switch",
+            product.host_script(channel_interrupt_script(), timeout=CHANNEL_TIMEOUT_SECONDS),
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            CHANNEL_HOLD_EXEC in (interrupted.get("configured") or ""),
+            "the ExecStartPre hold never reached the unit, so the switch was not interrupted "
+            f"in APPLYING: configured as {(interrupted.get('configured') or '').strip()!r}",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("hold_started") is True,
+            "the restarted Panel never reached the hold hook, so the operator was not "
+            "interrupted inside a running transaction",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            interrupted.get("observed_journal_state") == "APPLYING"
+            and interrupted.get("observed_channel") == "dev",
+            "the operator was not interrupted after taking the snapshot and rewriting the "
+            f"channel: journal {interrupted.get('observed_journal_state')!r}, environment "
+            f"{interrupted.get('observed_channel')!r}, after "
+            f"{interrupted.get('waited_seconds')!r}s",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            interrupted.get("operator_exit") == -9 or interrupted.get("operator_exit") == 137,
+            f"the operator exited {interrupted.get('operator_exit')!r} instead of dying from "
+            "SIGKILL, so the state left behind is not the one an interruption produces",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("operator_alive") is False,
+            "the operator process survived the SIGKILL and is still mutating the host",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("switch_reported_success") is False,
+            "the interrupted switch printed its success line, so it committed before the "
+            "kill and the case measured a completed transition",
+        )
+
+        journal_at_kill = interrupted.get("journal_at_kill") or {}
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, journal_at_kill.get("state") == "APPLYING",
+            f"the killed operator left the journal at {journal_at_kill.get('state')!r} instead "
+            "of the documented in-progress state APPLYING",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("journal_valid") is True,
+            "the journal the interrupted operator left does not pass the product's own "
+            "--validate-journal, so boot recovery would refuse it",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("lock_free") is True,
+            "the mutation lock stayed held after the operator died, so every later "
+            "invocation would refuse to run",
+        )
+        lease = interrupted.get("lease") or {}
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            not lease or interrupted.get("lease_holder_alive") is False,
+            f"the lease file names a live holder after the operator died: {lease!r}",
+        )
+
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("recovery_returncode") == 0,
+            "`gowave-auto.sh recover --boot-files` exited "
+            f"{interrupted.get('recovery_returncode')!r} on the interrupted transaction: "
+            f"{(interrupted.get('recovery_output') or '').strip()[-800:]}",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            "Interrupted transaction rolled back successfully."
+            in (interrupted.get("recovery_output") or ""),
+            "the recovery command did not report a completed rollback: "
+            f"{(interrupted.get('recovery_output') or '').strip()[-800:]}",
+        )
+        recovery_journal = interrupted.get("journal_after_recovery") or {}
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, recovery_journal.get("state") == "ROLLED_BACK",
+            f"the recovery left the journal at {recovery_journal.get('state')!r} instead of "
+            "ROLLED_BACK",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            recovery_journal.get("snapshot_dir") == journal_at_kill.get("snapshot_dir"),
+            "the recovery rolled back a different transaction: it names "
+            f"{recovery_journal.get('snapshot_dir')!r}, the interrupted operator took "
+            f"{journal_at_kill.get('snapshot_dir')!r}",
+        )
+
+        after = channel_state(product, CHANNEL_INTERRUPT_CASE_ID)
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            after.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+            "the recovery did not restore the pre-switch channel in /opt/gowave/.env",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            after.get("database", {}).get("integrity") == "ok",
+            f"the recovered database does not pass integrity_check: "
+            f"{after.get('database', {}).get('integrity')!r}",
+        )
+        snapshot_name = (journal_at_kill.get("snapshot_dir") or "").rsplit("/", 1)[-1]
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, bool(snapshot_name),
+            f"the interrupted journal names no snapshot directory: {journal_at_kill!r}",
+        )
+        snapshot = channel_state(
+            product, CHANNEL_INTERRUPT_CASE_ID, base=f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+        require_channel_snapshot(
+            CHANNEL_INTERRUPT_CASE_ID, before, snapshot,
+            f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+            f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the recovery",
+        )
+        health = wait_for_channel_health(product, CHANNEL_INTERRUPT_CASE_ID)
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, health == "200",
+            f"the Panel health route answered {health!r} after the recovery",
+        )
+        surface = channel_client_surface(product, CHANNEL_INTERRUPT_CASE_ID, "verify")
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, surface.get("inventory_identical") is True,
+            f"the recovered database serves {surface.get('users')!r} clients instead of the "
+            f"{surface.get('users_captured')!r} it held before the interrupt",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, surface.get("user_present") is True,
+            "the client the host served before the interrupt is missing from the recovered "
+            "inventory",
+        )
+        changed = sorted(
+            name for name, identical in (surface.get("representations_identical") or {}).items()
+            if not identical
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, not changed,
+            f"the recovered database serves different bytes for {', '.join(changed)}: "
+            f"{surface.get('representations')!r}",
+        )
+        # Both engines are read after the recovery: a Panel that answers its health
+        # route but no longer carries a payload would satisfy every file comparison.
+        traffic = require_channel_traffic(product, CHANNEL_INTERRUPT_CASE_ID, host)
+        # The case's own facts are written beside the verdict: the observation that
+        # the kill landed at APPLYING, the journal on both sides of the recovery and
+        # the lease left behind. A PASS that only says "PASS" cannot be audited.
+        product.context.evidence_text(
+            "channel-interrupt.json",
+            json.dumps(
+                {
+                    "interrupted": interrupted,
+                    "journal_at_kill": journal_at_kill,
+                    "journal_after_recovery": recovery_journal,
+                },
+                indent=2, sort_keys=True,
+            ),
+        )
+        return {
+            "interrupted_state": interrupted.get("observed_journal_state"),
+            "waited_seconds": interrupted.get("waited_seconds"),
+            "operator_exit": interrupted.get("operator_exit"),
+            "mutation_lock_free": interrupted.get("lock_free"),
+            "journal_state_at_kill": journal_at_kill.get("state"),
+            "snapshot": snapshot_name,
+            "recovery_returncode": interrupted.get("recovery_returncode"),
+            "journal_state": recovery_journal.get("state"),
+            "channel_after": after.get("environment", {}).get("GOWAVE_CHANNEL"),
+            "unit_state": after.get("unit", {}).get("ActiveState"),
+            "health": health,
+            "clients_served": surface.get("users"),
+            "transfer_count": traffic.get("transfer_count"),
+            "source_ips": ",".join(traffic.get("source_ips") or []),
+        }
+    finally:
+        healing = product.host_script(
+            channel_interrupt_cleanup_script(), timeout=CHANNEL_TIMEOUT_SECONDS,
+        )
+        healed = channel_state(product, CHANNEL_INTERRUPT_CASE_ID)
+        if healing.returncode != 0 or healed.get("unit", {}).get("ActiveState") != "active":
+            product.context.evidence_text(
+                "channel-interrupt-cleanup.log",
+                f"exit {healing.returncode}\n{(healing.stdout or '')[-2000:]}\n"
+                f"{(healing.stderr or '')[-4000:]}\nunit {healed.get('unit')!r}",
+            )
+
+
+VERIFIED_ARTIFACT_FETCH_CASE_ID = "VERIFIED-ARTIFACT-FETCH"
+PINNED_INSTALLER_HOSTS_CASE_ID = "PINNED-INSTALLER-HOSTS"
+PANEL_ASSET_VERIFICATION_CASE_ID = "PANEL-ASSET-VERIFICATION"
+FAIL_STEP_CASE_ID = "FAIL-STEP"
+
+
+def case_verified_artifact_fetch(product: AioProduct) -> Dict[str, Any]:
+    """``VERIFIED-ARTIFACT-FETCH``: the verified artifact chain fetches from ordered hosts,
+    verifies the digest before atomic rename, and stops on mismatch without fall-through.
+
+    The artifact helper `fetch_verified_artifact` is sourced and driven against a local
+    HTTP fixture that answers the first URL with a 404, the second with the correct
+    bytes, and a third with a mismatched payload. The case asserts fall-through on 404,
+    successful verification and atomic replace on the second, and terminal mismatch
+    refusal without trying the third host.
+    """
+    import hashlib
+    import http.server
+    import tempfile
+    import threading
+    import shlex
+    import subprocess
+    from pathlib import Path
+
+    payload = b"the pinned artifact bytes\n"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    class FixtureServer:
+        def __init__(self, routes):
+            self.routes = dict(routes)
+            self.requests = []
+            routes = self.routes
+            requests = self.requests
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    requests.append(self.path)
+                    body = routes.get(self.path)
+                    if body is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args):
+                    pass
+
+            self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+        def __enter__(self):
+            self._thread.start()
+            self.base = f"http://127.0.0.1:{self._httpd.server_address[1]}"
+            return self
+
+        def __exit__(self, *_exc):
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._thread.join(timeout=10)
+            return False
+
+        def url(self, path):
+            return self.base + path
+
+    # Test 1: fall-through on 404
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/second": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            *(shlex.quote(server.url(p)) for p in ["/first", "/second"]),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 0,
+            f"fall-through on 404 failed: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            dest.read_bytes() == payload,
+            "artifact bytes do not match expected payload",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == ["/first", "/second"],
+            f"expected requests [/first, /second], got {server.requests}",
+        )
+
+    # Test 2: terminal mismatch without fall-through
+    mismatched = b"different bytes\n"
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/first": mismatched, "/second": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            *(shlex.quote(server.url(p)) for p in ["/first", "/second"]),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 2,
+            f"mismatch should be terminal: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == ["/first"],
+            f"mismatch must not fall through, got {server.requests}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            not dest.exists(),
+            "mismatched download must not be left behind",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            "SHA256 mismatch" in result.stderr,
+            "error message must mention SHA256 mismatch",
+        )
+
+    # Test 3: no host delivering leaves nothing
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            *(shlex.quote(server.url(p)) for p in ["/first", "/second"]),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 1,
+            f"no host should fail: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == ["/first", "/second"],
+            f"both hosts should be tried, got {server.requests}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            not dest.exists(),
+            "no artifact should be left behind",
+        )
+
+    # Test 4: atomic replace - destination is replaced only after verification
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/only": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        dest.write_bytes(b"previous content\n")
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            shlex.quote(server.url("/only")),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 0,
+            f"atomic replace failed: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            dest.read_bytes() == payload,
+            "destination must be replaced with verified content",
+        )
+
+    # Test 5: unusable digest refused before any download
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/only": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            shlex.quote(server.url("/only")),
+            shlex.quote("not-a-digest"),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 2,
+            f"unusable digest should be refused: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == [],
+            "no download for unusable digest",
+        )
+
+    # Test 6: missing host list refused
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 1,
+            f"missing host list should be refused: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            "no source host" in result.stderr,
+            "error must mention missing host list",
+        )
+
+    return {
+        "tests_passed": 6,
+        "fall_through_404": True,
+        "terminal_mismatch": True,
+        "no_host_fails": True,
+        "atomic_replace": True,
+        "unusable_digest_refused": True,
+        "missing_host_list_refused": True,
+    }
+
+
+def case_pinned_installer_hosts(product: AioProduct) -> Dict[str, Any]:
+    """``PINNED-INSTALLER-HOSTS``: the pinned Worker installer URL order is GitHub first,
+    then jsDelivr.
+
+    The `pinned_node_installer_urls` function is sourced and its output is compared
+    against the expected order: raw.githubusercontent.com followed by cdn.jsdelivr.net.
+    """
+    import os
+    import shlex
+    import subprocess
+    from pathlib import Path
+
+    commit = "7b3514d1ab8c674050597820d52d55525d4bece7"
+    env = os.environ.copy()
+    env["GOWAVE_NODE_INSTALLER_COMMIT"] = commit
+
+    command = f"source {shlex.quote(str(product.repo / 'modules' / 'node.sh'))} && pinned_node_installer_urls"
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+
+    require(
+        PINNED_INSTALLER_HOSTS_CASE_ID,
+        result.returncode == 0,
+        f"pinned_node_installer_urls failed: {result.stderr}",
+    )
+
+    urls = result.stdout.split()
+    expected = [
+        f"https://raw.githubusercontent.com/aaaSaZaN/gowave-node/{commit}/install.sh",
+        f"https://cdn.jsdelivr.net/gh/aaaSaZaN/gowave-node@{commit}/install.sh",
+    ]
+
+    require(
+        PINNED_INSTALLER_HOSTS_CASE_ID,
+        urls == expected,
+        f"URL order mismatch: got {urls}, expected {expected}",
+    )
+
+    return {
+        "urls": urls,
+        "github_first": urls[0].startswith("https://raw.githubusercontent.com/"),
+        "jsdelivr_second": urls[1].startswith("https://cdn.jsdelivr.net/"),
+    }
+
+
+def case_panel_asset_verification(product: AioProduct) -> Dict[str, Any]:
+    """``PANEL-ASSET-VERIFICATION``: the panel release asset transfer requires SHA256SUMS
+    from the release host, and a mismatched asset aborts without falling through.
+
+    The `download_panel_release` function is driven with a stubbed curl that answers
+    every URL with a mismatched payload. The SHA256SUMS file contains well-formed
+    digests that the stub's bytes cannot match. The case asserts the mismatch aborts
+    the transfer, the binary is not left behind, and only one URL is requested
+    (no fall-through to the next host).
+    """
+    import tempfile
+    import os
+    import shlex
+    import subprocess
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target_dir = tmp / "opt_gowave"
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        log = tmp / "curl-urls.log"
+        payload = tmp / "stub-body.bin"
+        payload.write_bytes(b"another release's bytes\n")
+        stub = bin_dir / "curl"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "url=''\n"
+            "target=''\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    -o) target="$2"; shift 2 ;;\n'
+            '    -*) shift ;;\n'
+            '    *) url="$1"; shift ;;\n'
+            "  esac\n"
+            "done\n"
+            f'printf \'%s\\n\' "$url" >> "{log}"\n'
+            f'if [ -n "$target" ]; then cp "{payload}" "$target"; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        arch_result = subprocess.run(
+            ["bash", "-c", f'source "{product.repo / "modules" / "panel.sh"}" && detect_arch'],
+            capture_output=True, text=True, timeout=60,
+        )
+        arch = arch_result.stdout.strip()
+
+        sums = tmp / "SHA256SUMS"
+        sums.write_text(
+            f"{'0' * 64}  gowave-linux-{arch}\n"
+            f"{'0' * 64}  gowave-frontend.tar.gz\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["GOWAVE_SHA256SUMS"] = str(sums)
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+        command = f'source "{product.repo / "modules" / "panel.sh"}" && download_panel_release "{target_dir}" v9.9.9'
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            result.returncode != 0,
+            "mismatched asset must abort the transfer",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            "Checksum mismatch" in result.stderr,
+            "error must mention checksum mismatch",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            not (target_dir / "gowave-server").exists(),
+            "binary must not be left behind after mismatch",
+        )
+
+        requested = log.read_text().splitlines()
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            len(requested) == 1,
+            f"a mismatch must abort instead of trying the next URL, got {requested}",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            f"gowave-linux-{arch}" in requested[0],
+            f"requested URL must be for the binary: {requested[0]}",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            "gowave-frontend.tar.gz" not in requested[0],
+            "frontend asset must not be requested in the same call",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            not any("api.github.com" in url for url in requested),
+            "a digest mismatch must not fall back to the release API",
+        )
+
+    return {
+        "mismatch_aborts": True,
+        "binary_not_left": True,
+        "single_url_requested": True,
+        "no_release_api_fallback": True,
+    }
+
+
+def case_fail_step(product: AioProduct) -> Dict[str, Any]:
+    """``FAIL-STEP``: a failed install prints a located failure with the step name,
+    the failing command and its status, exactly once, and exits with that status.
+
+    The ERR trap with CURRENT_STEP is installed per design.md D13. The fixture
+    sources ``gowave-auto.sh`` — the router stops at a sourced file, so the menu
+    does not start — sets CURRENT_STEP, and runs a step whose command fails. The
+    report is read for the three things the operator needs to locate the stop, and
+    the run is read for the status the trap must keep. A second run where the step
+    succeeds is the control: the same trap must stay silent.
+
+    The double-compensation clause is not measured here: this trap only reports,
+    and the unit suite (`tests/test_failure_report.py`) drives the handler against
+    a pre-rolled-back step to prove it. A case that asserted it from this fixture
+    would be asserting a behaviour the fixture cannot show.
+    """
+    import tempfile
+    import subprocess
+    import shlex
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        script_path = str(product.repo / "gowave-auto.sh")
+
+        failed = tmp / "test_fail_step.sh"
+        failed.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"source {shlex.quote(script_path)}\n"
+            "\n"
+            "CURRENT_STEP='test-step'\n"
+            "failing_step() { false; }\n"
+            "failing_step\n"
+            "echo 'SHOULD_NOT_REACH'\n",
+            encoding="utf-8",
+        )
+        failed.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(failed)], capture_output=True, text=True, timeout=60,
+        )
+
+        succeeded = tmp / "test_ok_step.sh"
+        succeeded.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"source {shlex.quote(script_path)}\n"
+            "\n"
+            "CURRENT_STEP='ok-step'\n"
+            "true\n"
+            "echo 'STEP_COMPLETED'\n",
+            encoding="utf-8",
+        )
+        succeeded.chmod(0o755)
+        control = subprocess.run(
+            ["bash", str(succeeded)], capture_output=True, text=True, timeout=60,
+        )
+
+    report = result.stderr
+    require(FAIL_STEP_CASE_ID, result.returncode == 1,
+            f"a failing step exited {result.returncode!r} instead of keeping its status")
+    require(FAIL_STEP_CASE_ID, 'step "test-step"' in report,
+            f"the report does not name the step: stdout={result.stdout!r}, stderr={report!r}")
+    require(FAIL_STEP_CASE_ID, 'running "false"' in report,
+            f"the report does not name the failing command: {report!r}")
+    require(FAIL_STEP_CASE_ID, "(exit 1)" in report,
+            f"the report does not name the status: {report!r}")
+    # Counted before the message: an f-string may not carry a backslash in its
+    # expression part before Python 3.12, and the Debian 12 guest that runs this
+    # suite has 3.11.
+    report_count = report.count('Error: step "')
+    require(FAIL_STEP_CASE_ID, report_count == 1,
+            f"the report was printed {report_count} times, so the handler "
+            f"re-entered itself: {report!r}")
+    require(FAIL_STEP_CASE_ID, "SHOULD_NOT_REACH" not in result.stdout,
+            "the run continued past the failing command")
+
+    require(FAIL_STEP_CASE_ID, control.returncode == 0,
+            f"a step that succeeded exited {control.returncode!r}: {control.stderr!r}")
+    require(FAIL_STEP_CASE_ID, "STEP_COMPLETED" in control.stdout,
+            f"the control run did not reach its end: {control.stdout!r}")
+    require(FAIL_STEP_CASE_ID, "Error: step " not in control.stderr,
+            f"a successful run printed a failure report: {control.stderr!r}")
+
+    return {
+        "step_named": "test-step" in report,
+        "command_named": 'running "false"' in report,
+        "status_named": "(exit 1)" in report,
+        "report_count": report_count,
+        "exit_status": result.returncode,
+        "silent_on_success": "Error: step " not in control.stderr,
+    }
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
@@ -4363,6 +10095,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-01", "aio", lambda context: case_panel_ready(product), timeout_seconds=300),
         Case("AIO-03", "aio", lambda context: case_credentials(product), timeout_seconds=300),
         Case("AIO-05", "aio", lambda context: case_tls_and_identity(product), timeout_seconds=300),
+        # The installer's own TLS/SNI probe is asked what decides its answer —
+        # the per-run bundle, or no bundle and whatever the host trusts — before
+        # any reload touches the tree this case reads it out of.
+        Case(TLS_CA_CASE_ID, "aio", lambda context: case_tls_ca_bundle(product),
+             timeout_seconds=TLS_CA_TIMEOUT_SECONDS),
         # The public certificate is read before the tree is reloaded, so a later
         # case's reload cannot be mistaken for a defect in what this one measured.
         Case(TLS_CASE_ID, "aio", lambda context: case_tls_surface(product),
@@ -4380,6 +10117,12 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # measured here, while no case has changed the tree or the lineage yet.
         Case(DECOY_CASE_ID, "aio", lambda context: case_decoy(product),
              timeout_seconds=DECOY_TIMEOUT_SECONDS),
+        # The Vision contour is read the same way: the running map and socket
+        # table, then the delegated name over 443 and its fallback over the
+        # loopback. Nothing here writes, so it stays with the other read-only
+        # surfaces above the reload cases.
+        Case(VISION_ROUTE_CASE_ID, "aio", lambda context: case_vision_route(product),
+             timeout_seconds=VISION_ROUTE_TIMEOUT_SECONDS),
         # The renewal runs before any traffic for the same reason: it reloads
         # NGINX onto a fresh lineage, and a data-plane case must not be measured
         # across a reload this one caused.
@@ -4390,12 +10133,46 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(ACME_OUTAGE_CASE_ID, "aio", lambda context: case_acme_outage(product),
              timeout_seconds=ACME_OUTAGE_TIMEOUT_SECONDS),
         Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
+        # Beside it and before any traffic: the same Panel is asked for four
+        # credentials it did not issue, and the one it did issue still reads.
+        Case(AUTH_NEGATIVE_CASE_ID, "aio", lambda context: case_panel_auth_negative(product),
+             timeout_seconds=300),
+        # The controller's client, not the probe's own HTTP: the same class the
+        # live run drives, pointed at this host's public name with the run bundle.
+        Case(PANEL_API_CLIENT_CASE_ID, "aio", lambda context: case_panel_api_client_trust(product),
+             timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),
         Case("SUB-UA-ABSENT", "aio", lambda context: case_user_agent_absent(product), timeout_seconds=300),
         Case("SUB-UA-BLANK", "aio", lambda context: case_user_agent_blank(product), timeout_seconds=300),
+        # The listener's own contract, read where a pasted link lands: the edge,
+        # not the loopback. It runs after the representation cases because it
+        # compares the payload it is served with the one they already imported.
+        Case(SUB_EDGE_CASE_ID, "aio", lambda context: case_subscription_edge(product),
+             timeout_seconds=SUB_EDGE_TIMEOUT_SECONDS),
+        Case(SUB_EDGE_FORGERY_CASE_ID, "aio",
+             lambda context: case_subscription_edge_forgery(product),
+             timeout_seconds=SUB_EDGE_TIMEOUT_SECONDS),
         Case("SUB-B64", "aio", lambda context: case_share_links(product), timeout_seconds=300),
+        Case(NGX_HYGIENE_CASE_ID, "aio", lambda context: case_ngx_hygiene(product),
+             timeout_seconds=NGX_HYGIENE_TIMEOUT_SECONDS),
+        Case(NGX_SCANNER_CASE_ID, "aio", lambda context: case_ngx_scanner(product),
+             timeout_seconds=NGX_HYGIENE_TIMEOUT_SECONDS),
+        # Two refusals of the same entrypoint, ordered after the install because
+        # the control they read is the product the install left serving.
+        Case(PRE_INPUTS_CASE_ID, "aio", lambda context: case_preflight_inputs(product),
+             timeout_seconds=PRE_INPUTS_TIMEOUT_SECONDS),
+        Case(PRE_INPUTS_BAD_CASE_ID, "aio", lambda context: case_preflight_inputs_bad(product),
+             timeout_seconds=PRE_INPUTS_TIMEOUT_SECONDS),
         Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
+        # The anchor every TLS outbound needs, read from the helper the data-plane
+        # cases call: the config is minted here and the CA is minted here, so the
+        # case decides what the outbound carries and what that anchor trusts
+        # without starting an engine. The traffic cases decide the other half.
+        Case(tls_anchors.CASE_ID, "aio",
+             lambda context: tls_anchors.case_every_tls_outbound_carries_the_fixture_ca(
+                 product, context),
+             timeout_seconds=300),
     ]
     for case_id, inbound, client in data_plane:
         suite.append(Case(
@@ -4406,19 +10183,351 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
     suite.append(Case(
         "AIO-MATRIX", "aio", lambda context: case_matrix(product), timeout_seconds=120,
     ))
+    # The bracket's failure paths run after the positive ones, so a degradation
+    # that would be indistinguishable from a broken install is measured against a
+    # host the matrix cases have already shown carries traffic.
+    suite.append(Case(
+        PKT_INCOMPLETE_CASE_ID, "aio",
+        lambda context: case_packet_evidence_incomplete(product),
+        timeout_seconds=PKT_INCOMPLETE_TIMEOUT_SECONDS,
+    ))
     suite.extend([
         Case("AIO-REVOKE", "aio", lambda context: case_revocation(product),
-             timeout_seconds=TUNNEL_READY_TIMEOUT_SECONDS + 2 * TRAFFIC_TIMEOUT_SECONDS),
+             # The positive matrix is re-run inside a fixed window when the probe
+             # reported nothing, so the ceiling carries that window on top of the
+             # two probe budgets this case already declared.
+             timeout_seconds=TUNNEL_READY_TIMEOUT_SECONDS + 2 * TRAFFIC_TIMEOUT_SECONDS
+             + REVOCATION_TRANSFER_TIMEOUT_SECONDS),
         Case("AIO-RESTART", "aio", lambda context: case_restart(product),
              timeout_seconds=RESTART_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
              + TRAFFIC_TIMEOUT_SECONDS),
+        # The fault cases come after the restart case and before the repeated
+        # install: each one removes its own fault, and a host left in the state
+        # a fault produced must never be the one the idempotency case measures.
+        Case(BACKUP_FAULT_CASE_ID, "aio", lambda context: case_backup_store_full(product),
+             timeout_seconds=BACKUP_FAULT_TIMEOUT_SECONDS),
+        Case(PANEL_FAULT_CASE_ID, "aio", lambda context: case_panel_service_down(product),
+             timeout_seconds=PANEL_FAULT_TIMEOUT_SECONDS),
+        Case(CORE_FAULT_CASE_ID, "aio", lambda context: case_core_process_killed(product),
+             timeout_seconds=CORE_FAULT_TIMEOUT_SECONDS),
+        Case(LATENCY_FAULT_CASE_ID, "aio", lambda context: case_public_latency(product),
+             timeout_seconds=LATENCY_FAULT_TIMEOUT_SECONDS),
         Case("AIO-IDEMPOTENT", "aio", lambda context: case_idempotent(product),
              timeout_seconds=INSTALL_TIMEOUT_SECONDS + TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-NEG-DEST", "aio", lambda context: case_negative_destination(product),
              timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-NEG-PORT", "aio", lambda context: case_foreign_listener(product), timeout_seconds=300),
         Case("AIO-NEG-ACME", "aio", lambda context: case_acme_fail_closed(product), timeout_seconds=300),
+        # The same refusal table, read from the three copies of the function that
+        # makes it: the install case proves the installer stops, this one proves
+        # the Master's copy and the Worker's two copies stop for the same inputs
+        # and accept the same allowlist.
+        Case(acme_mode.CASE_ID, "aio",
+             lambda context: acme_mode.case_arbitrary_directory_is_refused(product, context),
+             timeout_seconds=300),
+        Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
+        # Beside the other failure paths, and before the channel cases: it runs a
+        # second install that is meant to fail, so it must never be measured
+        # across a switch and must never be the case a switch is measured across.
+        Case(VISION_FAILURE_CASE_ID, "aio", lambda context: case_vision_certificate_failure(product),
+             timeout_seconds=VISION_FAILURE_TIMEOUT_SECONDS),
+        # The two halves of the redaction contract read the host and the artifact
+        # tree, so they run here: after every mutating case has written the
+        # evidence they audit, and before the channel switch, whose dev build is
+        # not the host either case describes.
+        Case(REDACTION_CASE_ID, "aio", lambda context: case_redacted_credentials(product),
+             timeout_seconds=300),
+        Case(DIAGNOSTICS_CASE_ID, "aio", lambda context: case_diagnostic_artifacts(product),
+             timeout_seconds=DIAGNOSTICS_TIMEOUT_SECONDS),
+        # The channel cases come last because a switch restarts the Panel, and an
+        # earlier case must never be measured across one. Their own order is the
+        # contract: the same-channel no-op is proven before anything mutates the
+        # channel, the failed and the interrupted switch both start from stable and
+        # end back on it, and only the last case leaves the host on dev, which has
+        # no safe automatic way back.
+        Case(CHANNEL_NOOP_CASE_ID, "aio", lambda context: case_channel_noop(product),
+             timeout_seconds=600),
+        Case(CHANNEL_ROLLBACK_CASE_ID, "aio", lambda context: case_channel_rollback(product),
+             timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
+        Case(CHANNEL_INTERRUPT_CASE_ID, "aio", lambda context: case_operator_interrupt(product),
+             timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
+        Case(CHANNEL_DEV_CASE_ID, "aio", lambda context: case_channel_dev(product),
+             timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
+        # Before the budget case, because it reads no clock: it produces the report
+        # an overall PASS is read from and asserts what a red one must name.
+        Case(status.STATUS_CASE_ID, "aio", status.case_status_semantics, timeout_seconds=120),
+        # Also before the budget case, and for the same reason: it starts no
+        # container and touches no host, so it reads a policy the suite never
+        # exercises — the one it ends in.
+        Case(teardown.TEARDOWN_CASE_ID, "aio", teardown.case_teardown_policy,
+             timeout_seconds=120),
+        # Beside it, and for the same reason: Vision's two container-reproducible
+        # scenarios decide a configuration file and a host's port baseline, so
+        # neither starts a container. They run in both contours because both read
+        # the same parser and the same gate.
+        Case(vision_policy.CONFIG_CASE_ID, "aio", vision_policy.case_config_contract,
+             timeout_seconds=120),
+        Case(vision_policy.GATE_CASE_ID, "aio", vision_policy.case_port_gate, timeout_seconds=120),
+        # The eight questions a run decides before it may touch a VPS: two hosts
+        # on two addresses, four names that are pairwise distinct, two host keys,
+        # and the resolvers that answer for those names. None starts a container,
+        # and they run here rather than after the install because the DNS pair
+        # binds :53 on loopback: a host that already serves it is reported before
+        # anything is deployed, not as a verdict about a running cluster.
+        Case(preflight_cases.SSH_TRUST_CASE_ID, "aio", preflight_cases.case_ssh_trust,
+             timeout_seconds=120),
+        Case(preflight_cases.DNS_MISMATCH_CASE_ID, "aio",
+             preflight_cases.case_dns_address_mismatch, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITHOUT_IPV6_CASE_ID, "aio",
+             preflight_cases.case_aaaa_rejected_without_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITH_IPV6_CASE_ID, "aio",
+             preflight_cases.case_aaaa_verified_with_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_BYPASS_CASE_ID, "aio",
+             preflight_cases.case_aaaa_cannot_bypass, timeout_seconds=240),
+        Case(preflight_cases.PROXY_CIDR_CASE_ID, "aio",
+             preflight_cases.case_proxy_cidr_refused, timeout_seconds=240),
+        Case(preflight_cases.PROXY_CIDR_OVERRIDE_CASE_ID, "aio",
+             preflight_cases.case_proxy_cidr_override, timeout_seconds=240),
+        Case(preflight_cases.TLS_LINEAGE_CASE_ID, "aio",
+             preflight_cases.case_tls_lineage, timeout_seconds=120),
+        Case(preflight_cases.TLS_LINEAGE_BAD_CASE_ID, "aio",
+             preflight_cases.case_tls_lineage_bad, timeout_seconds=120),
+        Case(preflight_cases.DISTINCT_TARGETS_CASE_ID, "aio",
+             preflight_cases.case_distinct_targets, timeout_seconds=120),
+        Case(preflight_cases.DISTINCT_DOMAINS_CASE_ID, "aio",
+             preflight_cases.case_distinct_domains, timeout_seconds=120),
+        Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "aio",
+             preflight_cases.case_root_identity, timeout_seconds=120),
+        # A target address the suite must not be pointed at: every class the
+        # sentence names is refused by the product's own validator, and the two
+        # harness addresses the rest of the run uses are read back as global so
+        # the refusals above are not the rule rejecting everything.
+        Case(preflight_cases.PRIVATE_ADDRESS_CASE_ID, "aio",
+             preflight_cases.case_private_address_rejected, timeout_seconds=240),
+        # The run's own record, read without a host: a run id names a directory
+        # below the artifact root or nothing, and a partial phase resumes only the
+        # run that wrote the state it was handed. Both call the product's own
+        # helpers, so the cases start no container and read no clock.
+        Case(runstate_cases.RUN_ID_CASE_ID, "aio",
+             runstate_cases.case_run_id_root, timeout_seconds=120),
+        Case(runstate_cases.RESUME_CASE_ID, "aio",
+             runstate_cases.case_resume_gate, timeout_seconds=120),
+        # The gate a run decides about a host before it may install on it, and the
+        # two trust questions a payload is read through. The environment cases
+        # start their own clean container from the run's own image, so they run
+        # after the install that built it and after every case that could have
+        # changed the image; the other three start nothing.
+        Case(environment_gate.CLEAN_CASE_ID, "aio",
+             lambda context: environment_gate.case_clean_baseline_passes_gate(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(environment_gate.CONTAMINATED_CASE_ID, "aio",
+             lambda context: environment_gate.case_contaminated_host_is_refused(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(trust_bundle.DP12_CASE_ID, "aio",
+             lambda context: trust_bundle.case_production_bundle_excludes_staging(product, context),
+             timeout_seconds=180),
+        # The three Staging sentences beside the production one, because they read
+        # the same vendored roots and the same builder: the pins and their digests,
+        # the anchors a TLS outbound receives, and what the combined bundle trusts.
+        Case(staging_trust.DP11_CASE_ID, "aio",
+             lambda context: staging_trust.case_staging_roots_are_pinned(product, context),
+             timeout_seconds=240),
+        Case(staging_trust.DP10_CASE_ID, "aio",
+             lambda context: staging_trust.case_xray_outbounds_carry_anchors(product, context),
+             timeout_seconds=180),
+        Case(staging_trust.DP09_CASE_ID, "aio",
+             lambda context: staging_trust.case_staging_and_public_chains_are_trusted(product, context),
+             timeout_seconds=240),
+        Case(skip_policy.DP14_CASE_ID, "aio",
+             lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
+             timeout_seconds=180),
+        # The controller the operator runs on this machine, read whole: its input
+        # gate before any socket exists, the one call its password is allowed in,
+        # the host key it pins, and the bounded access it installs. None of these
+        # starts a container, so they sit beside the other file-shaped cases.
+        Case(operator_access.OP_CASE_ID, "aio",
+             lambda context: operator_access.case_domain_input_is_validated_before_network(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.PASSWORD_CASE_ID, "aio",
+             lambda context: operator_access.case_password_is_hidden_and_unpersisted(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_CONFIRMED_CASE_ID, "aio",
+             lambda context: operator_access.case_confirmed_host_key_is_pinned(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_DECLINED_CASE_ID, "aio",
+             lambda context: operator_access.case_unconfirmed_host_key_aborts(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.BOUNDED_CASE_ID, "aio",
+             lambda context: operator_access.case_temporary_key_is_bounded(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.FALLBACK_CASE_ID, "aio",
+             lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
+        # What happens to the access after the run: the key and the timer are
+        # withdrawn on every host, and a host that keeps them is recorded as
+        # INCOMPLETE instead of passing.
+        Case(operator_access.REVOKED_CASE_ID, "aio",
+             lambda context: operator_access.case_temporary_access_is_revoked(
+                 product, context),
+             timeout_seconds=300),
+        # The Certbot deploy hook the transaction writes into the target: the
+        # shell functions are driven in a temporary tree, so the ownership
+        # manifest, the digest and the teardown verdicts are the product's own.
+        Case(hook_ownership.CASE_ID, "aio",
+             lambda context: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it(
+                 product, context),
+             timeout_seconds=300),
+        # What is already at the managed hook path, whatever shape it takes: the
+        # preflight is driven over a symlink, a directory, a FIFO and a file
+        # edited after its manifest, and each refusal is read back for what it
+        # left behind.
+        Case(hook_ownership.HOOK_01, "aio",
+             lambda context: hook_ownership.case_preexisting_hook_is_never_adopted(
+                 product, context),
+             timeout_seconds=300),
+        # The sysctl file the panel writes: the shipped writer is run on this
+        # container against a path the case owns, so a foreign file, an empty
+        # file and a symlink are refused rather than truncated.
+        Case(ownership.CASE_ID, "aio",
+             lambda context: ownership.case_panel_sysctl_is_not_adopted(product, context),
+             timeout_seconds=300),
+        # The Worker paths this install would remove on rollback: the shipped
+        # preflight and its record are driven over a scratch root, so a unit
+        # file, a binary directory and a symlink this install did not write are
+        # refused before anything is touched.
+        Case(ownership_targets.CASE_ID, "aio",
+             lambda context: ownership_targets.case_panel_mutation_targets_are_not_adopted(
+                 product, context),
+             timeout_seconds=300),
+        # The firewall this install reconfigures: the before-image and the
+        # restore are the product's, driven over a scratch root with ufw and
+        # iptables answered by shims, so an operator rule, the default policies
+        # and the enabled state come back together.
+        Case(firewall_image.CASE_ID, "aio",
+             lambda context: firewall_image.case_panel_firewall_policy_is_preserved(
+                 product, context),
+             timeout_seconds=300),
+        # The paths this transaction writes: a pre-existing object comes back
+        # from the before-image, a created one is removed only while the
+        # ownership record still proves it, and anything else is preserved with
+        # the cleanup reported incomplete rather than claimed as a rollback.
+        Case(mutation_baseline.CASE_ID, "aio",
+             lambda context: mutation_baseline.case_panel_mutation_targets_are_restored(
+                 product, context),
+             timeout_seconds=300),
+        # The journal an interrupted Worker install leaves behind: the writer,
+        # the mark that closes it and the reconcile the next entrypoint runs are
+        # all the product's, driven over a scratch root, so a run killed before
+        # its before-image was restored is discovered rather than built upon.
+        Case(worker_journal.CASE_ID, "aio",
+             lambda context: worker_journal.case_panel_journal_is_reconciled(
+                 product, context),
+             timeout_seconds=300),
+        # What the packages that install pulled in left behind: the baseline is
+        # taken before the first package mutation and the delta once the
+        # transaction knows it is done, so a preserved host reports the residue
+        # instead of being called clean.
+        Case(package_residual.CASE_ID, "aio",
+             lambda context: package_residual.case_panel_package_residuals(
+                 product, context),
+             timeout_seconds=300),
+        # The payload's own signal block, driven over a scratch host root: one
+        # compensation per interruption, the before-image put back and verified,
+        # the journal left for the next entrypoint and a nonzero exit.
+        Case(signal_compensation.CASE_ID, "aio",
+             lambda context: signal_compensation.case_panel_signal_is_compensated_once(
+                 product, context),
+             timeout_seconds=300),
+        # The journal an interrupted switch leaves behind, and the boot recovery
+        # that reads it: both the writer and the shell recovery are the product's.
+        Case(transaction_recovery.CASE_ID, "aio",
+             lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
+                 product, context),
+             timeout_seconds=300),
+        # The end of that transaction: both compensation sides are recorded, and
+        # a transaction is only rolled back once the Worker host and the Panel API
+        # have each verified. The Worker is a stub script, the API is the
+        # product's own rollback over a journal this case wrote.
+        Case(rollback_sides.CASE_ID, "aio",
+             lambda context: rollback_sides.case_worker_and_api_rollback_are_both_required(
+                 product, context),
+             timeout_seconds=300),
+        # The same transaction from the other end: the operator's own node add
+        # against an address whose sshd never answers. The Master registers, then
+        # recovers, and the case reads the journal, the state snapshot, the Panel
+        # inventory and the lock it was left with.
+        Case(negative_journal.CASE_ID, "aio",
+             lambda context: negative_journal.case_partial_worker_install_leaves_no_committed_journal(
+                 product, context),
+             timeout_seconds=900),
+        # The end of the same transaction: the temporary key is revoked on the
+        # target, and a revocation that cannot be verified turns the run
+        # INCOMPLETE. The transport is a seam, so no socket is opened.
+        Case(revocation.REV_01, "aio",
+             lambda context: revocation.case_revocation_succeeds(product, context),
+             timeout_seconds=300),
+        Case(revocation.REV_02, "aio",
+             lambda context: revocation.case_revocation_cannot_be_verified(product, context),
+             timeout_seconds=300),
+        # The pinned artifact chain: ordered hosts, digest before use, mismatch
+        # terminal. These are unit-test-style cases that start no container and
+        # read no clock, so they run beside the other file-shaped cases. Their
+        # driver takes the product alone: the runner's context is what the cases
+        # that reach a host need, and passing it here was a call the function
+        # never accepted.
+        Case(VERIFIED_ARTIFACT_FETCH_CASE_ID, "aio",
+             lambda _context: case_verified_artifact_fetch(product),
+             timeout_seconds=120),
+        Case(PINNED_INSTALLER_HOSTS_CASE_ID, "aio",
+             lambda _context: case_pinned_installer_hosts(product),
+             timeout_seconds=120),
+        Case(PANEL_ASSET_VERIFICATION_CASE_ID, "aio",
+             lambda _context: case_panel_asset_verification(product),
+             timeout_seconds=120),
+        Case(FAIL_STEP_CASE_ID, "aio",
+             lambda _context: case_fail_step(product),
+             timeout_seconds=120),
+        # The negative matrix itself: fifteen rows the spec prints, each with the
+        # case that stops at its boundary and the contour able to produce it. The
+        # witnesses are read out of the suite's own registry, so a witness deleted
+        # from the code fails here instead of quietly emptying a catalog entry.
+        Case(negative_matrix.MATRIX_CASE_ID, "aio",
+             lambda context: negative_matrix.case_fifteen_rows_are_witnessed(product, context),
+             timeout_seconds=120),
+        Case(negative_matrix.TEN_CASE_ID, "aio",
+             lambda context: negative_matrix.case_ten_rows_are_witnessed(product, context),
+             timeout_seconds=120),
+        # The three gates a change must pass, driven from inside the run that
+        # claims them: the pre-push entrypoint reads the manifest for what to
+        # run, and the coverage and divergence audits read the catalog and the
+        # inventory they ship with. Each one is also handed a damaged copy, so a
+        # green verdict here says the refusal exists rather than that nothing
+        # was damaged.
+        Case(gate_tiers.PREPUSH_CASE_ID, "aio",
+             lambda context: gate_tiers.case_pre_push_gate(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.COVERAGE_CASE_ID, "aio",
+             lambda context: gate_tiers.case_coverage_audit(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.DIVERGENCE_CASE_ID, "aio",
+             lambda context: gate_tiers.case_divergence_guard(product, context),
+             timeout_seconds=600),
+        # Last, because the deadline it proves is the one the whole run spent: the
+        # case reads the elapsed wall clock and the enforced budget, then produces
+        # an exhausted run of the real runner and reads its report. A suite that
+        # spent the deadline before reaching this point never runs it, and the
+        # runner marks it INCOMPLETE with the rest of the tail instead.
+        Case(budget.BUDGET_CASE_ID, "aio", budget.case_budget, timeout_seconds=120),
     ])
     return suite

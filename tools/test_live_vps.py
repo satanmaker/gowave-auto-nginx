@@ -35,6 +35,13 @@ from live_vps.preflight import (
     LocalLock,
     RemotePairLock,
 )
+from live_vps.runstate import (
+    RunIdRejected,
+    artifact_path,
+    baseline_drift,
+    pair_lock_gate,
+    resume_gate,
+)
 from live_vps.deployment import (
     prepare_master_repository,
     ensure_strace_on_master,
@@ -48,6 +55,8 @@ from live_vps.subscriptions import (
     verify_user_agent_policy,
     fetch_and_validate_xray_subscription,
     fetch_and_validate_mihomo_subscription,
+    expected_proxy_count,
+    installed_node_count,
 )
 from live_vps.firewall import verify_master_firewall, verify_worker_firewall
 from live_vps.nginx import (
@@ -274,23 +283,12 @@ def main() -> int:
     artifact_root = (REPO_ROOT / "artifacts" / "live-vps").resolve()
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    def artifact_path_for(run_id_value: str) -> Path:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", run_id_value) or run_id_value in (".", ".."):
-            raise ValueError("run-id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63} and must not be '.' or '..'")
-        candidate = artifact_root / run_id_value
-        if candidate.is_symlink():
-            raise ValueError("run-id artifact path must not be a symlink")
-        resolved = candidate.resolve(strict=False)
-        if not resolved.is_relative_to(artifact_root):
-            raise ValueError("run-id artifact path escapes artifacts/live-vps")
-        return candidate
-
     is_fresh_run = args.mode in ("full", "preflight")
     if is_fresh_run:
         run_id = args.run_id or f"run-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         try:
-            artifact_dir = artifact_path_for(run_id)
-        except ValueError as e:
+            artifact_dir = artifact_path(artifact_root, run_id)
+        except RunIdRejected as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
         if artifact_dir.exists():
@@ -316,27 +314,14 @@ def main() -> int:
             return 1
         run_id = args.run_id
         try:
-            artifact_dir = artifact_path_for(run_id)
-            state = load_run_state(artifact_dir)
-        except Exception as e:
+            artifact_dir = artifact_path(artifact_root, run_id)
+        except RunIdRejected as e:
             print(f"Error loading run state: {e}", file=sys.stderr)
             return 1
-
-        if state.get("test_run_id") != run_id:
-            print("Error: run-id does not match persisted state identity", file=sys.stderr)
-            return 1
-        if state.get("repository_commit") != head_commit:
-            print(f"Error: State repository commit mismatch: {state.get('repository_commit')} != {head_commit}", file=sys.stderr)
-            return 1
-
-        cfg_fp = state.get("config_fingerprint", {})
-        expected_fp = build_config_fingerprint(config)
-        if cfg_fp != expected_fp:
-            print("Error: Non-secret configuration identity mismatch with run state", file=sys.stderr)
-            return 1
-        if state.get("results", {}).get(args.mode, {}).get("status") in ("PASS", "FAIL", "INCOMPLETE", "TEARDOWN_FAILED"):
-            print(f"Error: phase '{args.mode}' already has a terminal result; refusing implicit destructive rerun", file=sys.stderr)
-            return 1
+        # The saved state is read below, once this runner holds both remote
+        # locks: a resume that revalidated a record before taking the locks could
+        # act on a phase result another runner had already replaced.
+        state = {}
 
     # Initialize SSH clients
     master_ssh = SSHClient(
@@ -370,6 +355,9 @@ def main() -> int:
         return 1
 
     overall_status = "PASS"
+    #: Set once the pair-wide lock is attempted, so the early-failure restore
+    #: path can ask whether this runner still speaks for the hosts.
+    remote_lock: Optional[RemotePairLock] = None
 
     try:
         # Revalidate local SSH identity material on every invocation, including
@@ -399,6 +387,50 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+
+        # The authoritative locks come before any phase touches a host. The local
+        # lock is only a fast guard on this Control Machine; exclusion against a
+        # run started elsewhere lives in these two kernel locks, held by these
+        # two sessions until the run ends.
+        remote_lock = RemotePairLock(master_ssh, worker_ssh, run_id=run_id)
+        if not remote_lock.acquire():
+            local_lock.release()
+            print(
+                f"Error: the pair-wide mutation lock is not available: {remote_lock.last_error}",
+                file=sys.stderr,
+            )
+            return 2
+
+        if not is_fresh_run:
+            # Revalidated under both locks, so what is read here is what the next
+            # phase will act on.
+            try:
+                state = load_run_state(artifact_dir)
+            except Exception as e:
+                print(f"Error loading run state: {e}", file=sys.stderr)
+                return 1
+            verdict = resume_gate(
+                state,
+                run_id=run_id,
+                commit=head_commit,
+                config_fingerprint=build_config_fingerprint(config),
+                phase=args.mode,
+            )
+            if not verdict.ok:
+                print(f"Error: {verdict.error}", file=sys.stderr)
+                return 1
+
+        def lock_lost(phase: str) -> bool:
+            """Stop before a mutating phase whose lock-holder sessions are gone."""
+            gate = pair_lock_gate(remote_lock, phase)
+            if gate.ok:
+                return False
+            nonlocal overall_status
+            overall_status = "INCOMPLETE"
+            state["results"][phase] = gate.record()
+            save_run_state(artifact_dir, state)
+            print(f"Error: {gate.error}", file=sys.stderr)
+            return True
 
         # Phase: Preflight
         if args.mode in ("full", "preflight"):
@@ -462,20 +494,46 @@ def main() -> int:
                 print("Prerequisite preflight is not PASS", file=sys.stderr)
                 return 1
 
+            if lock_lost("install"):
+                return 2
+
+            # The preflight snapshot was taken before either lock, so a host
+            # another actor touched in between would be installed over on the
+            # strength of a verdict about a host that no longer exists. Both
+            # baselines are re-collected here, while this runner holds both locks,
+            # and the install stops before its first remote write on any drift.
+            drift = baseline_drift(
+                state.get("results", {}).get("preflight", {}),
+                collect_remote_baseline(master_ssh),
+                collect_remote_baseline(worker_ssh),
+                vision_enabled=bool(config.master_vision_domain) or bool(config.worker_vision_domain),
+            )
+            if drift:
+                state["results"]["install"] = {"status": "FAIL", "error": drift}
+                save_run_state(artifact_dir, state)
+                print(f"Error: {drift}", file=sys.stderr)
+                return 1
+
             prep_ok = prepare_master_repository(master_ssh, REPO_ROOT)
             if not prep_ok:
                 state["results"]["install"] = {"status": "FAIL", "error": "Failed copying repo to Master"}
                 save_run_state(artifact_dir, state)
                 return 1
 
-            master_token = getattr(config, "_lease_token", None)
+            master_token = remote_lock.lease_tokens.get(config.master_ip, "")
             inst_ok, inst_details = install_master(master_ssh, config, lease_token=master_token)
             if not inst_ok:
                 state["results"]["install"] = {"status": "FAIL", "details": inst_details}
                 save_run_state(artifact_dir, state)
                 return 1
 
-            worker_ok, worker_details = deploy_worker(master_ssh, worker_ssh, config, lease_token=master_token)
+            worker_ok, worker_details = deploy_worker(
+                master_ssh,
+                worker_ssh,
+                config,
+                lease_token=master_token,
+                worker_lease_token=remote_lock.lease_tokens.get(config.worker_ip, ""),
+            )
             state["results"]["install"] = {
                 "status": "PASS" if worker_ok else "FAIL",
                 "master_install": inst_details,
@@ -516,6 +574,7 @@ def main() -> int:
             fw_m_res = verify_master_firewall(
                 master_ssh, config.master_ip,
                 enable_ipv6=config.enable_ipv6, master_ipv6=config.master_ipv6,
+                has_local_node=config.install_mode != "panel-only",
             )
             fw_w_res = verify_worker_firewall(
                 master_ssh, worker_ssh, config.worker_ip,
@@ -529,15 +588,18 @@ def main() -> int:
             short_uuid = get_default_user_short_uuid(panel_client)
             ua_res = verify_user_agent_policy(config.master_panel_domain, short_uuid, ssl_ctx)
             vision_count = int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
+            node_count = installed_node_count(config.install_mode)
             xray_sub_ok, xray_sub_res = fetch_and_validate_xray_subscription(
                 config.master_panel_domain, short_uuid, ssl_ctx,
                 vision_count=vision_count, ca_bundle_path=ca_bundle,
                 reality_fingerprint=config.reality_fingerprint,
+                node_count=node_count,
             )
             mih_sub_ok, mih_sub_res = fetch_and_validate_mihomo_subscription(
                 config.master_panel_domain, short_uuid, ssl_ctx,
                 vision_count=vision_count, ca_bundle_path=ca_bundle,
                 reality_fingerprint=config.reality_fingerprint,
+                node_count=node_count,
             )
 
             verification_statuses = [
@@ -581,6 +643,9 @@ def main() -> int:
                 print("Prerequisite verify is not PASS", file=sys.stderr)
                 return 1
 
+            if lock_lost("traffic"):
+                return 2
+
             token = panel_client.login(panel_credentials["ADMIN_USERNAME"], panel_credentials["ADMIN_PASSWORD"])
             short_uuid = get_default_user_short_uuid(panel_client)
 
@@ -590,7 +655,12 @@ def main() -> int:
             sweep_stale_captures(worker_ssh)
 
             # Fetch subscriptions
-            _, xray_sub_res = fetch_and_validate_xray_subscription(config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle)
+            traffic_node_count = installed_node_count(config.install_mode)
+            traffic_vision_count = int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
+            _, xray_sub_res = fetch_and_validate_xray_subscription(
+                config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle,
+                vision_count=traffic_vision_count, node_count=traffic_node_count,
+            )
             mihomo_sub_url = f"https://{config.master_panel_domain}/api/sub/{short_uuid}/mihomo"
             req = urllib.request.Request(mihomo_sub_url, headers={"User-Agent": "mihomo"})
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
@@ -662,7 +732,11 @@ def main() -> int:
                 timeout=config.traffic_timeout,
             )
 
-            expected_per_client = 8 + int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
+            # The traffic suite runs one case per delivered endpoint, so its expected
+            # case count is the same figure the subscription validator checks.
+            expected_per_client = expected_proxy_count(
+                vision_count=traffic_vision_count, node_count=traffic_node_count
+            )
             traffic_status = evaluate_traffic_suite_status(
                 test_traffic_verification=config.test_traffic_verification,
                 xray_results=xray_case_results,
@@ -682,6 +756,8 @@ def main() -> int:
             if args.mode == "negative" and state.get("results", {}).get("install", {}).get("status") != "PASS":
                 print("Prerequisite install is not PASS", file=sys.stderr)
                 return 1
+            if lock_lost("negative"):
+                return 2
             token = panel_client.login(panel_credentials["ADMIN_USERNAME"], panel_credentials["ADMIN_PASSWORD"])
             short_uuid = get_default_user_short_uuid(panel_client)
             neg_res = run_negative_suite(
@@ -691,6 +767,9 @@ def main() -> int:
                 panel_client=panel_client,
                 short_uuid=short_uuid,
                 ssl_context=ssl_ctx,
+                # NEG-05 installs through the same lock this run holds, so it
+                # needs the Master's lease the way `node add` does.
+                master_lease_token=getattr(remote_lock, "lease_tokens", {}).get(master_ssh.host),
             )
             state["results"]["negative"] = neg_res
             save_run_state(artifact_dir, state)
@@ -703,6 +782,8 @@ def main() -> int:
             ):
                 print("Prerequisite preflight baselines for both VPS are missing; refusing teardown", file=sys.stderr)
                 return 1
+            if lock_lost("teardown"):
+                return 2
             # Collect diagnostics before teardown
             collect_diagnostics(artifact_dir, master_ssh, worker_ssh)
 
@@ -749,7 +830,14 @@ def main() -> int:
             and state.get("results", {}).get("preflight", {}).get("status") == "PASS"
         ):
             try:
-                if master_ssh and worker_ssh:
+                # A restore is a mutation like any other: it runs only while this
+                # runner still holds both hosts exclusively.
+                if (
+                    master_ssh
+                    and worker_ssh
+                    and remote_lock is not None
+                    and remote_lock.check_alive()
+                ):
                     try:
                         collect_diagnostics(artifact_dir, master_ssh, worker_ssh)
                     except Exception as diagnostics_error:
@@ -769,7 +857,10 @@ def main() -> int:
                     state["results"]["teardown"] = {
                         "status": "TEARDOWN_FAILED",
                         "policy": "RESTORE_SNAPSHOT",
-                        "error": "SSH sessions unavailable during early-failure snapshot teardown",
+                        "error": (
+                            "the pair-wide mutation lock was not held during early-failure "
+                            "snapshot teardown, so the restore was not started"
+                        ),
                     }
                 save_run_state(artifact_dir, state)
             except Exception as teardown_error:
@@ -807,6 +898,8 @@ def main() -> int:
         finally:
             master_ssh.close()
             worker_ssh.close()
+            if remote_lock is not None:
+                remote_lock.release()
             local_lock.release()
 
     print(f"E2E Run completed: {run_id}. Overall status: {overall_status}")

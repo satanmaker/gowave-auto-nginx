@@ -25,7 +25,8 @@ from tests.test_podman_subscriptions import (  # noqa: E402
     engine_share_links, installed_product, panel_result, served_facts,
 )
 from tests.test_podman_topology import FakePodman  # noqa: E402
-from tools.podman_e2e import aio, matrix, multi_node, topology  # noqa: E402
+from tests.test_podman_traffic import StubIngress  # noqa: E402
+from tools.podman_e2e import aio, matrix, multi_node, topology, traffic_probe  # noqa: E402
 
 
 class TestSubscriptionDomains(unittest.TestCase):
@@ -159,10 +160,10 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.context = type("_Context", (), {"topology_name": "multi-node"})()
 
-    def _product(self, engine):
+    def _product(self, engine, served=None):
         product, _ = installed_product(
             self.context,
-            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            host_scripts=[panel_result({"subscriptions": served or served_facts()})],
         )
         product.host = _ClusterHost([engine_result(engine)])
         return product
@@ -219,9 +220,24 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
         # "the clash YAML declares 2 proxies, expected 1" while the Panel was right.
         data = matrix.load()
         cluster = (matrix.inbounds(data, vision=False) * 2)
+        dials = engine_representations()["xray_json"]["dials"]
+        worker_dials = [dict(dial) for dial in dials]
+        for dial in worker_dials:
+            dial["tag"] = f"{dial['tag']}-worker"
+            dial["address"] = topology.WORKER_DOMAIN
+            dial["sni"] = (topology.WORKER_REALITY_DOMAIN
+                           if dial["sni"] == topology.REALITY_DOMAIN else topology.WORKER_DOMAIN)
+        records = [dict(record) for record in served_facts()["hosts"]["records"]]
+        worker_records = [dict(record) for record in records]
+        for record in worker_records:
+            record["remark"] = record["remark"].replace("@local-node", "@worker-1")
+            record["address"] = topology.WORKER_DOMAIN
+            record["sni"] = (topology.WORKER_REALITY_DOMAIN
+                             if record["sni"] == topology.REALITY_DOMAIN else topology.WORKER_DOMAIN)
         engine = engine_representations({
             "base64.link_count": 8,
             "xray_json.entries": 8,
+            "xray_json.dials": dials + worker_dials,
             "mihomo.proxies": 8,
             "mihomo.proxy_details": [
                 {"name": "REALITY", "type": "vless", "server": topology.PANEL_DOMAIN},
@@ -236,11 +252,15 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
             "clash.proxies": 2,
             "singbox.outbounds": 8,
         })
-        product = self._product(engine)
+        product = self._product(
+            engine, served_facts({"hosts.records": records + worker_records}),
+        )
         product.subscription_inbounds_override = cluster
         evidence = aio.case_subscriptions(product)
         self.assertEqual(evidence["clash_proxies"], 2)
         self.assertEqual(evidence["mihomo_proxies"], 8)
+        self.assertEqual(evidence["host_records"], 8)
+        self.assertEqual(evidence["host_record_mismatches"], 0)
 
 
 # The network the data-plane doubles hand out, so both nodes' egress addresses
@@ -402,6 +422,9 @@ class TestWorkerDataPlaneCase(unittest.TestCase):
         )
         product.case_topology = matrix.MULTI_NODE
         product.host = node_host
+        # The packet bracket is held by `tests/test_podman_ingress.py`; here it
+        # only has to run the request and answer PASS, which is what the stub does.
+        product.bracket_request = StubIngress.bracket
         return product
 
     def _host(self, **overrides):
@@ -424,6 +447,8 @@ class TestWorkerDataPlaneCase(unittest.TestCase):
             "request_id_match": True,
             "body_match": True,
             "source_ip": str(DATA_PLAN.data_worker_ip),
+            "connect_budget_seconds": traffic_probe.connect_budget_seconds(),
+            "transfer_budget_seconds": traffic_probe.REQUEST_TIMEOUT_SECONDS,
             "reason": "",
         }
         facts.update(overrides)

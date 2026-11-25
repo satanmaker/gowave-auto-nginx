@@ -7,7 +7,7 @@ The live two-VPS acceptance run is launched from the operator's Linux workstatio
 - Linux control machine and a clean checkout of the tested repository commit.
 - Python 3 and a virtual environment.
 - OpenSSH client tools (ssh, ssh-keygen), curl, dig, openssl, and timeout.
-- Xray and Mihomo client binaries on the Control Machine. `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` default to `latest`, so preflight accepts the installed builds; set an explicit tag there to require one.
+- Xray and Mihomo client binaries on the Control Machine. The example config pins `XRAY_CLIENT_VERSION=26.11.9` and `MIHOMO_CLIENT_VERSION=1.19.34`, so preflight requires exactly those builds; set a different tag (or `latest`) there to accept another one.
 - Both freshly provisioned disposable VPS instances must be reachable over SSH and have tcpdump and coreutils timeout installed and executable by root. The controller does not install these target-side tools; preflight rejects a target that lacks either one instead of failing later in the traffic phase.
 - DNS records for the five required domains must resolve to the corresponding target IPv4 addresses. Optional Master and Worker Vision domains are independent.
 
@@ -38,7 +38,7 @@ Run a non-deploying eligibility check first with `python3 tools/run_live_vps.py 
 
 ## Component versions and REALITY fingerprint
 
-Every component version defaults to `latest`, matching what the installers ship: `GOWAVE_PANEL_VERSION`, `GOWAVE_NODE_VERSION`, `XRAY_SERVER_VERSION`, `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION`. With a floating channel the deployment step asserts that each component reports a version and records what it reported, instead of comparing it to a hardcoded tag; an explicit version/tag is still accepted when a run has to reproduce a specific release. Keep `tools/live_vps_config.env` in sync with `tools/live_vps_config.env.example` so the run does not start from a stale pin.
+Panel and Node follow their release channel and default to `latest`, matching what the installers ship: `GOWAVE_PANEL_VERSION` and `GOWAVE_NODE_VERSION`. The Xray core does not float any more: an unset `XRAY_SERVER_VERSION` installs the pinned 26.11.9 from a digest-verified release before the upstream installer runs, and `latest` is the explicit opt-out that lets the installer fetch its own core. The client binaries are pinned in the example config (`XRAY_CLIENT_VERSION=26.11.9`, `MIHOMO_CLIENT_VERSION=1.19.34`), so preflight requires exactly those builds on the control machine; set an explicit tag to reproduce another release. With a floating channel the deployment step asserts that the component reports a version and records what it reported, instead of comparing it to a hardcoded tag. Keep `tools/live_vps_config.env` in sync with `tools/live_vps_config.env.example` so the run does not start from a stale pin.
 
 | Key | Default | Purpose |
 |---|---|---|

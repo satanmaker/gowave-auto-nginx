@@ -6,10 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import LiveVPSConfig
 from .ssh import SSHClient
@@ -59,6 +60,50 @@ BASELINE_COMPARISON_KEYS = (
     "key_packages",
 )
 
+#: What ``record_worker_package_changes`` writes in the transaction's own
+#: recovery directory. The header is the version of that shape; a record that
+#: does not carry it is refused rather than guessed at.
+PACKAGE_CHANGES_HEADER = "#gowave-package-changes/v1"
+PACKAGE_CHANGES_UNAVAILABLE = "#unavailable"
+_PACKAGE_FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.:~_(),-]*$")
+
+
+def read_package_changes(path: str) -> Dict[str, Any]:
+    """The package change a Worker transaction recorded, as the installer writes it.
+
+    ``installed`` and ``removed`` rows carry a name and one version, an
+    ``upgraded`` row the name and both versions. ``inventory`` says whether the
+    host's package manager answered: ``recorded``, or ``unavailable`` when it
+    did not — which is a fact about the record and not a claim that nothing
+    changed.
+    """
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] != PACKAGE_CHANGES_HEADER:
+        raise ValueError(f"{path}: the record does not start with {PACKAGE_CHANGES_HEADER}")
+    body = lines[1:]
+    if body == [PACKAGE_CHANGES_UNAVAILABLE]:
+        return {"inventory": "unavailable", "installed": [], "upgraded": [], "removed": []}
+    if PACKAGE_CHANGES_UNAVAILABLE in body:
+        raise ValueError(f"{path}: the record is unavailable and also lists changes")
+    changes: Dict[str, Any] = {"inventory": "recorded", "installed": [], "upgraded": [], "removed": []}
+    for number, line in enumerate(body, start=2):
+        fields = line.split("\t")
+        kind = fields[0]
+        if kind not in ("installed", "upgraded", "removed"):
+            raise ValueError(f"{path}:{number}: {kind!r} is not a package change")
+        expected = 4 if kind == "upgraded" else 3
+        if len(fields) != expected:
+            raise ValueError(
+                f"{path}:{number}: a {kind} row carries {len(fields)} fields, not {expected}")
+        for field in fields[1:]:
+            if not _PACKAGE_FIELD.match(field):
+                raise ValueError(f"{path}:{number}: {field!r} is not a package name or version")
+        if kind == "upgraded":
+            changes["upgraded"].append({"name": fields[1], "from": fields[2], "to": fields[3]})
+        else:
+            changes[kind].append({"name": fields[1], "version": fields[2]})
+    return changes
+
 
 def compare_captured_baseline(
     before: Dict[str, Any], after: Dict[str, Any]
@@ -79,15 +124,35 @@ def execute_teardown(
     worker_ssh: Optional[SSHClient] = None,
     pre_baseline_master: Optional[Dict[str, Any]] = None,
     pre_baseline_worker: Optional[Dict[str, Any]] = None,
+    package_changes: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Execute configured teardown policy (PRESERVE or RESTORE_SNAPSHOT)."""
     policy = config.test_teardown_policy.upper()
 
     if policy == "PRESERVE":
+        # PRESERVE keeps the host, so what the transaction installed stays
+        # installed: a rollback restores the paths it wrote and never the
+        # packages it pulled in. The record says so instead of letting a
+        # preserved host be read as a clean baseline, and a host whose package
+        # change was never recorded says that too rather than "no changes".
+        packages = (
+            dict(package_changes) if isinstance(package_changes, dict)
+            else {"inventory": "unrecorded", "installed": [], "upgraded": [], "removed": []}
+        )
+        packages.setdefault("inventory", "recorded")
         return {
             "status": "PASS",
             "policy": "PRESERVE",
-            "message": "Both VPS and state preserved per PRESERVE policy",
+            "message": (
+                "Both VPS and state preserved per PRESERVE policy. The package changes this run "
+                "caused are retained as residual state and are not undone: compensation removes "
+                "only what the transaction itself wrote, which is not a restoration of the "
+                "original OS baseline. The host is not eligible for another clean-baseline run "
+                "until it is re-imaged or restored through the verified snapshot procedure."
+            ),
+            "residual_state": {"packages": packages, "retained": True},
+            "restored_baseline": False,
+            "clean_baseline_eligible": False,
         }
 
     if policy != "RESTORE_SNAPSHOT":
@@ -124,14 +189,22 @@ def execute_teardown(
             "error": f"Invalid restore hook: {hook_err}",
         }
 
-    # Prepare restore payload
+    # The request is the documented protocol, not an internal convenience:
+    # `schema_version`, `action` and one object per restored host are what a
+    # provider-side hook is written against, and a field renamed here is a hook
+    # that silently restores nothing.
     payload = {
-        "version": "1.0",
-        "run_id": run_id,
-        "master_ip": config.master_ip,
-        "master_snapshot_id": config.master_snapshot_id,
-        "worker_ip": config.worker_ip,
-        "worker_snapshot_id": config.worker_snapshot_id,
+        "schema_version": 1,
+        "action": "restore",
+        "test_run_id": run_id,
+        "master": {
+            "address": config.master_ip,
+            "snapshot_id": config.master_snapshot_id,
+        },
+        "worker": {
+            "address": config.worker_ip,
+            "snapshot_id": config.worker_snapshot_id,
+        },
     }
 
     try:
@@ -180,6 +253,16 @@ def execute_teardown(
             "error": "Restore hook JSON output must be an object",
         }
 
+    if hook_out.get("schema_version") != 1:
+        return {
+            "status": "TEARDOWN_FAILED",
+            "policy": "RESTORE_SNAPSHOT",
+            "error": (
+                "Restore hook answered schema_version "
+                f"{hook_out.get('schema_version')!r}, not 1"
+            ),
+        }
+
     if hook_out.get("status") != "RESTORED":
         return {
             "status": "TEARDOWN_FAILED",
@@ -187,15 +270,38 @@ def execute_teardown(
             "error": f"Hook reported status: {hook_out.get('status')}",
         }
 
-    if (
-        hook_out.get("master_snapshot_id") != config.master_snapshot_id
-        or hook_out.get("worker_snapshot_id") != config.worker_snapshot_id
+    # Both hosts, each with the id it was asked for and its own confirmation: a
+    # hook that echoes one host and drops the other has restored half a cluster,
+    # and a top-level id cannot say which host it belongs to.
+    for host, configured in (
+        ("master", config.master_snapshot_id),
+        ("worker", config.worker_snapshot_id),
     ):
-        return {
-            "status": "TEARDOWN_FAILED",
-            "policy": "RESTORE_SNAPSHOT",
-            "error": "Restore hook snapshot IDs mismatch response",
-        }
+        answered = hook_out.get(host)
+        if not isinstance(answered, dict):
+            return {
+                "status": "TEARDOWN_FAILED",
+                "policy": "RESTORE_SNAPSHOT",
+                "error": f"Restore hook answered no {host} object",
+            }
+        if answered.get("snapshot_id") != configured:
+            return {
+                "status": "TEARDOWN_FAILED",
+                "policy": "RESTORE_SNAPSHOT",
+                "error": (
+                    f"Restore hook snapshot IDs mismatch response: {host} answered "
+                    f"{answered.get('snapshot_id')!r}, expected {configured!r}"
+                ),
+            }
+        if answered.get("restored") is not True:
+            return {
+                "status": "TEARDOWN_FAILED",
+                "policy": "RESTORE_SNAPSHOT",
+                "error": (
+                    f"Restore hook did not report the {host} as restored: "
+                    f"restored={answered.get('restored')!r}"
+                ),
+            }
 
     # Reconnect and compare the captured pre/post state on both hosts. This is
     # deliberately not reported as PASS: D8 pair-lock reacquisition and the

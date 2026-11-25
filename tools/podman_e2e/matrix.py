@@ -24,11 +24,25 @@ VISION_INBOUND = "VISION"
 
 AIO = "aio"
 MULTI_NODE = "multi-node"
+# The Panel and the camouflage site without a traffic plane. It is a topology
+# the suite accepts, not a Vision combination: there is no node to configure.
+PANEL_ONLY = "panel-only"
 
 
 def load(path: Path = MATRIX_PATH) -> Dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def product(data: Dict[str, Any]) -> Dict[str, str]:
+    """The product versions a deployment configures, as strings.
+
+    Every consumer compares these against what a binary reported, so a key the
+    matrix omits is absent rather than a `None` a matcher would read as "any
+    version", and a pin that is present is always text.
+    """
+    pinned = data.get("product") or {}
+    return {str(key): str(value) for key, value in pinned.items() if value is not None}
 
 
 def inbounds(data: Dict[str, Any], vision: bool) -> List[Dict[str, Any]]:
@@ -95,6 +109,12 @@ def combination(topology: str, vision: bool = False, worker_vision: bool = False
         if worker_vision:
             return "worker-only"
         return "neither"
+    if topology == PANEL_ONLY:
+        if vision or worker_vision:
+            raise KeyError(
+                "the Panel-only topology has no traffic plane, so it configures no Vision inbound"
+            )
+        return "none"
     raise KeyError(f"no Vision combination is defined for {topology!r} yet")
 
 
@@ -107,3 +127,30 @@ def positive_count(
     if key not in counts:
         raise KeyError(f"the matrix declares no positive case count for {topology}/{key}")
     return int(counts[key])
+
+
+def runtime_budget_seconds(data: Dict[str, Any], topology: str) -> int:
+    """The wall-clock budget the manifest declares for one topology's suite.
+
+    A suite that ran longer than this has left the envelope the matrix promised,
+    so the value is the run's deadline rather than a suggestion: the entrypoint
+    takes it as the default and refuses to widen it.
+    """
+    declared = (data.get("topologies") or {}).get(topology, {}).get("runtime_budget_seconds")
+    if not isinstance(declared, int) or declared <= 0:
+        raise KeyError(f"the matrix declares no runtime_budget_seconds for {topology!r}")
+    return declared
+
+
+def tier_budget_seconds(data: Dict[str, Any], tier: str) -> int:
+    """The wall-clock budget the manifest declares for a whole gate tier.
+
+    ``runtime_budget`` is a mapping of ``<tier>_total_seconds`` to seconds, so
+    ``pre_push`` and ``pr`` are read out of it instead of being restated in the
+    entrypoints that honour them.
+    """
+    budgets = data.get("runtime_budget") or {}
+    declared = budgets.get(f"{tier}_total_seconds")
+    if not isinstance(declared, int) or declared <= 0:
+        raise KeyError(f"the matrix declares no runtime_budget.{tier}_total_seconds")
+    return declared

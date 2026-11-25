@@ -10,14 +10,19 @@ defect into a harness failure — or worse, a wrong node into a passing case.
 """
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
 import unittest
 import unittest.mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -25,9 +30,12 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, matrix, mtls, multi_node, topology  # noqa: E402
+from tools.podman_e2e import acme_mode, aio, budget, gate_tiers, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, runstate_cases, tls_anchors, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
-from test_podman_aio import BROKEN_TAIL, nginx_probe  # noqa: E402
+from test_podman_aio import (  # noqa: E402
+    BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
+    vision_contour,
+)
 
 
 class _StubContext:
@@ -50,6 +58,7 @@ class _StubPodman:
     def __init__(self, root):
         self.context = _StubContext(root)
         self.started = []
+        self.scripts = []
 
     def network_subnets(self):
         return []
@@ -57,6 +66,19 @@ class _StubPodman:
     def run(self, **kwargs):
         self.started.append(kwargs["name"])
         return kwargs["name"]
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        """The Worker's own status report, naming the core the matrix pinned.
+
+        A tuple names the core its node deployed, so the stub answers that read
+        from the manifest: a hard-coded version would keep the fake answering
+        after the matrix's pin moved, and the case would be comparing against a
+        core this deployment never configured.
+        """
+        self.scripts.append(script)
+        core = matrix.product(matrix.load()).get("xray_version", "")
+        body = json.dumps({"status": {"stdout": f"Xray Core: {core}\n"}})
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, body, "")
 
 
 class TestMultiNodePlan(unittest.TestCase):
@@ -87,6 +109,17 @@ class TestMultiNodePlan(unittest.TestCase):
         plan = topology.allocate_plan([])
         self.assertNotEqual(plan.worker_ip, plan.target_ip)
         self.assertNotEqual(plan.data_worker_ip, plan.data_target_ip)
+
+    def test_the_second_node_address_belongs_to_no_other_role(self):
+        # The Panel keys a node by its address, so the address a second
+        # registration needs has to be one no role already holds.
+        plan = topology.allocate_plan([])
+        addresses = [
+            plan.target_ip, plan.worker_ip, plan.second_node_ip,
+            plan.dns_ip, plan.pebble_ip, plan.echo_ip,
+            plan.client_ip, plan.engine_client_ip, plan.untrusted_ip,
+        ]
+        self.assertEqual(len(set(addresses)), len(addresses))
 
 
 class TestMultiNodeRoles(unittest.TestCase):
@@ -208,6 +241,28 @@ class TestMultiNodeRoles(unittest.TestCase):
         self.assertNotIn(host.engine_client_name, host.started)
         host.require_roles()
 
+    def test_the_second_worker_is_a_clean_systemd_host_on_the_address_it_registers(self):
+        # The registration needs a host the pair does not hold, and the case that
+        # needs it starts it: the same image, resolver and SSH preparation the
+        # Worker had, on the address no role owns, with the second node's names.
+        host = self._create()
+        address = host.plan.second_node_ip
+        domains = ("worker-two.testbed.internal", "worker-two-reality.testbed.internal")
+        started = host.start_secondary_worker("second-worker", address, domains)
+        run = self._runs()["second-worker"]
+        self.assertTrue(run["privileged"])
+        self.assertEqual(run["systemd"], "always")
+        self.assertIn(address, list(run["extra_args"]))
+        self.assertIn(host.plan.dns_ip, list(run["extra_args"]))
+        self.assertEqual(list(run["aliases"]), list(domains))
+        self.assertIn("second-worker", host.started)
+        scripts = [script for name, script in self.podman.scripts if name == "second-worker"]
+        self.assertTrue(any("disable_ipv6" in script for script in scripts),
+                        "the second Worker has to take the same IPv4-only branch as the first")
+        self.assertTrue(any("ssh-keygen -A" in script for script in scripts),
+                        "a shared image carries one host key for every container it starts")
+        self.assertEqual(started["address"], address)
+
 
 def _ssh_ed25519(seed, comment):
     """A well-formed ed25519 public key line, so the fingerprint helper is exercised for real."""
@@ -302,6 +357,60 @@ class TestWorkerTrustPin(unittest.TestCase):
             host.pin_worker_trust()
         self.assertIn("known_hosts", str(caught.exception))
         self.assertIn(host.target_name, str(caught.exception))
+
+    def test_a_second_address_is_pinned_under_the_key_the_worker_presents_now(self):
+        host = self.host()
+        host.pin_worker_trust()
+        rotated = _ssh_ed25519(b"r" * 32, "root@worker")
+        host.podman.files[(host.worker_name, "/etc/ssh/ssh_host_ed25519_key.pub")] = rotated + "\n"
+        entry = host.pin_worker_address(host.plan.second_node_ip)
+        pinned = host.podman.files[(host.target_name, "/root/.ssh/known_hosts")]
+        self.assertIn(f"{host.plan.second_node_ip} {rotated}", pinned)
+        self.assertNotIn(f"{host.plan.second_node_ip} {WORKER_HOST_KEY}", pinned)
+        self.assertTrue(entry.startswith(host.plan.second_node_ip))
+
+    def test_the_second_host_pin_reaches_both_sides_of_the_handshake(self):
+        host = self.host()
+        address = host.plan.second_node_ip
+        host.podman.files[("second", "/etc/ssh/ssh_host_ed25519_key.pub")] = WORKER_HOST_KEY + "\n"
+        evidence = host.pin_secondary_trust("second", address)
+        files = host.podman.files
+        self.assertIn(
+            topology.MultiNodeTopology._key_blob(MASTER_PUBLIC_KEY),
+            files[("second", "/root/.ssh/authorized_keys")],
+        )
+        self.assertIn(
+            f"{address} {WORKER_HOST_KEY}",
+            files[(host.target_name, "/root/.ssh/known_hosts")],
+        )
+        self.assertEqual(evidence["address"], address)
+        self.assertTrue(evidence["host_key_fingerprint"].startswith("SHA256:"))
+
+    def test_a_second_host_without_its_own_key_is_refused_by_name(self):
+        host = self.host()
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_secondary_trust("second", host.plan.second_node_ip)
+        self.assertIn("second", str(caught.exception))
+
+    def test_an_address_is_refused_by_name_when_the_worker_has_no_host_key(self):
+        host = self.host()
+        del host.podman.files[(host.worker_name, "/etc/ssh/ssh_host_ed25519_key.pub")]
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_worker_address(host.plan.second_node_ip)
+        self.assertIn("no ed25519 host key", str(caught.exception))
+        self.assertIn(host.plan.second_node_ip, str(caught.exception))
+
+    def test_a_lost_second_address_write_is_refused_by_name(self):
+        host = self.host(drop_stdin=("known_hosts",))
+        # The key is already pinned under the Worker's own address, so only a
+        # check of the address line itself can notice that this write was lost.
+        host.podman.files[(host.target_name, "/root/.ssh/known_hosts")] = (
+            f"{host.plan.worker_ip} {WORKER_HOST_KEY}\n"
+        )
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_worker_address(host.plan.second_node_ip)
+        self.assertIn("did not land", str(caught.exception))
+        self.assertIn(host.plan.second_node_ip, str(caught.exception))
 
 
 class TestPodmanExecAttachesStdin(unittest.TestCase):
@@ -427,6 +536,34 @@ class TestWorkerProvisioningCommand(unittest.TestCase):
         script = host.node_add_script()
         for forbidden in ("SECRET_KEY", "ADMIN_PASSWORD", "accessToken"):
             self.assertNotIn(forbidden, script)
+
+    def test_an_operator_environment_is_written_before_the_product_command(self):
+        # The Master's shell is what forwards the variable over the SSH stdin
+        # stream, so the control's opt-out has to be on this line rather than in
+        # the container's creation environment.
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        script = host.node_add_script(
+            "worker-core-hole", environment={"XRAY_SERVER_VERSION": "latest"},
+        )
+        self.assertTrue(script.startswith("XRAY_SERVER_VERSION=latest "))
+        self.assertIn(f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add", script)
+
+    def test_a_command_without_an_environment_is_the_operator_command_alone(self):
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        self.assertTrue(host.node_add_script().startswith("bash "))
+
+    def test_another_hosts_address_and_names_replace_the_topology_defaults(self):
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        script = host.node_add_script(
+            "worker-core-hole", address="203.0.113.9",
+            worker_domain="hole.example", reality_domain="hole-reality.example",
+            vision_domain="",
+        )
+        self.assertIn("'203.0.113.9'", script)
+        self.assertIn("'hole.example'", script)
+        self.assertIn("'hole-reality.example'", script)
+        self.assertNotIn("--vision-domain", script)
+        self.assertNotIn(str(host.plan.worker_ip), script)
 
 
 class TestWorkerControlReport(unittest.TestCase):
@@ -585,16 +722,28 @@ class TestMasterAddressCase(unittest.TestCase):
 
 
 class _RegistrationProduct:
-    """A product stub: it reports the Panel's node table and nothing else."""
+    """A product stub: it reports the Panel's node table and the Worker's core."""
 
     combination = "neither"
     expected_inbound_total = 8
 
     def __init__(self, hosts=2, name=None, connected=True, endpoint_port=3002,
-                 inbound_count=8):
+                 inbound_count=8, core_status=None, core_binary=None, control=None):
         plan = topology.allocate_plan([])
         self.topology = type("Host", (), {"plan": plan})()
         name = name or topology.WORKER_NODE_NAME
+        self.matrix = matrix.load()
+        pin = matrix.product(self.matrix).get("xray_version", "")
+        # Both readings default to the pin the matrix configures, so a test has to
+        # name the value it wants to see rejected instead of relying on a typo.
+        self.core_status = pin if core_status is None else core_status
+        self.core_binary = pin if core_binary is None else core_binary
+        self.control = control if control is not None else {
+            "control_returncode": 1,
+            "control_matched_lines": ["dial tcp: api.github.com"],
+            "control_core_path": "absent",
+            "cleanup": {"nodes_after": {"count": 2}},
+        }
         self.surface = {
             "nodes": {
                 "names": sorted(["local-node", name]),
@@ -617,6 +766,15 @@ class _RegistrationProduct:
 
     def add_worker(self):
         return {"node_add_returncode": 0}
+
+    def worker_core_version(self, case_id):
+        return self.core_status
+
+    def worker_core_binary(self, case_id):
+        return {"binary": "/opt/gowave-node/rw-core", "version": self.core_binary}
+
+    def worker_core_control(self, case_id):
+        return self.control
 
     def wait_for_nodes(self, case_id, expected):
         return {"nodes": {"count": 2, "connected_count": 2}}
@@ -659,6 +817,28 @@ class TestWorkerRegistrationCase(unittest.TestCase):
             self._evidence(_RegistrationProduct(inbound_count=7))
         self.assertIn("active inbounds in total", str(caught.exception))
 
+    def test_the_worker_core_is_read_from_both_the_status_and_the_binary(self):
+        product = _RegistrationProduct()
+        evidence = self._evidence(product)
+        pin = matrix.product(product.matrix)["xray_version"]
+        self.assertEqual(evidence["worker_core_version_from_status"], pin)
+        self.assertEqual(evidence["worker_core_version_from_binary"], pin)
+        self.assertEqual(evidence["worker_core_binary"]["binary"],
+                         multi_node.WORKER_CORE_BINARY)
+        self.assertEqual(evidence["core_hole_control"], product.control)
+
+    def test_a_worker_status_naming_another_core_is_rejected(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._evidence(_RegistrationProduct(core_status="Xray 25.1.1"))
+        message = str(caught.exception)
+        self.assertIn("the Worker's status reports", message)
+        self.assertIn("25.1.1", message)
+
+    def test_a_worker_binary_naming_another_core_is_rejected(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._evidence(_RegistrationProduct(core_binary="26.11.90"))
+        self.assertIn("the Worker's binary reports", str(caught.exception))
+
 
 class TestRunnerEntrypoint(unittest.TestCase):
     """The CLI's flags must reach the suite; a dropped flag is a silent coverage gap."""
@@ -677,6 +857,12 @@ class TestRunnerEntrypoint(unittest.TestCase):
         class _Podman:
             def __init__(self, context):
                 self.context = context
+                captured["environment"] = dict(context.environment)
+
+            def remove_stale_runs(self):
+                # The entrypoint reclaims what a killed run left behind; this stub
+                # owns no host, so nothing is older than the age limit.
+                return []
 
             def register_cleanup(self):
                 pass
@@ -687,6 +873,9 @@ class TestRunnerEntrypoint(unittest.TestCase):
 
             def add(self, case):
                 pass
+
+            def on_failure(self, hook):
+                captured["failure_hook"] = hook
 
             def execute(self):
                 return 0
@@ -720,6 +909,35 @@ class TestRunnerEntrypoint(unittest.TestCase):
         captured = self._main(["--topology", "multi-node"])
         self.assertFalse(captured["vision"])
         self.assertFalse(captured["worker_vision"])
+
+    def test_the_artifact_names_the_vision_combination_the_flags_select(self):
+        """`result.json` has to say which of the four Multi-Node configurations ran.
+
+        `enabled`/`disabled` describes All-in-One, so a Multi-Node run labelled
+        that way cannot be matched to the positive-case count it owes — the
+        matrix states one count per combination, and two of them are 18.
+        """
+        cases = (
+            (["--topology", "aio"], "disabled"),
+            (["--topology", "aio", "--vision"], "enabled"),
+            (["--topology", "multi-node"], "neither"),
+            (["--topology", "multi-node", "--vision"], "master-only"),
+            (["--topology", "multi-node", "--worker-vision"], "worker-only"),
+            (
+                ["--topology", "multi-node", "--vision", "--worker-vision"],
+                "both",
+            ),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=" ".join(argv)):
+                self.assertEqual(self._main(argv)["environment"]["vision"], expected)
+
+    def test_the_failure_bundle_is_wired_before_any_case_runs(self):
+        captured = self._main(["--topology", "multi-node"])
+        self.assertTrue(
+            callable(captured.get("failure_hook")),
+            "a red case must leave the diagnostics the entrypoint is responsible for wiring",
+        )
 
     def test_the_aio_topology_rejects_the_worker_vision_flag(self):
         with self.assertRaises(SystemExit) as caught:
@@ -782,7 +1000,10 @@ class _MatrixProduct(multi_node.MultiNodeProduct):
         self._root = tempfile.TemporaryDirectory()
         super().__init__(_StubPodman(Path(self._root.name)),
                          vision=vision, worker_vision=worker_vision)
-        self.topology = type("Host", (), {"plan": topology.allocate_plan([])})()
+        plan = topology.allocate_plan([])
+        self.topology = type(
+            "Host", (), {"plan": plan, "worker_name": "worker-test"},
+        )()
 
     def cleanup(self):
         self._root.cleanup()
@@ -1307,6 +1528,253 @@ class TestSshHostKeyCase(unittest.TestCase):
                         ids.index(multi_node.NODE_ADD_CASE_ID))
 
 
+class _SshDownPodman:
+    """A two-host stand-in for OpenSSH, the Worker's units, and its data plane.
+
+    Six rules the case depends on are encoded here: the daemon is a unit plus a
+    socket unit and *either* of them can put a daemon on 22 for the next
+    connection, so both have to go down; the node is a different unit that the
+    daemon cannot take with it; the planted snapshot disappears only when a
+    remote command really runs; and the Worker keeps carrying payload while its
+    own SSH is down. Each flag below breaks exactly one rule.
+    """
+
+    def __init__(
+        self, *, stop_leaves_active=False, socket_leaves_active=False,
+        leaks_command=False,
+        refusal="ssh: connect to host 10.89.0.12 port 22: Connection refused",
+        worker_unit="active", down_delivered=True, down_status=200,
+        down_source_ip=None, start_fails=False, delete_on_recovery=True,
+    ):
+        self.ssh_active = True
+        self.ssh_socket_active = True
+        self.sentinel = False
+        self.state_calls = []
+        self.remote_calls = 0
+        self.stop_leaves_active = stop_leaves_active
+        self.socket_leaves_active = socket_leaves_active
+        self.leaks_command = leaks_command
+        self.refusal = refusal
+        self.worker_unit = worker_unit
+        self.down_delivered = down_delivered
+        self.down_status = down_status
+        self.down_source_ip = down_source_ip
+        self.start_fails = start_fails
+        self.delete_on_recovery = delete_on_recovery
+
+    # ------------------------------------------------------------ podman API
+    def exec(self, name, argv, check=True, input_text=None, timeout=None):
+        if name == "worker" and argv[:2] == ["test", "-f"]:
+            return _SshCompleted(0 if self.sentinel else 1)
+        raise AssertionError(f"unexpected exec on {name}: {argv}")
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=None):
+        ssh_unit = multi_node.SSH_UNIT
+        ssh_socket = multi_node.SSH_SOCKET_UNIT
+        if name == "worker" and "install -d" in script:
+            self.sentinel = True
+            self.state_calls.append("plant")
+            return _SshCompleted(0)
+        if name == "worker" and f"systemctl stop {ssh_socket}" in script:
+            self.state_calls.append("stop")
+            if not self.stop_leaves_active:
+                self.ssh_active = False
+            if not self.socket_leaves_active:
+                self.ssh_socket_active = False
+            return _SshCompleted(0, self._ssh_states())
+        if name == "worker" and f"systemctl start {ssh_socket}" in script:
+            self.state_calls.append("start")
+            if self.start_fails:
+                return _SshCompleted(0, self._ssh_states())
+            self.ssh_active = True
+            self.ssh_socket_active = True
+            return _SshCompleted(0, self._ssh_states())
+        if name == "worker" and f"systemctl is-active {multi_node.WORKER_UNIT}" in script:
+            return _SshCompleted(0, self.worker_unit + "\n")
+        if name == "master" and "remote_finalize" in script:
+            return self._remote_finalize()
+        raise AssertionError(f"unexpected bash script on {name}: {script[:200]!r}")
+
+    def _ssh_states(self):
+        service = "active" if self.ssh_active else "inactive"
+        socket = "active" if self.ssh_socket_active else "inactive"
+        return f"service={service}\nsocket={socket}\n"
+
+    # ------------------------------------------------------------- the rules
+    def _remote_finalize(self):
+        self.remote_calls += 1
+        # Socket activation is the reason this is not just "is the service up":
+        # an active ssh.socket starts a daemon for the very next connection.
+        if not self.ssh_active and not self.ssh_socket_active:
+            if self.leaks_command:
+                self.sentinel = False
+                return _SshCompleted(
+                    255, "Worker ACME recovery snapshot finalized.\n", self.refusal + "\n",
+                )
+            return _SshCompleted(255, "", self.refusal + "\n")
+        if self.delete_on_recovery:
+            self.sentinel = False
+        return _SshCompleted(0, "Worker ACME recovery snapshot finalized.\n")
+
+
+class _SshDownProduct:
+    """The case's product surface, with the real remote-finalize command builder."""
+
+    def __init__(self, podman):
+        self.podman = podman
+        self.host = type("Host", (), {
+            "plan": topology.allocate_plan([]),
+            "target_name": "master",
+            "worker_name": "worker",
+        })()
+        self.master = type("Master", (), {
+            "subscription_payloads": lambda _self, case_id: {},
+        })()
+        self.transfers = 0
+        self.asserted_transfer = ()
+        if podman.down_source_ip is None:
+            podman.down_source_ip = self.host.plan.data_worker_ip
+
+    def require_installed(self):
+        return self.host
+
+    def worker_tuple(self):
+        return {"id": 1}, "v2rayNG/1.10.0"
+
+    def node_transfer(self, case_id, node, inbound, client, expect_refusal=False):
+        self.asserted_transfer = (case_id, node, inbound, client, expect_refusal)
+        self.transfers += 1
+        # The baseline is the control the case reads before the fault, so it is
+        # always a delivered payload; only the transfer taken while sshd is down
+        # is the fault's to degrade.
+        delivered = True if self.transfers == 1 else self.podman.down_delivered
+        status = 200 if self.transfers == 1 else self.podman.down_status
+        source_ip = (self.host.plan.data_worker_ip if self.transfers == 1
+                     else self.podman.down_source_ip)
+        return {
+            "delivered": delivered,
+            "status": status,
+            "request_id_match": True,
+            "body_match": True,
+            "source_ip": source_ip,
+            "reason": "",
+        }
+
+    def remote_finalize(self, known_hosts, transaction, timeout=0):
+        return multi_node.MultiNodeProduct.remote_finalize(
+            self, known_hosts, transaction, timeout,
+        )
+
+
+class TestSshServiceDownCase(unittest.TestCase):
+    """MN-SSH-DOWN: losing sshd blocks the controller and nothing else."""
+
+    def _run(self, **flags):
+        product = _SshDownProduct(_SshDownPodman(**flags))
+        return multi_node.case_ssh_service_down(product), product
+
+    def test_a_worker_without_sshd_refuses_the_operation_and_keeps_serving(self):
+        evidence, product = self._run()
+        self.assertEqual(evidence["ssh_unit_after_stop"], "inactive")
+        self.assertEqual(evidence["ssh_socket_after_stop"], "inactive")
+        self.assertEqual(evidence["ssh_unit_after_start"], "active")
+        self.assertEqual(evidence["ssh_socket_after_start"], "active")
+        self.assertNotEqual(evidence["refused_returncode"], 0)
+        self.assertEqual(evidence["refusal_names_transport"], "true")
+        self.assertEqual(evidence["remote_effect_during_fault"], "false")
+        self.assertEqual(evidence["worker_unit_with_sshd_down"], "active")
+        self.assertEqual(evidence["worker_status_with_sshd_down"], 200)
+        self.assertEqual(evidence["worker_source_ip_with_sshd_down"],
+                         product.host.plan.data_worker_ip)
+        self.assertEqual(evidence["recovered_returncode"], 0)
+        self.assertEqual(evidence["remote_effect_after_restore"], "true")
+        self.assertEqual(evidence["worker_ip"], product.host.plan.worker_ip)
+        self.assertEqual(product.asserted_transfer[1], "worker")
+        self.assertIs(product.asserted_transfer[4], True)
+        self.assertEqual(product.podman.state_calls, ["plant", "stop", "start"])
+        self.assertEqual(product.podman.remote_calls, 2)
+        self.assertIs(product.podman.ssh_active, True)
+        self.assertIs(product.podman.ssh_socket_active, True)
+        self.assertIs(product.podman.sentinel, False)
+
+    def test_a_stop_that_leaves_the_daemon_active_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(stop_leaves_active=True)
+        self.assertIn("the Worker still answers for SSH after", str(caught.exception))
+
+    def test_a_stop_that_leaves_the_socket_activating_is_refused(self):
+        # Ubuntu 24.04 answers on 22 through ssh.socket even with ssh.service
+        # stopped, so a case that only stops the service proves nothing.
+        with self.assertRaises(AssertionError) as caught:
+            self._run(socket_leaves_active=True)
+        self.assertIn("ssh.socket='active'", str(caught.exception))
+
+    def test_a_refusal_that_still_runs_the_script_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(leaks_command=True)
+        self.assertIn("the remote script ran although the Worker's sshd was stopped",
+                      str(caught.exception))
+
+    def test_a_refusal_that_does_not_name_the_transport_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(refusal="kex_exchange_identification: Connection closed by remote host")
+        self.assertIn("did not name a connection failure", str(caught.exception))
+
+    def test_a_refusal_left_to_host_key_verification_is_refused(self):
+        # Both lines are needed: the case accepts only a refusal that names the
+        # transport, so a verification failure has to be the extra one.
+        with self.assertRaises(AssertionError) as caught:
+            self._run(refusal=(
+                "Host key verification failed.\n"
+                "ssh: connect to host 10.89.0.12 port 22: Connection refused"
+            ))
+        self.assertIn("was refused by host-key verification", str(caught.exception))
+
+    def test_losing_ssh_that_takes_the_node_with_it_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(worker_unit="inactive")
+        self.assertIn("losing SSH took the node with it", str(caught.exception))
+
+    def test_a_node_that_stops_carrying_payload_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(down_delivered=False, down_status=0)
+        self.assertIn("stopped carrying payload while only its sshd was down",
+                      str(caught.exception))
+
+    def test_a_payload_that_left_from_another_address_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(down_source_ip="10.89.0.2")
+        self.assertIn("instead of the Worker's data address", str(caught.exception))
+
+    def test_a_fault_that_does_not_restore_the_daemon_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(start_fails=True)
+        self.assertIn("left the Worker's daemon 'inactive'", str(caught.exception))
+
+    def test_a_recovery_that_leaves_the_snapshot_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(delete_on_recovery=False)
+        self.assertIn("reported success without removing the planted snapshot",
+                      str(caught.exception))
+
+    def test_a_failed_check_still_brings_the_daemon_back(self):
+        # Every later case needs the controller's SSH path, so a red here must
+        # not leave the Worker unreachable.
+        product = _SshDownProduct(_SshDownPodman(worker_unit="inactive"))
+        with self.assertRaises(AssertionError):
+            multi_node.case_ssh_service_down(product)
+        self.assertIs(product.podman.ssh_active, True)
+        self.assertIn("start", product.podman.state_calls)
+
+    def test_the_suite_runs_the_fault_after_the_worker_it_faults(self):
+        ids = [case.id for case in multi_node.cases(_StubPodman(Path(tempfile.mkdtemp())))]
+        self.assertLess(ids.index(multi_node.SSH_KEY_CASE_ID),
+                        ids.index(multi_node.SSH_DOWN_CASE_ID))
+        self.assertLess(ids.index(multi_node.NODE_ADD_CASE_ID),
+                        ids.index(multi_node.SSH_DOWN_CASE_ID))
+        self.assertLess(ids.index(multi_node.SSH_DOWN_CASE_ID), ids.index("SUB-SERVED"))
+
+
 class TestMultiNodeSuite(unittest.TestCase):
     """The declared suite is what the runner executes, and its ids are stable."""
 
@@ -1317,14 +1785,47 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.podman = _StubPodman(Path(self.tmp.name))
 
+    def assertSequence(self, ids, expected):
+        """``expected`` appears consecutively and in this order, wherever it sits.
+
+        The guards below are about ordering — one case reading what the previous
+        one wrote — not about an offset. A guard written as ``ids[20:23]`` fails
+        for an insertion that changed no ordering at all, which is exactly what
+        importing the live scenarios does, so the block is located instead of
+        counted.
+        """
+        for start in range(len(ids) - len(expected) + 1):
+            if ids[start:start + len(expected)] == list(expected):
+                return
+        self.fail(f"{list(expected)} does not appear consecutively in {ids}")
+
     def test_the_suite_starts_with_the_install_and_then_provisions_the_worker(self):
         suite = multi_node.cases(self.podman)
         self.assertIsInstance(suite[0], Case)
-        self.assertEqual(
-            [case.id for case in suite][:4],
-            [multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID,
-             multi_node.NODE_ADD_CASE_ID, multi_node.MASTER_ADDRESS_CASE_ID],
-        )
+        ids = [case.id for case in suite]
+        self.assertEqual(ids[0], multi_node.INSTALL_CASE_ID, "the install is the first case")
+        # The observer reads the trace the provisioning just wrote, and the
+        # duplicate-add case re-runs the very verb that trace recorded, so both
+        # sit between the deployment and the cases that audit what it produced.
+        # Each step is named rather than counted: a case imported between two of
+        # them changes no ordering, and this guard is about ordering.
+        for earlier, later in (
+            (multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID),
+            (multi_node.SSH_KEY_CASE_ID, multi_node.NODE_ADD_CASE_ID),
+            (multi_node.NODE_ADD_CASE_ID, multi_node.ARGV_OBSERVER_CASE_ID),
+            (multi_node.ARGV_OBSERVER_CASE_ID, multi_node.DUPLICATE_ADD_CASE_ID),
+            (multi_node.DUPLICATE_ADD_CASE_ID, multi_node.MASTER_ADDRESS_CASE_ID),
+        ):
+            with self.subTest(order=f"{earlier} before {later}"):
+                self.assertLess(ids.index(earlier), ids.index(later))
+        # The pair-wide lock cases start the product's own holder over SSH into
+        # both containers, and the Worker carries a python3 only once the
+        # provisioning above has run there.
+        self.assertSequence(ids, [
+            lock_cases.LOCK_CASE_ID, lock_cases.LOCK_LOSS_CASE_ID,
+            lock_cases.LOCK_PATH_CASE_ID, lock_cases.CLI_CASE_ID,
+            lock_cases.NESTED_CASE_ID,
+        ])
         self.assertEqual({case.topology for case in suite}, {"multi-node"})
 
     def test_every_case_declares_a_positive_timeout(self):
@@ -1340,20 +1841,21 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_mtls_cases_follow_the_verifier_then_the_negative_controls(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[4:12], [f"MTLS-0{number}" for number in range(1, 9)])
+        self.assertSequence(ids, [f"MTLS-0{number}" for number in range(1, 9)])
 
     def test_the_management_denial_pair_follows_the_control_plane_proof(self):
         # 5.8: an untrusted vantage and the allowed one are measured after the
         # Master's mTLS path is proven, so a refusal can be told from an outage.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[12:14], ["FW-01", "FW-02"])
+        self.assertSequence(ids, [f"MTLS-0{number}" for number in range(1, 9)]
+                            + ["FW-01", "FW-02"])
 
     def test_the_master_access_case_follows_the_denial_pair(self):
         # 6.6: FW-03 asks the same question of the Master's own rules that the
         # pair above asked of the Worker's, so it reads them while the cluster
         # is healthy and before the cases that only observe the Panel.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[14], multi_node.MASTER_ACCESS_CASE_ID)
+        self.assertSequence(ids, ["FW-01", "FW-02", multi_node.MASTER_ACCESS_CASE_ID])
         self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID), ids.index("CLUS-01"))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MASTER_ACCESS_CASE_ID].timeout_seconds,
@@ -1365,7 +1867,8 @@ class TestMultiNodeSuite(unittest.TestCase):
         # while both roles are healthy, so a later change to either install cannot
         # be read as an IPv6 effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[15], multi_node.IPV6_CASE_ID)
+        self.assertSequence(ids, ["FW-02", multi_node.MASTER_ACCESS_CASE_ID,
+                                  multi_node.IPV6_CASE_ID])
         self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID),
                         ids.index(multi_node.IPV6_CASE_ID))
         self.assertLess(ids.index(multi_node.IPV6_CASE_ID), ids.index("CLUS-01"))
@@ -1376,27 +1879,48 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16:19], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertSequence(ids, [multi_node.IPV6_CASE_ID,
+                                  "CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[19:21], ["WRK-05", "WRK-06"])
+        self.assertSequence(ids, ["CLUS-01", "CLUS-02", "CLUS-03", "WRK-05", "WRK-06"])
 
     def test_the_vision_independence_case_follows_the_worker_config(self):
         # 5.10: the per-node Vision proof reads the config WRK-06 has just
         # compared, so it runs once that assignment is established and before any
         # data plane traffic.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[19:22], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+        self.assertSequence(ids, ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[22], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[29], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[30], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[37], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        start = ids.index("MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[start - 1], multi_node.VISION_CASE_ID)
+        self.assertEqual(ids[start + 7], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[start + 8], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[start + 15], "MN-DP-worker-TROJAN-GRPC-mihomo")
+
+    def test_the_budget_case_is_declared_last(self):
+        # It reads this topology's deadline and the clock two hosts spent, so no
+        # case may close the report behind it. It starts no container and reads no
+        # cluster, which is why the cases after VIS-06 — which leaves the cluster
+        # incomplete on purpose — are the two that read the run's own record, the
+        # three gates, and this one.
+        suite = multi_node.cases(self.podman)
+        self.assertEqual([case.id for case in suite][-9:],
+                         [multi_node.VIS_COMPENSATION_CASE_ID,
+                          runstate_cases.RUN_ID_CASE_ID,
+                          runstate_cases.RESUME_CASE_ID,
+                          acme_mode.CASE_ID,
+                          tls_anchors.CASE_ID,
+                          gate_tiers.PREPUSH_CASE_ID,
+                          gate_tiers.COVERAGE_CASE_ID,
+                          gate_tiers.DIVERGENCE_CASE_ID,
+                          budget.BUDGET_CASE_ID])
+        self.assertEqual(suite[-1].topology, "multi-node")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()
@@ -1455,32 +1979,81 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 5.12: attribution reads the same run and the endpoint, so it follows the
         # count and still precedes revocation, which would revoke a client.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[37], "MN-DP-worker-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[38:42], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
-                                      "SUB-SERVED", "SUB-B64"])
+        self.assertEqual(
+            ids[ids.index(multi_node.MATRIX_CASE_ID) - 1], "MN-DP-worker-TROJAN-GRPC-mihomo",
+            "the count case no longer follows the last data-plane tuple",
+        )
+        for earlier, later in (
+            ("MN-DP-worker-TROJAN-GRPC-mihomo", multi_node.MATRIX_CASE_ID),
+            (multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID),
+            (multi_node.EGRESS_CASE_ID, multi_node.SSH_DOWN_CASE_ID),
+            (multi_node.SSH_DOWN_CASE_ID, "SUB-SERVED"),
+            ("SUB-SERVED", "SUB-B64"),
+        ):
+            self.assertLess(ids.index(earlier), ids.index(later))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MATRIX_CASE_ID].timeout_seconds,
                          multi_node.MATRIX_TIMEOUT_SECONDS)
         self.assertEqual(suite[multi_node.EGRESS_CASE_ID].timeout_seconds,
                          multi_node.EGRESS_TIMEOUT_SECONDS)
 
+    def test_the_panel_client_trust_case_reads_the_master_beside_the_refusal_case(self):
+        # APIC-01 asks the controller's own HTTPS client about the Panel the
+        # refusal case has just proven is serving, and both run on the healthy
+        # pair before the lifecycle cases restart it.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertSequence(ids, [aio.AUTH_NEGATIVE_CASE_ID, aio.PANEL_API_CLIENT_CASE_ID,
+                                  aio.REDACTION_CASE_ID])
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[aio.PANEL_API_CLIENT_CASE_ID].topology, "multi-node")
+        self.assertEqual(suite[aio.PANEL_API_CLIENT_CASE_ID].timeout_seconds, 300)
+
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the
         # cluster under the suite, so nothing that observes a healthy cluster may
         # run after them. 6.12 then re-provisions that Worker and renames the
-        # Master, so it closes the run instead of reading what they left behind.
+        # Master, so it closes the install-facing run instead of reading what they
+        # left behind. 9.2's VIS-06 follows it because it needs that Worker whole
+        # before it provisions a second node onto it and observes the compensation
+        # that tears it down. The cases after them start no container: the run's
+        # own record is read from the state it wrote, the three gates read the
+        # tree and the run's artifacts, and GATE-BUDGET reads the clock of the
+        # whole run.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(
-            ids[-4:],
+        self.assertSequence(
+            ids,
             [multi_node.REVOCATION_CASE_ID, multi_node.OUTAGE_CASE_ID,
-             multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID],
+             multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID,
+             multi_node.VIS_COMPENSATION_CASE_ID],
+        )
+        self.assertEqual(
+            ids[-8:],
+            [runstate_cases.RUN_ID_CASE_ID, runstate_cases.RESUME_CASE_ID,
+             acme_mode.CASE_ID, tls_anchors.CASE_ID,
+             gate_tiers.PREPUSH_CASE_ID, gate_tiers.COVERAGE_CASE_ID,
+             gate_tiers.DIVERGENCE_CASE_ID, budget.BUDGET_CASE_ID],
+        )
+
+    def test_the_incomplete_compensation_case_follows_the_worker_reprovision(self):
+        # 9.2 VIS-06: the case provisions a second node onto the Worker and lets
+        # the failed compensation tear it down, so it may not run before ACME80 —
+        # which needs that Worker whole — and nothing that reads a healthy cluster
+        # may run after it.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids.index(multi_node.VIS_COMPENSATION_CASE_ID),
+                         ids.index(multi_node.ACME80_CASE_ID) + 1)
+        self.assertEqual(ids[-1], budget.BUDGET_CASE_ID)
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[multi_node.VIS_COMPENSATION_CASE_ID].topology, "multi-node")
+        self.assertEqual(
+            suite[multi_node.VIS_COMPENSATION_CASE_ID].timeout_seconds,
+            multi_node.NODE_ADD_TIMEOUT_SECONDS + multi_node.NODE_HEALTH_TIMEOUT_SECONDS,
         )
 
     def test_the_nginx_configuration_case_precedes_the_lifecycle_cases(self):
         # 6.1: both roles' trees are validated and reloaded while the cluster is
         # healthy, so a later revocation cannot be read as a reload effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[42], multi_node.NGINX_CONFIG_CASE_ID)
         self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID),
                         ids.index(multi_node.REVOCATION_CASE_ID))
         self.assertLess(ids.index("SUB-B64"), ids.index(multi_node.NGINX_CONFIG_CASE_ID))
@@ -1492,13 +2065,189 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.2: both roles' certificates are read from a healthy cluster, so a
         # later Worker shutdown cannot be blamed for what the client saw here.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[43], aio.TLS_CASE_ID)
-        self.assertEqual(ids[42], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID), ids.index(aio.TLS_CASE_ID))
         self.assertLess(ids.index(aio.TLS_CASE_ID), ids.index(multi_node.REVOCATION_CASE_ID))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[aio.TLS_CASE_ID].timeout_seconds,
                          multi_node.TLS_CASE_TIMEOUT_SECONDS)
         self.assertEqual(suite[aio.TLS_CASE_ID].topology, "multi-node")
+
+    def test_the_vision_route_case_precedes_the_lifecycle_cases(self):
+        # 9.2 NGX-04: both nodes' contours are read from the running cluster and
+        # from the traffic each name receives, so a later Worker shutdown or a
+        # renamed Master cannot be blamed for what the client saw here.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertLess(ids.index(aio.VISION_ROUTE_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[aio.VISION_ROUTE_CASE_ID].topology, "multi-node")
+        self.assertEqual(suite[aio.VISION_ROUTE_CASE_ID].timeout_seconds,
+                         2 * aio.VISION_ROUTE_TIMEOUT_SECONDS)
+
+
+class _VisionRoutePodman:
+    """The two hosts' probes, answered in the order the case asks for them."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.calls.append((container, script, timeout))
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, self.answers.pop(0), "")
+
+
+class _VisionRouteHost:
+    """The Master's client role: one fetch per URL, answered in order."""
+
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+    def __init__(self, reports):
+        self.client_reports = list(reports)
+        self.client_calls = []
+
+    def client_http(self, url, **kwargs):
+        self.client_calls.append({"url": url, **kwargs})
+        return self.client_reports.pop(0)
+
+
+class _VisionRouteProduct:
+    """The cluster the Vision route case reads, without containers.
+
+    The case counts the route against the Panel's own node records, so the
+    cluster is rendered from this product's arithmetic: one identifier per
+    inbound the node's own Vision flag owes, published by one host each. A
+    fixture with written-out numbers would stay green while that arithmetic
+    broke.
+    """
+
+    def __init__(self, vision=False, worker_vision=False, answers=(), reports=()):
+        self.vision = vision
+        self.worker_vision = worker_vision
+        self.matrix = matrix.load()
+        self.podman = _VisionRoutePodman(answers)
+        self.host = _VisionRouteHost(reports)
+
+    def require_worker(self):
+        return self.host
+
+    @property
+    def master_inbound_count(self) -> int:
+        return len(matrix.inbounds(self.matrix, vision=self.vision))
+
+    @property
+    def worker_inbound_count(self) -> int:
+        return len(matrix.inbounds(self.matrix, vision=self.worker_vision))
+
+    @property
+    def positive_case_count(self) -> int:
+        return matrix.positive_count(
+            self.matrix, matrix.MULTI_NODE, self.vision, self.worker_vision,
+        )
+
+    def cluster_facts(self, case_id):
+        records = [
+            {"name": multi_node.LOCAL_NODE_NAME, "uuid": "master-uuid",
+             "inbounds": [f"master-{index}" for index in range(self.master_inbound_count)]},
+            {"name": topology.WORKER_NODE_NAME, "uuid": "worker-uuid",
+             "inbounds": [f"worker-{index}" for index in range(self.worker_inbound_count)]},
+        ]
+        hosts = [
+            {"inbound": value, "nodes": [record["uuid"]]}
+            for record in records for value in record["inbounds"]
+        ]
+        return {
+            "nodes": {"status": 200, "records": records},
+            "hosts": {"status": 200, "records": hosts},
+        }
+
+
+class TestVisionRouteCase(unittest.TestCase):
+    """NGX-04 on a cluster: each node's own contour, or its own absence."""
+
+    def _reports(self, name=topology.WORKER_VISION_DOMAIN, sha=VISION_ROUTED_SHA):
+        return [
+            decoy_vision_report(f"https://{name}/", 200, sha, [name]),
+            decoy_vision_report(f"https://{topology.COVER_APEX}/", 200, sha,
+                                [topology.COVER_APEX]),
+            decoy_vision_report(f"https://{name}/api/nodes", 404, VISION_OTHER_SHA, [name]),
+        ]
+
+    def _product(self, vision=False, worker_vision=True, answers=None, reports=None):
+        return _VisionRouteProduct(
+            vision=vision, worker_vision=worker_vision,
+            answers=answers if answers is not None else [
+                vision_contour(target=None, listen=0, bound=(), root=""),
+                vision_contour(domain=topology.WORKER_VISION_DOMAIN),
+                vision_answer(),
+                vision_answer("HTTP/1.1 400 Bad Request", ""),
+            ],
+            reports=self._reports() if reports is None else reports,
+        )
+
+    def test_each_node_is_read_against_its_own_name_and_its_own_answer(self):
+        product = self._product()
+        evidence = multi_node.case_vision_route(product)
+        self.assertEqual(evidence["master"]["combination"], "disabled")
+        self.assertEqual(evidence["worker"]["combination"], "enabled")
+        self.assertEqual(evidence["master"]["vision_domain"], topology.VISION_DOMAIN)
+        self.assertEqual(evidence["worker"]["vision_domain"], topology.WORKER_VISION_DOMAIN)
+        self.assertEqual(evidence["worker"]["route_status"], 200)
+        self.assertEqual(evidence["worker"]["proxied_sha256"], VISION_ROUTED_SHA)
+        self.assertEqual([call[0] for call in product.podman.calls],
+                         ["aio-master", "worker-01", "worker-01", "worker-01"])
+        self.assertIn(topology.VISION_DOMAIN, product.podman.calls[0][1])
+        self.assertIn(topology.WORKER_VISION_DOMAIN, product.podman.calls[1][1])
+        self.assertIn(aio.VISION_FALLBACK_LISTEN, product.podman.calls[1][1])
+        self.assertEqual(
+            [call["url"] for call in product.host.client_calls],
+            [f"https://{topology.WORKER_VISION_DOMAIN}/",
+             f"https://{topology.COVER_APEX}/",
+             f"https://{topology.WORKER_VISION_DOMAIN}/api/nodes"],
+        )
+
+    def test_the_masters_absence_cannot_satisfy_the_workers_contour(self):
+        # A Worker installed without the domain is the common case, and the case
+        # has to prove that absence rather than let the Master's route answer for
+        # it: flipping only the flags leaves the contour's own answers in place,
+        # and each node must be refused for what it actually runs.
+        product = self._product(
+            vision=True, worker_vision=False,
+            answers=[vision_contour(), vision_answer(), vision_answer(
+                "HTTP/1.1 400 Bad Request", ""),
+                vision_contour(domain=topology.WORKER_VISION_DOMAIN)],
+            reports=self._reports(name=topology.VISION_DOMAIN),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_vision_route(product)
+        self.assertIn("the Worker is installed without a Vision domain and still routes",
+                      str(caught.exception))
+
+    def test_a_worker_whose_own_contour_fails_is_named_as_the_worker(self):
+        product = self._product(
+            answers=[
+                vision_contour(target=None, listen=0, bound=(), root=""),
+                vision_contour(domain=topology.WORKER_VISION_DOMAIN,
+                               target="127.0.0.1:8443"),
+            ],
+        )
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_vision_route(product)
+        self.assertIn("the Worker routes", str(caught.exception))
+
+
+def decoy_vision_report(url, status, sha, san=(), version="TLSv1.3", length=1024):
+    """One independent-client fetch, in the shape the probe prints it."""
+    probe = {
+        "url": url,
+        "status": status,
+        "body_length": length,
+        "body_sha256": sha,
+        "body_snippet": "",
+        "peer": {"san": list(san), "tls_version": version, "issuer": "CN=Pebble Intermediate CA"},
+    }
+    return {"returncode": 0, "probe": probe, "stdout": json.dumps(probe), "stderr": ""}
 
 
 _COVER_MASTER_IP = "10.89.0.10"
@@ -1994,6 +2743,9 @@ class TestCoverSiteCase(unittest.TestCase):
 
 _DECOY_ROUTE_INDEX = b"<html><title>A home for considered work | Testbed</title></html>"
 _DECOY_ROUTE_INDEX_SHA = hashlib.sha256(_DECOY_ROUTE_INDEX).hexdigest()
+_DECOY_ROUTE_404 = b"<html><title>Not found | Testbed</title></html>"
+_DECOY_ROUTE_404_SHA = hashlib.sha256(_DECOY_ROUTE_404).hexdigest()
+_DECOY_ROUTE_PANEL_API = b'{"error":"unauthorized"}'
 _DECOY_ROUTE_MASTER_MAP = (
     "map $ssl_preread_server_name $sni_backend {",
     "    panel.testbed.internal 127.0.0.1:7443;",
@@ -2085,6 +2837,7 @@ class _DecoyRoutePodman:
         }
         self.site_output = site_output if site_output is not None else (
             f"file\tindex.html\t{_DECOY_ROUTE_INDEX_SHA}\t{len(_DECOY_ROUTE_INDEX)}\n"
+            f"file\t404.html\t{_DECOY_ROUTE_404_SHA}\t{len(_DECOY_ROUTE_404)}\n"
         )
         self.outcomes = outcomes or {}
         self.scripts = {} if scripts is None else scripts
@@ -2137,26 +2890,43 @@ class _DecoyRouteHost:
     client_name = "client-01"
     untrusted_name = "untrusted-01"
 
-    def __init__(self, pages=None, status=None, sans=None):
+    def __init__(self, pages=None, status=None, sans=None, paths=None, insecure=None):
         self.pages = pages if pages is not None else {
             "testbed.internal": _DECOY_ROUTE_INDEX,
             "www.testbed.internal": _DECOY_ROUTE_INDEX,
             "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "probe.testbed.internal": _DECOY_ROUTE_INDEX,
             "panel.testbed.internal": b"<html>panel login</html>",
         }
         self.status = status or {}
+        # Per-request answers: ``"<name><path>" -> (status, body)``. Anything not
+        # listed falls back to the site's own pages, so a path a management
+        # probe asks is refused with the cover site's 404.html.
+        self.paths = paths or {}
+        self.insecure = [] if insecure is None else insecure
         self.sans = sans if sans is not None else list(
             _DECOY_ROUTE_MASTER_LINEAGES[
                 "/etc/letsencrypt/live/reality.testbed.internal/cert.pem"])
         self.plan = type("Plan", (), {"target_ip": "10.89.0.10", "worker_ip": "10.89.0.11"})()
 
     def client_http(self, url, timeout=30, **kwargs):
-        name = url.split("://", 1)[1].split("/", 1)[0]
-        payload = self.pages.get(name, b"")
+        if kwargs.get("insecure"):
+            self.insecure.append(url)
+        name, _, path = url.split("://", 1)[1].partition("/")
+        path = f"/{path}"
+        answer = self.paths.get(f"{name}{path}")
+        if answer is None:
+            if path == "/":
+                answer = (self.status.get(name, 200), self.pages.get(name, b""))
+            elif name == self.panel_domain and path == "/api/nodes":
+                answer = (401, _DECOY_ROUTE_PANEL_API)
+            else:
+                answer = (404, _DECOY_ROUTE_404)
+        status, payload = answer
         probe = {
             "url": url,
             "method": "GET",
-            "status": self.status.get(name, 200),
+            "status": status,
             "headers": {"content-type": "text/html"},
             "body_length": len(payload),
             "body_sha256": hashlib.sha256(payload).hexdigest(),
@@ -2389,11 +3159,79 @@ class TestDecoyRouteCase(unittest.TestCase):
             self.run_case(host=host)
         self.assertIn("does not name www.testbed.internal", str(caught.exception))
 
+    def test_every_name_that_terminates_on_the_decoy_refuses_management_paths(self):
+        host = _DecoyRouteHost()
+        evidence = self.run_case(host=host)
+        names = evidence["management"]["names"]
+        self.assertEqual(sorted(names), sorted([
+            topology.COVER_APEX, f"www.{topology.COVER_APEX}",
+            topology.REALITY_DOMAIN, topology.PROBE_UNMAPPED_SNI,
+        ]))
+        for name, paths in names.items():
+            with self.subTest(name=name):
+                self.assertEqual(sorted(paths), sorted(aio.DECOY_MANAGEMENT_PATHS))
+                for path, fact in paths.items():
+                    self.assertEqual(fact["status"], 404, path)
+                    self.assertEqual(fact["sha256"], _DECOY_ROUTE_404_SHA, path)
+        self.assertEqual(evidence["management"]["panel_anonymous_api_status"], 401)
+        self.assertNotEqual(
+            evidence["management"]["panel_anonymous_api_sha256"], _DECOY_ROUTE_404_SHA)
+
+    def test_the_unlisted_sni_is_read_without_a_name_pin(self):
+        host = _DecoyRouteHost()
+        evidence = self.run_case(host=host)
+        self.assertEqual(evidence["client"]["unmapped"]["body_sha256"],
+                         _DECOY_ROUTE_INDEX_SHA)
+        self.assertIn(f"https://{topology.PROBE_UNMAPPED_SNI}/", host.insecure)
+
+    def test_a_management_path_answered_on_the_decoy_fails_the_run(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.COVER_APEX}/api/": (200, b'{"nodes":[]}'),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("published a management interface", str(caught.exception))
+
+    def test_a_management_path_refused_with_another_body_fails_the_run(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.COVER_APEX}/api/nodes": (404, b"<html>nginx</html>"),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("not the cover site's own 404.html", str(caught.exception))
+
+    def test_a_panel_that_answers_the_management_read_fails_the_control(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.PANEL_DOMAIN}/api/nodes": (200, b'{"nodes":[]}'),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("control that tells the Panel from the decoy is gone",
+                      str(caught.exception))
+
+    def test_a_panel_name_served_by_the_decoy_fails_the_control(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.PANEL_DOMAIN}/api/nodes": (403, _DECOY_ROUTE_404),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("is served by the decoy rather than by the Panel",
+                      str(caught.exception))
+
+    def test_a_site_without_a_404_document_is_rejected(self):
+        podman = _DecoyRoutePodman(site_output=(
+            f"file\tindex.html\t{_DECOY_ROUTE_INDEX_SHA}\t{len(_DECOY_ROUTE_INDEX)}\n"
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("rendered no 404.html", str(caught.exception))
+
     def test_a_panel_name_serving_the_decoy_page_is_rejected(self):
         host = _DecoyRouteHost(pages={
             "testbed.internal": _DECOY_ROUTE_INDEX,
             "www.testbed.internal": _DECOY_ROUTE_INDEX,
             "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "probe.testbed.internal": _DECOY_ROUTE_INDEX,
             "panel.testbed.internal": _DECOY_ROUTE_INDEX,
         })
         with self.assertRaises(AssertionError) as caught:
@@ -4571,6 +5409,3327 @@ class TestAcme80Case(unittest.TestCase):
         self.assertEqual(len(change), 1)
         self.assertIn("gowave-auto.sh domain-change", change[0])
         self.assertIn(multi_node.ACME_NEW_PANEL_DOMAIN, change[0])
+
+
+_BACKUP_PANEL_ARCHIVE = "/var/backups/gowave/gowave-backup-panel-1763078400.tar.gz"
+_BACKUP_NODE_ARCHIVE = "/var/backups/gowave/gowave-backup-node-1763078401.tar.gz"
+_BACKUP_SECRET_SENTINEL = "s3cr3t-value-that-must-never-be-evidenced"
+
+
+def _backup_facts(path, backup_type, paths, *, declared=None, mode="0o600",
+                  env_keys=None, private_keys=(), sqlite_header=None):
+    """One archive as `backup_probe_script` reports it back."""
+    paths = tuple(paths)
+    return {
+        "path": path,
+        "mode": mode,
+        "size": 20480,
+        "sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+        "format_version": 1,
+        "type": backup_type,
+        "paths": sorted(paths),
+        "declared": sorted(paths if declared is None else declared),
+        "env_keys": {} if env_keys is None else env_keys,
+        "private_key_members": sorted(private_keys),
+        "sqlite_header": ("opt/gowave/gowave.db" in paths
+                          if sqlite_header is None else sqlite_header),
+    }
+
+
+_BACKUP_PANEL_PATHS = (
+    "etc/letsencrypt/archive/panel.testbed.internal/cert1.pem",
+    "etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",
+    "etc/letsencrypt/live/panel.testbed.internal/fullchain.pem",
+    "etc/letsencrypt/renewal/panel.testbed.internal.conf",
+    "etc/nginx/conf.d/gowave-panel.conf",
+    "etc/nginx/stream-enabled/gowave-stream.conf",
+    "opt/gowave/.env",
+    "opt/gowave/gowave.db",
+    "var/lib/gowave-auto-nginx/state.json",
+)
+_BACKUP_NODE_PATHS = ("opt/gowave-node/.env",)
+
+
+def _panel_facts(**overrides):
+    facts = _backup_facts(
+        _BACKUP_PANEL_ARCHIVE, "panel", _BACKUP_PANEL_PATHS,
+        env_keys={"opt/gowave/.env": ["APP_SECRET", "GOWAVE_PROXY"]},
+        private_keys=("etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",),
+    )
+    facts.update(overrides)
+    return facts
+
+
+def _node_facts(**overrides):
+    facts = _backup_facts(
+        _BACKUP_NODE_ARCHIVE, "node", _BACKUP_NODE_PATHS,
+        env_keys={"opt/gowave-node/.env": ["NODE_PORT", "SECRET_KEY", "SNI_VERIFICATION"]},
+        sqlite_header=False,
+    )
+    facts.update(overrides)
+    return facts
+
+
+def _write_backup_archive(directory, name, backup_type, members, *, mode=0o600,
+                          format_version=1):
+    """A real Format v1 archive: `members` is (relative path, payload) pairs."""
+    path = os.path.join(directory, name)
+    meta = json.dumps({
+        "format_version": format_version,
+        "backup_type": backup_type,
+        "files": [{"path": rel, "sha256": hashlib.sha256(payload).hexdigest()}
+                  for rel, payload in members],
+    }).encode("utf-8")
+    with tarfile.open(path, "w:gz") as tar:
+        info = tarfile.TarInfo("meta.json")
+        info.size = len(meta)
+        info.mode = 0o600
+        tar.addfile(info, io.BytesIO(meta))
+        for rel, payload in members:
+            info = tarfile.TarInfo(f"files/{rel}")
+            info.size = len(payload)
+            info.mode = 0o600
+            tar.addfile(info, io.BytesIO(payload))
+    os.chmod(path, mode)
+    return path
+
+
+class TestBackupProbeScript(unittest.TestCase):
+    """`backup_probe_script` reads an archive without disclosing what it holds."""
+
+    def probe(self, archive):
+        script = multi_node.backup_probe_script(archive)
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout, json.loads(result.stdout)
+
+    def test_it_reports_the_inventory_and_never_a_secret_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = _write_backup_archive(directory, "panel.tar.gz", "panel", (
+                ("opt/gowave/gowave.db", b"SQLite format 3\x00" + b"\x00" * 32),
+                ("opt/gowave/.env",
+                 f"APP_SECRET={_BACKUP_SECRET_SENTINEL}\nGOWAVE_PROXY=external\n".encode()),
+                ("etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",
+                 b"-----BEGIN PRIVATE KEY-----\n" + _BACKUP_SECRET_SENTINEL.encode() + b"\n"),
+                ("etc/letsencrypt/archive/panel.testbed.internal/cert1.pem",
+                 b"-----BEGIN CERTIFICATE-----\n"),
+                ("etc/nginx/conf.d/gowave-panel.conf", b"server {}\n"),
+            ))
+            stdout, facts = self.probe(archive)
+
+        self.assertNotIn(_BACKUP_SECRET_SENTINEL, stdout)
+        self.assertEqual(facts["path"], archive)
+        self.assertEqual(facts["mode"], "0o600")
+        self.assertEqual(facts["format_version"], 1)
+        self.assertEqual(facts["type"], "panel")
+        self.assertEqual(facts["paths"], sorted([
+            "etc/letsencrypt/archive/panel.testbed.internal/cert1.pem",
+            "etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",
+            "etc/nginx/conf.d/gowave-panel.conf",
+            "opt/gowave/.env",
+            "opt/gowave/gowave.db",
+        ]))
+        self.assertEqual(facts["declared"], facts["paths"])
+        self.assertEqual(facts["env_keys"], {"opt/gowave/.env": ["APP_SECRET", "GOWAVE_PROXY"]})
+        self.assertEqual(facts["private_key_members"],
+                         ["etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem"])
+        self.assertIs(facts["sqlite_header"], True)
+        self.assertGreater(facts["size"], 0)
+        self.assertEqual(len(facts["sha256"]), 64)
+
+    def test_a_symlinked_live_member_is_counted_but_never_followed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "panel.tar.gz")
+            meta = json.dumps({
+                "format_version": 1,
+                "backup_type": "panel",
+                "files": [{"path": "etc/letsencrypt/archive/a/privkey1.pem",
+                           "sha256": "0" * 64}],
+            }).encode()
+            with tarfile.open(path, "w:gz") as tar:
+                info = tarfile.TarInfo("meta.json")
+                info.size = len(meta)
+                tar.addfile(info, io.BytesIO(meta))
+                info = tarfile.TarInfo("files/etc/letsencrypt/live/a/fullchain.pem")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "../../archive/a/fullchain1.pem"
+                tar.addfile(info)
+            os.chmod(path, 0o600)
+            _, facts = self.probe(path)
+
+        self.assertEqual(facts["paths"], ["etc/letsencrypt/live/a/fullchain.pem"])
+        self.assertEqual(facts["private_key_members"], [])
+        self.assertIs(facts["sqlite_header"], False)
+
+    def test_a_non_sqlite_database_is_reported_as_such(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = _write_backup_archive(directory, "panel.tar.gz", "panel", (
+                ("opt/gowave/gowave.db", b"not a database"),
+            ))
+            _, facts = self.probe(archive)
+        self.assertIs(facts["sqlite_header"], False)
+
+
+class _BackupPodman:
+    """Both roles' archive creation, the probe, and the product's validator."""
+
+    ROLES = {"aio-master": "panel", "worker-01": "node"}
+
+    def __init__(self, facts=None, backup_returncode=None, verify_returncode=None,
+                 verify_stdout="15-point preflight archive validation PASSED.\n"):
+        self.facts = {"panel": _panel_facts(), "node": _node_facts()}
+        for type_name, replacement in (facts or {}).items():
+            self.facts[type_name] = replacement
+        self.backup_returncode = backup_returncode or {}
+        self.verify_returncode = verify_returncode or {}
+        self.verify_stdout = verify_stdout
+        self.scripts = []
+
+    @staticmethod
+    def archive_path(type_name):
+        return _BACKUP_PANEL_ARCHIVE if type_name == "panel" else _BACKUP_NODE_ARCHIVE
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        type_name = self.ROLES[container]
+        if "tarfile" in script:
+            return subprocess.CompletedProcess(["bash", "-lc"], 0,
+                                               json.dumps(self.facts[type_name]) + "\n", "")
+        if "gowave-backup.sh verify" in script:
+            rc = self.verify_returncode.get(type_name, 0)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], rc,
+                self.verify_stdout if rc == 0 else "",
+                "" if rc == 0 else "ERROR: archive member is outside strict allowlist\n")
+        rc = self.backup_returncode.get(type_name, 0)
+        label = "Panel" if type_name == "panel" else "Node"
+        return subprocess.CompletedProcess(
+            ["bash", "-lc"], rc,
+            f"{label} backup created successfully: {self.archive_path(type_name)} "
+            "(mode 0600).\n" if rc == 0 else "",
+            "" if rc == 0 else f"ERROR: {label} backup root is missing\n")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        raise AssertionError(f"unexpected python probe in {container}: {argv}")
+
+
+class _BackupHost:
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+
+class _BackupProduct:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestBackupCase(unittest.TestCase):
+    """MN-BACKUP: both archive types come out of the operator's own interface."""
+
+    def run_case(self, podman=None, host=None):
+        return multi_node.case_backup_types(_BackupProduct(
+            podman if podman is not None else _BackupPodman(),
+            host if host is not None else _BackupHost()))
+
+    def test_it_records_both_archives_and_only_their_inventory(self):
+        podman = _BackupPodman()
+        evidence = self.run_case(podman=podman)
+        master = evidence["roles"]["master"]
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(master["type"], "panel")
+        self.assertEqual(master["path"], _BACKUP_PANEL_ARCHIVE)
+        self.assertEqual(master["mode"], "0o600")
+        self.assertEqual(master["members"], sorted(_BACKUP_PANEL_PATHS))
+        self.assertEqual(master["secret_keys"], {"opt/gowave/.env": ["APP_SECRET", "GOWAVE_PROXY"]})
+        self.assertEqual([path.rsplit("/", 1)[-1] for path in master["private_key_members"]],
+                         ["privkey1.pem"])
+        self.assertIn("PASSED", master["validation"][0])
+        self.assertEqual(worker["type"], "node")
+        self.assertEqual(worker["members"], sorted(_BACKUP_NODE_PATHS))
+        self.assertEqual(worker["secret_keys"],
+                         {"opt/gowave-node/.env": ["NODE_PORT", "SECRET_KEY", "SNI_VERIFICATION"]})
+        self.assertNotIn(_BACKUP_SECRET_SENTINEL, json.dumps(evidence))
+
+    def test_each_role_runs_the_archive_type_it_owns(self):
+        podman = _BackupPodman()
+        self.run_case(podman=podman)
+        created = [(container, script) for container, script in podman.scripts
+                   if "gowave-auto.sh backup" in script]
+        self.assertEqual([container for container, _ in created],
+                         ["aio-master", "worker-01"])
+        self.assertIn("backup --type panel", created[0][1])
+        self.assertIn("backup --type node", created[1][1])
+        verified = [(container, script) for container, script in podman.scripts
+                    if "gowave-backup.sh verify" in script]
+        self.assertEqual([container for container, _ in verified],
+                         ["aio-master", "worker-01"])
+        self.assertIn(f"verify {_BACKUP_PANEL_ARCHIVE} panel", verified[0][1])
+        self.assertIn(f"verify {_BACKUP_NODE_ARCHIVE} node", verified[1][1])
+
+    def test_an_archive_that_is_not_root_only_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(mode="0o644")}))
+        self.assertIn("not root-only", str(caught.exception))
+
+    def test_a_panel_archive_without_a_required_member_fails_the_case(self):
+        paths = tuple(path for path in _BACKUP_PANEL_PATHS
+                      if path != "var/lib/gowave-auto-nginx/state.json")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("state.json", str(caught.exception))
+
+    def test_a_panel_archive_without_a_lineage_half_fails_the_case(self):
+        paths = tuple(path for path in _BACKUP_PANEL_PATHS
+                      if not path.startswith("etc/letsencrypt/renewal/"))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("etc/letsencrypt/renewal/", str(caught.exception))
+
+    def test_a_panel_archive_without_a_usable_database_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(
+                facts={"panel": _panel_facts(sqlite_header=False)}))
+        self.assertIn("no usable database", str(caught.exception))
+
+    def test_a_panel_archive_without_a_private_key_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(
+                facts={"panel": _panel_facts(private_key_members=[])}))
+        self.assertIn("could not restore a lineage", str(caught.exception))
+
+    def test_a_panel_archive_that_sweeps_in_the_binary_fails_the_case(self):
+        paths = _BACKUP_PANEL_PATHS + ("opt/gowave/gowave-server",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("forbids", str(caught.exception))
+
+    def test_a_panel_archive_that_sweeps_in_the_worker_fails_the_case(self):
+        paths = _BACKUP_PANEL_PATHS + ("opt/gowave-node/.env",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("two role archives are mixed", str(caught.exception))
+
+    def test_a_panel_archive_without_its_secret_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(
+                env_keys={"opt/gowave/.env": ["GOWAVE_PROXY"]})}))
+        self.assertIn("APP_SECRET", str(caught.exception))
+
+    def test_a_worker_archive_carrying_anything_else_fails_the_case(self):
+        paths = _BACKUP_NODE_PATHS + ("opt/gowave-node/gowave-node",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"node": _node_facts(paths=paths)}))
+        self.assertIn("credentials-only", str(caught.exception))
+
+    def test_a_worker_archive_without_its_secret_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"node": _node_facts(
+                env_keys={"opt/gowave-node/.env": ["NODE_PORT"]})}))
+        self.assertIn("SECRET_KEY", str(caught.exception))
+
+    def test_declared_checksums_for_absent_members_fail_the_case(self):
+        declared = _BACKUP_PANEL_PATHS + ("opt/gowave/missing.conf",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(
+                facts={"panel": _panel_facts(declared=declared)}))
+        self.assertIn("opt/gowave/missing.conf", str(caught.exception))
+
+    def test_an_archive_of_the_wrong_type_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"node": _node_facts(type="panel")}))
+        self.assertIn("wrong contract", str(caught.exception))
+
+    def test_a_failed_creation_fails_the_case_with_the_product_error(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(backup_returncode={"panel": 1}))
+        self.assertIn("could not create a panel archive", str(caught.exception))
+        self.assertIn("backup root is missing", str(caught.exception))
+
+    def test_a_creation_without_the_archives_path_fails_the_case(self):
+        class SilentPodman(_BackupPodman):
+            def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+                result = super().exec_bash(container, script, check=check,
+                                           input_text=input_text, timeout=timeout)
+                if "gowave-auto.sh backup" in script:
+                    return subprocess.CompletedProcess(result.args, 0, "Done.\n", "")
+                return result
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=SilentPodman())
+        self.assertIn("did not name the archive", str(caught.exception))
+
+    def test_a_validator_that_refuses_the_archive_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(verify_returncode={"node": 1}))
+        self.assertIn("own validator refused", str(caught.exception))
+        self.assertIn("strict allowlist", str(caught.exception))
+
+    def test_a_validator_that_does_not_report_its_verdict_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(verify_stdout=""))
+        self.assertIn("own validator refused", str(caught.exception))
+
+    def test_it_reads_the_archive_the_product_named_rather_than_a_default(self):
+        class ElsewherePodman(_BackupPodman):
+            def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+                result = super().exec_bash(container, script, check=check,
+                                           input_text=input_text, timeout=timeout)
+                if "gowave-auto.sh backup" in script and container == "aio-master":
+                    return subprocess.CompletedProcess(
+                        result.args, 0,
+                        "Panel backup created successfully: "
+                        "/var/backups/gowave/custom-panel.tar.gz (mode 0600).\n", "")
+                return result
+
+        podman = ElsewherePodman(facts={"panel": _panel_facts(
+            path="/var/backups/gowave/custom-panel.tar.gz")})
+        evidence = self.run_case(podman=podman)
+        probed = [script for container, script in podman.scripts
+                  if container == "aio-master" and "tarfile" in script]
+        self.assertEqual(len(probed), 1)
+        self.assertIn("/var/backups/gowave/custom-panel.tar.gz", probed[0])
+        self.assertEqual(evidence["roles"]["master"]["path"],
+                         "/var/backups/gowave/custom-panel.tar.gz")
+
+    def test_the_case_reads_its_archives_before_the_lifecycle_block(self):
+        # Both archives carry install-time credentials and lineages of a role
+        # the lifecycle cases revoke or stop, so this case reads them first.
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        self.assertEqual(suite[ids.index(multi_node.BACKUP_CASE_ID)].topology, "multi-node")
+        self.assertEqual(suite[ids.index(multi_node.BACKUP_CASE_ID)].timeout_seconds,
+                         multi_node.BACKUP_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.COVER_UNRESOLVED_CASE_ID),
+                        ids.index(multi_node.BACKUP_CASE_ID))
+        self.assertLess(ids.index(multi_node.BACKUP_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+
+
+class TestBackupArchiveParsing(unittest.TestCase):
+    """The archive path is the one line the product prints, and nothing else."""
+
+    def test_the_last_created_line_names_the_archive(self):
+        stdout = (
+            "Preparing archive...\n"
+            "Panel backup created successfully: /tmp/one.tar.gz (mode 0600).\n"
+            "Node backup created successfully: /var/backups/two.tar.gz (mode 0600).\n"
+        )
+        self.assertEqual(multi_node.parse_backup_archive(stdout),
+                         "/var/backups/two.tar.gz")
+
+    def test_a_relative_or_absent_path_names_no_archive(self):
+        self.assertEqual(multi_node.parse_backup_archive(
+            "Panel backup created successfully: gowave-backup-panel-1.tar.gz"), "")
+        self.assertEqual(multi_node.parse_backup_archive("Done.\n"), "")
+        self.assertEqual(multi_node.parse_backup_archive(""), "")
+
+
+_VOLUME_RUN_ID = "podman-multi-node-20260101T000000-deadbeef"
+_VOLUME_SUFFIX = "deadbeef"
+_VOLUME_PANEL_ARCHIVE = "gowave-backup-panel-1794600459.tar.gz"
+_VOLUME_NODE_ARCHIVE = "gowave-backup-node-1794600460.tar.gz"
+
+
+def _volume_probe_report(**overrides):
+    facts = {
+        "target_type": "ext4",
+        "root_type": "overlay",
+        "owner": "root",
+        "mode": "700",
+        "mounts": "1",
+    }
+    facts.update(overrides)
+    return " ".join(f"{key}={value}" for key, value in facts.items()) + "\n"
+
+
+class _VolumeContext:
+    def __init__(self, artifact_dir):
+        self.run_id = _VOLUME_RUN_ID
+        self.topology = "multi-node"
+        self.artifact_dir = str(artifact_dir)
+
+
+class _VolumePodman:
+    """The archive store as the container sees it, and the product's own writes."""
+
+    ROLES = {"aio-master": "master", "worker-01": "worker"}
+    LABELS = {"master": "Panel", "worker": "Node"}
+
+    def __init__(self, context, mountpoints, labelled, probes=None,
+                 backup_returncode=None, archive_override=None,
+                 stored_mode=0o600, write_archive=True):
+        self.context = context
+        self.mountpoints = mountpoints
+        self.labelled = labelled
+        self.probes = probes or {}
+        self.backup_returncode = backup_returncode or {}
+        self.archive_override = archive_override or {}
+        self.stored_mode = stored_mode
+        self.write_archive = write_archive
+        self.scripts = []
+
+    @property
+    def archives(self):
+        return {
+            "master": f"{topology.BACKUP_STORE}/{_VOLUME_PANEL_ARCHIVE}",
+            "worker": f"{topology.BACKUP_STORE}/{_VOLUME_NODE_ARCHIVE}",
+        }
+
+    def labelled_volumes(self):
+        return list(self.labelled)
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        role = self.ROLES[container]
+        if "root_type=" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0, self.probes.get(role, _volume_probe_report()), "")
+        returncode = self.backup_returncode.get(role, 0)
+        if returncode != 0:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], returncode, "",
+                f"ERROR: {self.LABELS[role]} backup root is missing\n")
+        archive = self.archive_override.get(role, self.archives[role])
+        if self.write_archive:
+            stored = self.mountpoints[role] / Path(archive).name
+            stored.write_bytes(b"archive")
+            os.chmod(stored, self.stored_mode)
+        return subprocess.CompletedProcess(
+            ["bash", "-lc"], 0,
+            f"{self.LABELS[role]} backup created successfully: {archive} (mode 0600).\n", "")
+
+
+class _VolumeHost:
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+    def __init__(self, volumes):
+        self.backup_volumes = volumes
+
+
+class _VolumeProduct:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestBackupVolumeProbe(unittest.TestCase):
+    """What the container is asked about its archive store before anything is written."""
+
+    def test_the_probe_asks_what_the_store_is_and_where_it_is_mounted(self):
+        script = multi_node.backup_volume_probe_script()
+        self.assertIn(topology.BACKUP_STORE, script)
+        self.assertIn("stat -f -c '%T'", script)
+        self.assertIn("/proc/self/mounts", script)
+        for field in ("target_type", "root_type", "owner", "mode", "mounts"):
+            self.assertIn(f"{field}=", script)
+
+    def test_a_root_only_mount_of_its_own_is_accepted(self):
+        multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+            "target_type": "ext4", "root_type": "overlay",
+            "owner": "root", "mode": "700", "mounts": "1",
+        })
+
+    def test_a_store_on_the_container_filesystem_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "overlay", "root_type": "overlay",
+                "owner": "root", "mode": "700", "mounts": "1",
+            })
+        self.assertIn("container layer", str(caught.exception))
+
+    def test_a_missing_store_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "missing", "root_type": "overlay",
+                "owner": "missing", "mode": "missing", "mounts": "0",
+            })
+        self.assertIn("container layer", str(caught.exception))
+
+    def test_a_store_readable_by_another_user_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "ext4", "root_type": "overlay",
+                "owner": "root", "mode": "755", "mounts": "1",
+            })
+        self.assertIn("readable by another user", str(caught.exception))
+
+    def test_a_store_owned_by_a_normal_user_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "ext4", "root_type": "overlay",
+                "owner": "gowave", "mode": "700", "mounts": "1",
+            })
+        self.assertIn("owned by 'gowave'", str(caught.exception))
+
+    def test_a_store_that_is_not_a_single_mount_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "ext4", "root_type": "overlay",
+                "owner": "root", "mode": "700", "mounts": "0",
+            })
+        self.assertIn("mount entries", str(caught.exception))
+
+
+class TestArtifactLeaks(unittest.TestCase):
+    """The artifact tree is scanned by shape, never by trusting a file name alone."""
+
+    def test_an_empty_tree_holds_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            leaks = multi_node.artifact_leaks(Path(directory), (_VOLUME_PANEL_ARCHIVE,))
+        self.assertEqual(leaks["files"], 0)
+        self.assertEqual(leaks["gzip_files"], [])
+        self.assertEqual(leaks["archive_names"], [])
+        self.assertEqual(leaks["archive_suffixes"], [])
+        self.assertEqual(leaks["secret_markers"], [])
+
+    def test_a_gzip_stream_is_found_whatever_it_is_called(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "payload.bin").write_bytes(b"\x1f\x8b\x08\x00rest")
+            leaks = multi_node.artifact_leaks(Path(directory), ())
+        self.assertEqual(leaks["gzip_files"], ["payload.bin"])
+
+    def test_a_file_named_after_the_archive_is_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "nested").mkdir()
+            (Path(directory) / "nested" / _VOLUME_PANEL_ARCHIVE).write_bytes(b"copy")
+            leaks = multi_node.artifact_leaks(Path(directory), (_VOLUME_PANEL_ARCHIVE,))
+        self.assertEqual(leaks["archive_names"], [f"nested/{_VOLUME_PANEL_ARCHIVE}"])
+
+    def test_an_archive_suffix_is_found_even_under_another_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "state.tar.gz").write_bytes(b"copy")
+            leaks = multi_node.artifact_leaks(Path(directory), ())
+        self.assertEqual(leaks["archive_suffixes"], ["state.tar.gz"])
+
+    def test_a_protected_value_written_by_a_probe_is_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "probe.log").write_text(
+                "environment_sha256=0f\nAPP_SECRET=deadbeef\n", encoding="utf-8")
+            leaks = multi_node.artifact_leaks(Path(directory), ())
+        self.assertEqual(leaks["secret_markers"], ["probe.log:APP_SECRET="])
+
+    def test_plain_text_is_not_an_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "result.json").write_text(
+                json.dumps({"overall": "PASS"}), encoding="utf-8")
+            leaks = multi_node.artifact_leaks(Path(directory), (_VOLUME_PANEL_ARCHIVE,))
+        self.assertEqual(leaks["files"], 1)
+        self.assertEqual(leaks["gzip_files"], [])
+        self.assertEqual(leaks["archive_names"], [])
+        self.assertEqual(leaks["secret_markers"], [])
+
+
+class TestBackupVolumeCase(unittest.TestCase):
+    """MN-BACKUP-VOL: the unencrypted archives never leave a run-owned volume."""
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        base = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.base = base
+        self.artifact_dir = base / "artifacts"
+        self.artifact_dir.mkdir()
+        self.mountpoints = {}
+        for role in ("master", "worker"):
+            mountpoint = base / f"volume-{role}"
+            mountpoint.mkdir()
+            os.chmod(mountpoint, 0o700)
+            self.mountpoints[role] = mountpoint
+        self.names = {role: f"backups-{role}-{_VOLUME_SUFFIX}" for role in ("master", "worker")}
+
+    def run_case(self, volumes=None, labelled=None, mountpoints=None, modes=None, **kwargs):
+        mountpoints = mountpoints if mountpoints is not None else self.mountpoints
+        for role, mode in (modes or {}).items():
+            os.chmod(mountpoints[role], mode)
+        if volumes is None:
+            volumes = {
+                role: {"name": self.names[role], "mountpoint": str(mountpoints[role])}
+                for role in ("master", "worker")
+            }
+        podman = _VolumePodman(
+            _VolumeContext(self.artifact_dir), mountpoints,
+            labelled=list(self.names.values()) if labelled is None else labelled,
+            **kwargs)
+        evidence = multi_node.case_backup_volume(
+            _VolumeProduct(podman, _VolumeHost(volumes)))
+        return evidence, podman
+
+    def test_it_proves_both_roles_store_their_archive_on_a_run_owned_volume(self):
+        evidence, _ = self.run_case()
+        master = evidence["roles"]["master"]
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(master["volume"], self.names["master"])
+        self.assertEqual(master["filesystem"], "ext4")
+        self.assertEqual(master["root_filesystem"], "overlay")
+        self.assertEqual(master["owner"], "root")
+        self.assertEqual(master["directory_mode"], "700")
+        self.assertEqual(master["archive"], f"{topology.BACKUP_STORE}/{_VOLUME_PANEL_ARCHIVE}")
+        self.assertTrue(master["archive_on_volume"])
+        self.assertEqual(worker["archive"], f"{topology.BACKUP_STORE}/{_VOLUME_NODE_ARCHIVE}")
+        self.assertEqual(evidence["artifacts"]["files"], 0)
+        self.assertEqual(evidence["cleanup"]["labelled_volumes"], sorted(self.names.values()))
+
+    def test_the_volume_is_inspected_before_the_product_writes_into_it(self):
+        _, podman = self.run_case()
+        master = [script for container, script in podman.scripts
+                  if container == "aio-master"]
+        self.assertEqual(len(master), 2)
+        self.assertIn("root_type=", master[0])
+        self.assertIn("gowave-auto.sh backup", master[1])
+        self.assertIn("backup --type panel", master[1])
+        worker = [script for container, script in podman.scripts
+                  if container == "worker-01"]
+        self.assertIn("backup --type node", worker[1])
+
+    def test_a_store_that_is_part_of_the_image_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(probes={"master": _volume_probe_report(target_type="overlay")})
+        self.assertIn("container layer", str(caught.exception))
+
+    def test_a_store_readable_by_others_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(probes={"worker": _volume_probe_report(mode="755")})
+        self.assertIn("readable by another user", str(caught.exception))
+
+    def test_a_volume_named_outside_this_run_fails_the_case(self):
+        volumes = {
+            role: {"name": f"backups-{role}", "mountpoint": str(self.mountpoints[role])}
+            for role in ("master", "worker")
+        }
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(volumes=volumes)
+        self.assertIn("not scoped to this run", str(caught.exception))
+
+    def test_a_volume_the_cleanup_would_not_reclaim_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(labelled=[])
+        self.assertIn("cleanup would leave it behind", str(caught.exception))
+
+    def test_a_host_mountpoint_readable_by_others_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(modes={"master": 0o755})
+        self.assertIn("not root-only", str(caught.exception))
+
+    def test_a_role_without_an_archive_volume_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(volumes={"master": {
+                "name": self.names["master"],
+                "mountpoint": str(self.mountpoints["master"]),
+            }})
+        self.assertIn("do not each carry an archive volume", str(caught.exception))
+
+    def test_a_failed_creation_fails_the_case_with_the_product_error(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(backup_returncode={"worker": 1})
+        self.assertIn("could not write a node archive", str(caught.exception))
+        self.assertIn("backup root is missing", str(caught.exception))
+
+    def test_an_archive_outside_the_store_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(archive_override={"master": "/tmp/panel.tar.gz"})
+        self.assertIn("not inside the archive store", str(caught.exception))
+
+    def test_an_archive_that_never_reached_the_volume_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(write_archive=False)
+        self.assertIn("is not on the host volume", str(caught.exception))
+
+    def test_an_archive_readable_by_others_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(stored_mode=0o644)
+        self.assertIn("instead of 0o600", str(caught.exception))
+
+    def test_a_gzip_file_in_the_artifact_tree_fails_the_case(self):
+        (self.artifact_dir / "payload.bin").write_bytes(b"\x1f\x8b\x08\x00rest")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("gzip files", str(caught.exception))
+
+    def test_an_archive_copied_into_the_artifact_tree_fails_the_case(self):
+        (self.artifact_dir / _VOLUME_PANEL_ARCHIVE).write_bytes(b"copy")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("by name", str(caught.exception))
+
+    def test_a_protected_value_in_the_artifact_tree_fails_the_case(self):
+        (self.artifact_dir / "probe.log").write_text(
+            "SECRET_KEY=deadbeef\n", encoding="utf-8")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("protected value", str(caught.exception))
+
+    def test_the_case_runs_right_after_the_archive_contracts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.BACKUP_VOLUME_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.BACKUP_VOLUME_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.BACKUP_CASE_ID),
+                        ids.index(multi_node.BACKUP_VOLUME_CASE_ID))
+        self.assertLess(ids.index(multi_node.BACKUP_VOLUME_CASE_ID),
+                        ids.index(multi_node.RESTORE_CASE_ID))
+
+
+_REJECT_PANEL_ARCHIVE = "gowave-backup-panel-1794603001.tar.gz"
+_REJECT_NODE_ARCHIVE = "gowave-backup-node-1794603002.tar.gz"
+_REJECT_MESSAGES = {
+    "truncated": "Validation Error: Archive is not a readable Format v1 tar.gz: "
+                 "unexpected end of data",
+    "garbage": "Validation Error: Archive is not a readable Format v1 tar.gz: "
+               "file could not be opened successfully",
+    "checksum": "Validation Error: Checksum mismatch for member opt/gowave/.env: "
+                "expected 0, got 1",
+    "incomplete": "Validation Error: Missing archive member declared in meta.json: "
+                  "opt/gowave/.env",
+    "no-database": "Validation Error: Archive of type 'panel' is missing its required "
+                   "member: opt/gowave/gowave.db",
+    "wrong-type": "Validation Error: Backup type mismatch: expected panel, got node",
+    # The refusal NEG-12 turns on: the archive passed every container check and
+    # the product's own staged-copy check rejects the database it carries.
+    "sqlite": "Pre-restore check failed: staged database integrity check returned: "
+              "error: database disk image is malformed",
+    "node-truncated": "Validation Error: Archive is not a readable Format v1 tar.gz: "
+                      "unexpected end of data",
+}
+
+
+def _write_format_archive(path, type_name, members):
+    """A real Format v1 archive: a manifest plus the members it declares."""
+    entries = [{"path": rel, "sha256": hashlib.sha256(content).hexdigest()}
+               for rel, content in members]
+    with tarfile.open(path, "w:gz") as tar:
+        blob = json.dumps({
+            "format_version": 1,
+            "backup_type": type_name,
+            "files": entries,
+        }).encode()
+        info = tarfile.TarInfo("meta.json")
+        info.size = len(blob)
+        tar.addfile(info, io.BytesIO(blob))
+        for rel, content in members:
+            info = tarfile.TarInfo(f"files/{rel}")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    os.chmod(path, 0o600)
+    return path
+
+
+class _RejectPodman:
+    """The product's archive verbs, with a configurable refusal per variant."""
+
+    def __init__(self, store, worker_store, state=None, node_state=None,
+                 verify_returncode=0,
+                 verify_stdout="15-point preflight archive validation PASSED.\n",
+                 restore_returncode=None, restore_output=None, mutate_state=None,
+                 node_digest_after=None):
+        self.store = Path(store)
+        self.worker_store = Path(worker_store)
+        self.state = dict(state or {"unit": "active", "nginx": "active",
+                                    "env": "a" * 64, "db": "b" * 64, "snapshots": "0"})
+        self.node_state = dict(node_state or {"digest": "c" * 64, "sentinel": "0",
+                                              "active": "active"})
+        self.verify_returncode = verify_returncode
+        self.verify_stdout = verify_stdout
+        self.restore_returncode = restore_returncode or {}
+        self.restore_output = restore_output or {}
+        self.mutate_state = set(mutate_state or ())
+        self.node_digest_after = node_digest_after
+        self.scripts = []
+
+    def arch(self, type_name):
+        return (f"{topology.BACKUP_STORE}/{_REJECT_PANEL_ARCHIVE}"
+                if type_name == "panel" else
+                f"{topology.BACKUP_STORE}/{_REJECT_NODE_ARCHIVE}")
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        if "gowave-auto.sh backup" in script:
+            type_name = "panel" if "--type panel" in script else "node"
+            label = "Panel" if type_name == "panel" else "Node"
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"{label} backup created successfully: {self.arch(type_name)} "
+                "(mode 0600).\n", "")
+        if "gowave-backup.sh verify" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.verify_returncode,
+                self.verify_stdout if self.verify_returncode == 0 else "",
+                "" if self.verify_returncode == 0 else "Validation Error: refused\n")
+        if "gowave-auto.sh restore" in script:
+            archive = script.split(" restore ", 1)[1].split()[0].strip("'\"")
+            name = Path(archive).name
+            returncode = self.restore_returncode.get(name, 1)
+            if name in self.mutate_state:
+                self.state["db"] = "d" * 64
+            if self.node_digest_after and "--type node" in script:
+                self.node_state["digest"] = self.node_digest_after
+            if name in self.restore_output:
+                return subprocess.CompletedProcess(
+                    ["bash", "-lc"], returncode, self.restore_output[name], "")
+            if returncode == 0:
+                return subprocess.CompletedProcess(
+                    ["bash", "-lc"], 0,
+                    "Restore completed and verified successfully.\n", "")
+            variant = name[len("rejected-"):-len(".tar.gz")]
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], returncode, "", _REJECT_MESSAGES.get(variant, "") + "\n")
+        if "snapshots=" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                " ".join(f"{key}={value}" for key, value in self.state.items()) + "\n", "")
+        if "sentinel=" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                " ".join(f"{key}={value}" for key, value in self.node_state.items()) + "\n", "")
+        raise AssertionError(f"unexpected script in {container}: {script[:120]}")
+
+
+class TestBackupRejectCase(unittest.TestCase):
+    """MN-BACKUP-BAD: a restore refuses what it cannot honour, and touches nothing."""
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        base = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.base = base
+        self.store = base / "volume-master"
+        self.worker_store = base / "volume-worker"
+        self.store.mkdir()
+        self.worker_store.mkdir()
+        os.chmod(self.store, 0o700)
+        os.chmod(self.worker_store, 0o700)
+        self.panel = _write_format_archive(
+            self.store / _REJECT_PANEL_ARCHIVE, "panel", (
+                ("opt/gowave/gowave.db", b"SQLite format 3\x00" + b"\x00" * 512),
+                ("opt/gowave/.env", b"APP_SECRET=original\n"),
+                ("var/lib/gowave-auto-nginx/state.json", b'{"version": 1}\n'),
+            ))
+        self.node = _write_format_archive(
+            self.worker_store / _REJECT_NODE_ARCHIVE, "node", (
+                ("opt/gowave-node/.env", b"SECRET_KEY=original\nNODE_PORT=2096\n"),
+            ))
+        self.volumes = {
+            "master": {"name": "backups-master-deadbeef", "mountpoint": str(self.store)},
+            "worker": {"name": "backups-worker-deadbeef", "mountpoint": str(self.worker_store)},
+        }
+
+    def run_case(self, **kwargs):
+        podman = _RejectPodman(self.store, self.worker_store, **kwargs)
+        evidence = multi_node.case_backup_rejected(
+            _VolumeProduct(podman, _VolumeHost(self.volumes)))
+        return evidence, podman
+
+    def test_it_refuses_every_variant_and_leaves_the_master_untouched(self):
+        evidence, _ = self.run_case()
+        refused = {entry["variant"]: entry for entry in evidence["refused"]}
+        self.assertEqual(sorted(refused), sorted(name for name, _ in multi_node.REJECT_VARIANTS))
+        for name, entry in refused.items():
+            self.assertNotEqual(entry["returncode"], 0)
+            # Every variant but the database one is refused by the archive
+            # validator; that one reaches the product's own integrity check.
+            self.assertRegex(entry["message"], "Validation Error:|Pre-restore check failed:")
+            self.assertEqual(entry["state"]["db"], "b" * 64)
+        self.assertIn("required member: opt/gowave/gowave.db", refused["no-database"]["message"])
+        self.assertIn("Checksum mismatch", refused["checksum"]["message"])
+        self.assertIn("database integrity check", refused["sqlite"]["message"])
+        self.assertEqual(evidence["master_state"]["snapshots"], "0")
+        self.assertEqual(evidence["node_refused"]["returncode"], 1)
+        self.assertEqual(evidence["control"]["panel"],
+                         f"{topology.BACKUP_STORE}/{_REJECT_PANEL_ARCHIVE}")
+
+    def test_each_variant_breaks_exactly_one_promise_of_the_format(self):
+        self.run_case()
+        original = self.panel.read_bytes()
+
+        truncated = (self.store / "rejected-truncated.tar.gz").read_bytes()
+        self.assertLess(len(truncated), len(original))
+        self.assertEqual((self.store / "rejected-garbage.tar.gz").read_bytes(),
+                         b"not a Format v1 archive\n")
+        self.assertEqual(
+            (self.store / "rejected-wrong-type.tar.gz").read_bytes(),
+            self.node.read_bytes())
+
+        with tarfile.open(self.store / "rejected-checksum.tar.gz", "r:gz") as tar:
+            manifest = json.loads(tar.extractfile("meta.json").read())
+            self.assertEqual(tar.extractfile("files/opt/gowave/.env").read(),
+                             b"APP_SECRET=replaced-by-the-case\n")
+            self.assertIn("opt/gowave/.env", [entry["path"] for entry in manifest["files"]])
+            self.assertNotEqual(
+                next(entry["sha256"] for entry in manifest["files"]
+                     if entry["path"] == "opt/gowave/.env"),
+                hashlib.sha256(b"APP_SECRET=replaced-by-the-case\n").hexdigest())
+
+        with tarfile.open(self.store / "rejected-incomplete.tar.gz", "r:gz") as tar:
+            names = tar.getnames()
+            manifest = json.loads(tar.extractfile("meta.json").read())
+        self.assertNotIn("files/opt/gowave/.env", names)
+        self.assertIn("opt/gowave/.env", [entry["path"] for entry in manifest["files"]])
+
+        with tarfile.open(self.store / "rejected-no-database.tar.gz", "r:gz") as tar:
+            names = tar.getnames()
+            manifest = json.loads(tar.extractfile("meta.json").read())
+        self.assertNotIn("files/opt/gowave/gowave.db", names)
+        self.assertNotIn("opt/gowave/gowave.db", [entry["path"] for entry in manifest["files"]])
+
+    def test_the_database_variant_passes_every_container_check(self):
+        """The corruption has to be in the bytes, not in the archive around them."""
+        self.run_case()
+        with tarfile.open(self.store / "rejected-sqlite.tar.gz", "r:gz") as tar:
+            names = tar.getnames()
+            manifest = json.loads(tar.extractfile("meta.json").read())
+            carried = tar.extractfile(multi_node.REJECT_DATABASE_MEMBER).read()
+        with tarfile.open(self.panel, "r:gz") as tar:
+            original = tar.extractfile(multi_node.REJECT_DATABASE_MEMBER).read()
+        self.assertIn(multi_node.REJECT_DATABASE_MEMBER, names)
+        self.assertIn("meta.json", names)
+        self.assertLess(len(carried), len(original))
+        # Still a SQLite file by its own header, so the product reads it as a
+        # database and refuses it as a malformed one rather than as not-a-database.
+        self.assertTrue(carried.startswith(b"SQLite format 3\x00"))
+        declared = next(entry["sha256"] for entry in manifest["files"]
+                        if entry["path"] == multi_node.REJECT_DATABASE_PATH)
+        self.assertEqual(declared, hashlib.sha256(carried).hexdigest())
+
+    def test_an_archive_the_product_applies_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_returncode={"rejected-incomplete.tar.gz": 0})
+        self.assertIn("was not refused", str(caught.exception))
+
+    def test_a_rejection_that_still_reports_success_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_output={
+                "rejected-garbage.tar.gz":
+                    "Validation Error: Archive is not a readable Format v1 tar.gz: x\n"
+                    "Restore completed and verified successfully.\n",
+            })
+        self.assertIn("still reported success", str(caught.exception))
+
+    def test_a_rejection_for_another_reason_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_output={"rejected-checksum.tar.gz": "boom\n"})
+        self.assertIn("refused for another reason", str(caught.exception))
+
+    def test_a_traceback_instead_of_a_rejection_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_output={
+                "rejected-truncated.tar.gz":
+                    "Traceback (most recent call last):\n"
+                    "Validation Error: Archive is not a readable Format v1 tar.gz: x\n",
+            })
+        self.assertIn("crashed the validator", str(caught.exception))
+
+    def test_a_refusal_that_changes_the_master_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(mutate_state={"rejected-checksum.tar.gz"})
+        self.assertIn("changed the Master", str(caught.exception))
+
+    def test_an_archive_the_product_refuses_before_the_case_corrupts_it_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(verify_returncode=1)
+        self.assertIn("would prove nothing", str(caught.exception))
+
+    def test_a_master_that_is_not_running_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(state={"unit": "inactive", "nginx": "active", "env": "a" * 64,
+                                 "db": "b" * 64, "snapshots": "0"})
+        self.assertIn("a service that stays up afterwards would prove nothing",
+                      str(caught.exception))
+
+    def test_a_worker_that_stops_answering_after_a_refusal_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(node_digest_after="e" * 64)
+        self.assertIn("after a refused Worker restore", str(caught.exception))
+
+    def test_the_case_runs_between_the_volume_proof_and_the_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.REJECT_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.REJECT_CASE_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.BACKUP_VOLUME_CASE_ID),
+                        ids.index(multi_node.REJECT_CASE_ID))
+        self.assertLess(ids.index(multi_node.REJECT_CASE_ID),
+                        ids.index(multi_node.RESTORE_CASE_ID))
+
+
+_DUPLICATE_STATE = {
+    "state_digest": "1" * 64,
+    "journal_digest": "2" * 64,
+    "journal_state": "NODE_ADD_COMMITTED",
+    "journal_node_name": topology.WORKER_NODE_NAME,
+    "state_nodes": ["local-node", topology.WORKER_NODE_NAME],
+    "state_addresses": ["10.0.0.1", "10.0.0.2"],
+}
+
+_DUPLICATE_SURFACE = {
+    "nodes": {
+        "count": 2,
+        "connected_count": 2,
+        "inbound_count": 6,
+        "inbound_digest": "d" * 64,
+        "names": ["local-node", topology.WORKER_NODE_NAME],
+        "endpoints": ["10.0.0.1:3002", "10.0.0.2:3002"],
+        "connected": {"local-node": True, topology.WORKER_NODE_NAME: True},
+    },
+    "profiles": {"count": 2, "inbound_digest": "e" * 64},
+    "squads": {"count": 1, "mvp_inbound_digest": "f" * 64},
+    "hosts": {"count": 7, "inbound_digest": "a" * 64, "fingerprints": ["chrome"]},
+    "tokens": {"count": 1},
+}
+
+
+class _DuplicatePodman:
+    """The Master's registration record, its known_hosts and the operator's second `node add`."""
+
+    def __init__(self, record=None, returncode=1,
+                 output=f"{multi_node.DUPLICATE_ADD_REFUSAL} {topology.WORKER_NODE_NAME} "
+                        f"for the node at 10.0.0.2; choose another name or remove that "
+                        f"entry first.\n",
+                 mutate=None, on_attempt=None):
+        self.record = dict(record or _DUPLICATE_STATE)
+        self.returncode = returncode
+        self.output = output
+        self.mutate = mutate
+        self.on_attempt = on_attempt
+        self.attempts = []
+        self.known_hosts = "10.0.0.2 ssh-ed25519 AAAArecorded\n"
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        if argv[:2] == ["cat", "/root/.ssh/known_hosts"]:
+            return subprocess.CompletedProcess(argv, 0, self.known_hosts, "")
+        if argv[:2] == ["bash", "-c"] and "/root/.ssh/known_hosts" in argv[2]:
+            self.known_hosts = input_text
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(f"unexpected command in {container}: {argv}")
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        if "state_digest" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0, json.dumps(self.record), "")
+        if "gowave-auto.sh node add" in script:
+            self.attempts.append((container, script))
+            if self.mutate == "state":
+                self.record["state_digest"] = "9" * 64
+            elif self.mutate == "journal":
+                self.record["journal_digest"] = "9" * 64
+            if self.on_attempt is not None:
+                self.on_attempt()
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.returncode, self.output, "")
+        raise AssertionError(f"unexpected script in {container}: {script[:120]}")
+
+
+class _DuplicatePlan:
+    worker_ip = "10.0.0.2"
+    second_node_ip = "10.0.0.9"
+
+
+class _DuplicateHost:
+    target_name = "aio-master"
+    plan = _DuplicatePlan()
+
+    def __init__(self):
+        self.pinned = []
+
+    def node_add_script(self, name=None, address=None):
+        name = name or topology.WORKER_NODE_NAME
+        address = address or self.plan.worker_ip
+        return (
+            f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
+            f"'{name}' '{address}' "
+            "'worker.testbed.internal' 'reality.testbed.internal'"
+        )
+
+    def pin_worker_address(self, address):
+        entry = f"{address} ssh-ed25519 AAAApinned"
+        self.pinned.append(entry)
+        return entry
+
+
+class _DuplicateProduct:
+    def __init__(self, podman, surface):
+        self.podman = podman
+        self.surface = surface
+        self.host = _DuplicateHost()
+
+    def require_worker(self):
+        return self.host
+
+    def panel_surface(self, case_id):
+        return {"surface": self.surface}
+
+
+class TestDuplicateAddCase(unittest.TestCase):
+    """MN-DUP-ADD: the second registration is refused before anything is mutated."""
+
+    def setUp(self):
+        self.surface = copy.deepcopy(_DUPLICATE_SURFACE)
+
+    def run_case(self, record=None, **kwargs):
+        podman = _DuplicatePodman(
+            record=dict(record or copy.deepcopy(_DUPLICATE_STATE)), **kwargs)
+        return multi_node.case_duplicate_add(_DuplicateProduct(podman, self.surface)), podman
+
+    def test_it_refuses_the_operator_command_and_reads_both_sides(self):
+        evidence, podman = self.run_case()
+        self.assertEqual(len(podman.attempts), 1)
+        container, script = podman.attempts[0]
+        self.assertEqual(container, _DuplicateHost.target_name)
+        self.assertIn("gowave-auto.sh node add", script)
+        self.assertIn(topology.WORKER_NODE_NAME, script)
+        self.assertEqual(evidence["refusal"], multi_node.DUPLICATE_ADD_REFUSAL)
+        self.assertEqual(evidence["journal_state"], "NODE_ADD_COMMITTED")
+        self.assertTrue(evidence["state_unchanged"])
+        self.assertTrue(evidence["journal_unchanged"])
+        self.assertTrue(evidence["inventory_unchanged"])
+
+    def test_the_attempt_claims_the_name_at_a_second_address(self):
+        # The same name at the same address is the retry of a known identity,
+        # which the product accepts on purpose; only another address makes it a
+        # duplicate.
+        evidence, podman = self.run_case()
+        _container, script = podman.attempts[0]
+        self.assertIn(f"'{_DuplicatePlan.second_node_ip}'", script)
+        self.assertNotIn(f"'{_DuplicatePlan.worker_ip}'", script)
+        self.assertEqual(evidence["second_address"], _DuplicatePlan.second_node_ip)
+        self.assertEqual(evidence["recorded_address"], _DuplicatePlan.worker_ip)
+
+    def test_the_second_address_is_pinned_and_the_pin_taken_out_again(self):
+        evidence, podman = self.run_case()
+        self.assertIn(_DuplicatePlan.second_node_ip, evidence["address_pinned"])
+        self.assertEqual(podman.known_hosts, "10.0.0.2 ssh-ed25519 AAAArecorded\n")
+        self.assertTrue(evidence["known_hosts_restored"])
+
+    def test_a_refusal_that_does_not_name_the_recorded_address_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output=f"{multi_node.DUPLICATE_ADD_REFUSAL} "
+                                 f"{topology.WORKER_NODE_NAME} for the node at 10.0.0.9\n")
+        self.assertIn("does not name the address the record holds", str(caught.exception))
+
+    def test_the_record_probe_reads_the_product_own_files(self):
+        script = multi_node.duplicate_add_state_command()
+        self.assertIn(multi_node.NODE_ADD_STATE, script)
+        self.assertIn(multi_node.NODE_ADD_JOURNAL, script)
+        for field in ("state_digest", "journal_digest", "journal_state", "state_nodes"):
+            self.assertIn(field, script)
+
+    def test_the_inventory_leaves_out_the_connection_flag(self):
+        inventory = multi_node.panel_inventory(_DUPLICATE_SURFACE)
+        self.assertEqual(inventory["node_count"], 2)
+        self.assertNotIn("connected", inventory)
+        self.assertNotIn("connected_count", inventory)
+        flapped = copy.deepcopy(_DUPLICATE_SURFACE)
+        flapped["nodes"]["connected"][topology.WORKER_NODE_NAME] = False
+        flapped["nodes"]["connected_count"] = 1
+        self.assertEqual(multi_node.panel_inventory(flapped), inventory)
+
+    def test_a_duplicate_that_is_accepted_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(returncode=0, output="Worker 'worker-1' successfully added and deployed.\n")
+        self.assertIn("exited 0", str(caught.exception))
+
+    def test_a_refusal_without_the_existing_name_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output="Error: could not resolve the Panel address.\n")
+        self.assertIn("without naming the existing record", str(caught.exception))
+
+    def test_a_traceback_instead_of_the_refusal_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output=f"{multi_node.DUPLICATE_ADD_REFUSAL}: "
+                                 f"{topology.WORKER_NODE_NAME} for the node at 10.0.0.2\n"
+                                 "Traceback (most recent call last):\n"
+                                 "KeyError: 'nodes'\n")
+        self.assertIn("crashed instead of being refused", str(caught.exception))
+
+    def test_a_refusal_that_rewrites_state_json_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(mutate="state")
+        self.assertIn("rewrote state.json", str(caught.exception))
+
+    def test_a_refusal_that_rewrites_the_journal_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(mutate="journal")
+        self.assertIn("rewrote the recovery journal", str(caught.exception))
+
+    def test_a_refusal_that_creates_a_panel_record_fails_the_case(self):
+        def add_a_node():
+            self.surface["nodes"]["count"] = 3
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(on_attempt=add_a_node)
+        self.assertIn("changed the Panel inventory", str(caught.exception))
+
+    def test_a_pair_without_a_committed_journal_fails_the_case(self):
+        record = dict(_DUPLICATE_STATE, journal_state="NODE_ADD_VERIFYING")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(record=record)
+        self.assertIn("no completed registration", str(caught.exception))
+
+    def test_a_journal_naming_another_node_fails_the_case(self):
+        record = dict(_DUPLICATE_STATE, journal_node_name="worker-9")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(record=record)
+        self.assertIn("instead of", str(caught.exception))
+
+    def test_a_state_file_without_the_worker_fails_the_case(self):
+        record = dict(_DUPLICATE_STATE, state_nodes=["local-node"])
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(record=record)
+        self.assertIn("refused for the wrong reason", str(caught.exception))
+
+    def test_the_case_runs_after_the_observer_and_before_the_locks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.DUPLICATE_ADD_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.DUPLICATE_ADD_CASE_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.ARGV_OBSERVER_CASE_ID),
+                        ids.index(multi_node.DUPLICATE_ADD_CASE_ID))
+        self.assertLess(ids.index(multi_node.DUPLICATE_ADD_CASE_ID),
+                        ids.index(lock_cases.LOCK_CASE_ID))
+
+
+_RESTORE_REPRESENTATIONS = ("base64", "xray-json", "mihomo", "clash", "singbox")
+_RESTORE_SUFFIXES = {
+    "": "base64",
+    "/v2ray-json": "xray-json",
+    "/mihomo": "mihomo",
+    "/clash": "clash",
+    "/singbox": "singbox",
+}
+
+
+class _RestorePanelStub:
+    """A Panel with a client list, a representation per client, and a delete verb.
+
+    The served body is a function of the client row, so handing the same row back
+    is what makes the bytes reappear — which is exactly what the restore has to
+    reproduce, and what a rotated row must fail to reproduce.
+    """
+
+    def __init__(self):
+        self.users = {}
+        self.next_id = 100
+        self.salt = "captured"
+        self.password = "restore-password-do-not-print"
+        self.token = "restore-token-do-not-print"
+
+    def add(self, user_id=7, username="podman-e2e-restore-aaaa",
+            short_uuid="11111111-2222-3333-4444-555555555555"):
+        self.users[str(user_id)] = {
+            "id": user_id, "username": username, "shortUuid": short_uuid,
+            "status": "ACTIVE",
+        }
+        return self.users[str(user_id)]
+
+    def by_short_uuid(self, short_uuid):
+        return next((user for user in self.users.values()
+                     if user["shortUuid"] == short_uuid), None)
+
+    def body(self, name, user):
+        return f"{name} {user['shortUuid']} {user['username']} {self.salt}".encode()
+
+
+class TestRestoreScope(unittest.TestCase):
+    """The probe's restore steps, driven through the HTTP the Panel really serves."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.payloads = Path(self.tmp.name) / "payloads"
+        self.payloads.mkdir(mode=0o700)
+        self.stub = _RestorePanelStub()
+        self.credentials = Path(self.tmp.name) / "credentials"
+        self.credentials.write_text(
+            f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.stub.password}\n", encoding="utf-8"
+        )
+        self.credentials.chmod(0o600)
+        self.server = self._serve()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def _serve(self):
+        stub = self.stub
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _authorised(self):
+                return self.headers.get("Authorization") == f"Bearer {stub.token}"
+
+            def _send(self, status, body=None, raw=None,
+                      content_type="application/json; charset=utf-8"):
+                self.send_response(status)
+                payload_bytes = raw if raw is not None else (
+                    json.dumps(body).encode() if body is not None else b"")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload_bytes)))
+                self.end_headers()
+                self.wfile.write(payload_bytes)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                # The subscription routes are what a client dials, so the Panel
+                # serves them without a bearer token.
+                if path.startswith("/api/sub/"):
+                    remainder = path[len("/api/sub/"):]
+                    short_uuid, _, suffix = remainder.partition("/")
+                    name = _RESTORE_SUFFIXES.get(f"/{suffix}" if suffix else "")
+                    user = stub.by_short_uuid(short_uuid)
+                    if name is None or user is None:
+                        return self._send(404, {"message": "Subscription not found"})
+                    return self._send(200, raw=stub.body(name, user),
+                                      content_type="text/plain; charset=utf-8")
+                if not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                if path == "/api/users":
+                    users = list(stub.users.values())
+                    return self._send(200, {"response": {"users": users,
+                                                         "total": len(users)}})
+                if path.startswith("/api/users/"):
+                    user = stub.users.get(path.rsplit("/", 1)[-1])
+                    if user is None:
+                        return self._send(404, {"message": "User not found"})
+                    return self._send(200, {"response": user})
+                if path == "/api/internal-squads":
+                    return self._send(200, {"response": {"internalSquads": [
+                        {"uuid": "squad-uuid", "name": "Default MVP Squad"},
+                    ]}})
+                return self._send(404, {"message": "not found"})
+
+            def do_POST(self):
+                if self.path == "/api/auth/login":
+                    body = json.loads(self.rfile.read(
+                        int(self.headers.get("Content-Length") or 0)) or b"{}")
+                    if body.get("password") != stub.password:
+                        return self._send(401, {"error": "Unauthorized"})
+                    return self._send(200, {"response": {"accessToken": stub.token}})
+                if self.path == "/api/users" and self._authorised():
+                    body = json.loads(self.rfile.read(
+                        int(self.headers.get("Content-Length") or 0)) or b"{}")
+                    stub.next_id += 1
+                    user = stub.add(
+                        user_id=stub.next_id,
+                        username=str(body.get("username") or "unnamed"),
+                        short_uuid=f"{stub.next_id:08d}-0000-4000-8000-000000000000",
+                    )
+                    return self._send(201, {"response": user})
+                return self._send(404, {"message": "not found"})
+
+            def do_DELETE(self):
+                if not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                path = self.path.split("?", 1)[0]
+                user = stub.users.pop(path.rsplit("/", 1)[-1], None)
+                if user is None:
+                    return self._send(404, {"message": "User not found"})
+                return self._send(204)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
+
+    def _run(self, step, *extra):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = panel_surface.main([
+                "--scope", "restore",
+                "--step", step,
+                "--panel-url", f"http://127.0.0.1:{self.port}",
+                "--credentials", str(self.credentials),
+                "--payload-dir", str(self.payloads),
+                *extra,
+            ])
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertNotIn(self.stub.password, output)
+        self.assertNotIn(self.stub.token, output)
+        return json.loads(output)["restore"]
+
+    def _state(self):
+        return self.payloads / "backup-restore" / "state.json"
+
+    def test_capture_records_the_inventory_and_every_served_representation(self):
+        facts = self._run("capture")
+
+        self.assertEqual(facts["users_in_archive"], 1)
+        self.assertEqual(facts["create_status"], 201)
+        self.assertGreater(facts["created_short_uuid_length"], 0)
+        self.assertIs(facts["readback_username_matches"], True)
+        self.assertEqual(sorted(facts["representations"]), sorted(_RESTORE_REPRESENTATIONS))
+        self.assertTrue(all(entry["status"] == 200
+                            for entry in facts["representations"].values()))
+
+        state = json.loads(self._state().read_text(encoding="utf-8"))
+        self.assertEqual(os.stat(self._state()).st_mode & 0o777, 0o600)
+        self.assertTrue(state["username"].startswith("podman-e2e-restore-"))
+        self.assertEqual(state["users_in_archive"], 1)
+        self.assertEqual(sorted(state["representations"]), sorted(_RESTORE_REPRESENTATIONS))
+        self.assertTrue(all(len(entry["sha256"]) == 64
+                            for entry in state["representations"].values()))
+        for name in _RESTORE_REPRESENTATIONS:
+            payload = self.payloads / "backup-restore" / f"{name}.payload"
+            self.assertTrue(payload.is_file(), name)
+            self.assertEqual(os.stat(payload).st_mode & 0o777, 0o600, name)
+
+    def test_mutate_deletes_the_captured_client_and_its_route(self):
+        self._run("capture")
+        facts = self._run("mutate")
+
+        self.assertEqual(facts["delete_status"], 204)
+        self.assertEqual(facts["after_delete_readback_status"], 404)
+        self.assertIs(facts["user_present_after_delete"], False)
+        self.assertEqual(facts["users_after_delete"], 0)
+        self.assertNotEqual(facts["subscription_after_delete_status"], 200)
+
+    def test_verify_accepts_only_the_client_and_the_bytes_the_archive_brought_back(self):
+        captured = self._run("capture")
+        self._run("mutate")
+        state = json.loads(self._state().read_text(encoding="utf-8"))
+        self.stub.add(user_id=state["user_id"], username=state["username"],
+                      short_uuid=state["short_uuid"])
+
+        facts = self._run("verify")
+
+        self.assertEqual(facts["readback_status"], 200)
+        self.assertIs(facts["username_restored"], True)
+        self.assertIs(facts["short_uuid_restored"], True)
+        self.assertIs(facts["inventory_restored"], True)
+        self.assertEqual(facts["users_restored"], captured["users_in_archive"])
+        self.assertEqual(sorted(facts["representations_identical"]),
+                         sorted(_RESTORE_REPRESENTATIONS))
+        self.assertTrue(all(facts["representations_identical"].values()))
+
+    def test_verify_reports_a_client_that_did_not_come_back(self):
+        self._run("capture")
+        self._run("mutate")
+
+        facts = self._run("verify")
+
+        self.assertEqual(facts["readback_status"], 404)
+        self.assertIs(facts["username_restored"], False)
+        self.assertIs(facts["short_uuid_restored"], False)
+        self.assertIs(facts["inventory_restored"], False)
+        self.assertFalse(any(facts["representations_identical"].values()))
+
+    def test_verify_reports_a_client_served_different_bytes(self):
+        self._run("capture")
+        self._run("mutate")
+        state = json.loads(self._state().read_text(encoding="utf-8"))
+        self.stub.add(user_id=state["user_id"], username=state["username"],
+                      short_uuid=state["short_uuid"])
+        self.stub.salt = "restored-from-another-archive"
+
+        facts = self._run("verify")
+
+        self.assertEqual(facts["readback_status"], 200)
+        self.assertIs(facts["username_restored"], True)
+        self.assertEqual(sorted(facts["representations_identical"]),
+                         sorted(_RESTORE_REPRESENTATIONS))
+        self.assertFalse(any(facts["representations_identical"].values()))
+
+    def test_a_step_without_the_capture_state_names_the_step_to_run_first(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._run("mutate")
+        self.assertIn("--step capture", str(caught.exception))
+
+    def test_the_scope_refuses_to_run_without_a_payload_directory(self):
+        with self.assertRaises(SystemExit) as caught:
+            panel_surface.main([
+                "--scope", "restore", "--step", "capture",
+                "--panel-url", f"http://127.0.0.1:{self.port}",
+                "--credentials", str(self.credentials),
+            ])
+        self.assertIn("needs --payload-dir", str(caught.exception))
+
+    def test_a_state_file_without_a_client_id_is_refused(self):
+        self._run("capture")
+        self._state().write_text(json.dumps({"username": "orphan"}), encoding="utf-8")
+        with self.assertRaises(SystemExit) as caught:
+            panel_surface.read_state(self._state(), "capture")
+        self.assertIn("holds no client id", str(caught.exception))
+
+
+_RESTORE_PANEL_ARCHIVE = "/var/backups/gowave/gowave-backup-panel-1763078500.tar.gz"
+_RESTORE_NODE_ARCHIVE = "/var/backups/gowave/gowave-backup-node-1763078501.tar.gz"
+
+
+def _restore_served(status=200, served=48):
+    return {name: {"status": status, "bytes": served} for name in _RESTORE_REPRESENTATIONS}
+
+
+def _restore_capture_facts(**overrides):
+    facts = {
+        "users_in_archive": 3,
+        "create_status": 201,
+        "created_short_uuid_length": 36,
+        "readback_status": 200,
+        "readback_username_matches": True,
+        "representations": _restore_served(),
+    }
+    facts.update(overrides)
+    return facts
+
+
+def _restore_mutate_facts(**overrides):
+    facts = {
+        "delete_status": 204,
+        "after_delete_readback_status": 404,
+        "users_after_delete": 3,
+        "user_present_after_delete": False,
+        "subscription_after_delete_status": 404,
+    }
+    facts.update(overrides)
+    return facts
+
+
+def _restore_verify_facts(**overrides):
+    facts = {
+        "readback_status": 200,
+        "username_restored": True,
+        "short_uuid_restored": True,
+        "users_restored": 4,
+        "user_present_after_restore": True,
+        "inventory_restored": True,
+        "representations": _restore_served(),
+        "representations_identical": {name: True for name in _RESTORE_REPRESENTATIONS},
+    }
+    facts.update(overrides)
+    return facts
+
+
+class _RestorePodman:
+    """Both roles' backups and restores, the Panel steps, and a Worker environment.
+
+    The Worker's environment file is modelled rather than scripted: the marker
+    append changes its digest, and a successful node restore puts the captured
+    bytes back, so a case that never restarted the Worker cannot pass.
+    """
+
+    ENV_DIGEST = "a" * 64
+    MARKED_DIGEST = "e" * 64
+    SUCCESS = "Restore completed and verified successfully.\n"
+
+    def __init__(self, capture=None, mutate=None, verify=None,
+                 backup_returncode=None, restore_returncode=None, restore_stdout=None,
+                 silent_archives=False, marker_returncode=0, marker_changes=True,
+                 env_digest_restored=True, env_marker_cleared=True, unit="active"):
+        self.capture = _restore_capture_facts() if capture is None else capture
+        self.mutate = _restore_mutate_facts() if mutate is None else mutate
+        self.verify = _restore_verify_facts() if verify is None else verify
+        self.backup_returncode = backup_returncode or {}
+        self.restore_returncode = restore_returncode or {}
+        self.restore_stdout = restore_stdout or {}
+        self.silent_archives = silent_archives
+        self.marker_returncode = marker_returncode
+        self.marker_changes = marker_changes
+        self.env_digest_restored = env_digest_restored
+        self.env_marker_cleared = env_marker_cleared
+        self.unit = unit
+        self.scripts = []
+        self.env_digest = self.ENV_DIGEST
+        self.env_sentinel = "0"
+        self.captured_digest = self.ENV_DIGEST
+
+    @staticmethod
+    def archive_path(type_name):
+        return _RESTORE_PANEL_ARCHIVE if type_name == "panel" else _RESTORE_NODE_ARCHIVE
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        if "--scope restore" in script:
+            step = next(name for name in ("capture", "mutate", "verify")
+                        if f"--step {name}" in script)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                json.dumps({"restore": getattr(self, step)}) + "\n", "")
+        if f"sha256sum {multi_node.RESTORE_NODE_ENV}" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"digest={self.env_digest} sentinel={self.env_sentinel} active={self.unit}\n", "")
+        if ">> " in script and multi_node.RESTORE_SENTINEL_KEY in script:
+            if self.marker_returncode == 0 and self.marker_changes:
+                self.env_sentinel = "1"
+                self.env_digest = self.MARKED_DIGEST
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.marker_returncode, "",
+                "" if self.marker_returncode == 0 else "ERROR: read-only file system\n")
+        if "gowave-auto.sh backup" in script:
+            type_name = "panel" if "--type panel" in script else "node"
+            rc = self.backup_returncode.get(type_name, 0)
+            label = "Panel" if type_name == "panel" else "Node"
+            stdout = "" if rc != 0 or self.silent_archives else (
+                f"{label} backup created successfully: {self.archive_path(type_name)} "
+                "(mode 0600).\n")
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], rc, stdout,
+                "" if rc == 0 else f"ERROR: {label} backup root is missing\n")
+        if "gowave-auto.sh restore" in script:
+            type_name = "panel" if "--type panel" in script else "node"
+            rc = self.restore_returncode.get(type_name, 0)
+            if rc == 0 and type_name == "node":
+                self.env_digest = (self.captured_digest if self.env_digest_restored
+                                   else self.MARKED_DIGEST)
+                self.env_sentinel = "0" if self.env_marker_cleared else "1"
+            stdout = self.restore_stdout.get(type_name, self.SUCCESS)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], rc,
+                stdout if rc == 0 else "",
+                "" if rc == 0 else "ERROR: archive validation failed\n")
+        raise AssertionError(f"unexpected script in {container}: {script}")
+
+
+class _RestoreMaster:
+    def __init__(self, delivered=None):
+        self.delivered = delivered or {"base64": 1, "xray-json": 2}
+        self.tunnel_calls = []
+        self.payload_calls = []
+
+    def subscription_payloads(self, case_id):
+        self.payload_calls.append(case_id)
+        return {"representations": {}}
+
+    def wait_tunnel_ready(self, case_id, payload_dir=None):
+        self.tunnel_calls.append((case_id, payload_dir))
+        return {"delivered": dict(self.delivered)}
+
+
+class _RestoreHost:
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+
+class _RestoreProduct:
+    def __init__(self, podman, host=None, master=None):
+        self.podman = podman
+        self.host = host if host is not None else _RestoreHost()
+        self.master = master if master is not None else _RestoreMaster()
+        self.waits = []
+
+    def require_worker(self):
+        return self.host
+
+    def wait_for_nodes(self, case_id, expected):
+        self.waits.append((case_id, expected))
+        return {"count": expected, "connected_count": expected}
+
+
+class TestRestoreCase(unittest.TestCase):
+    """MN-RESTORE: the product restores what its own archive captured, on both roles."""
+
+    def run_case(self, **kwargs):
+        podman = _RestorePodman(**kwargs)
+        product = _RestoreProduct(podman)
+        return multi_node.case_backup_restore(product), podman, product
+
+    def fail(self, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**kwargs)
+        return str(caught.exception)
+
+    def test_it_records_both_roles_and_the_restored_panel_state(self):
+        evidence, podman, product = self.run_case()
+
+        master = evidence["roles"]["master"]
+        self.assertEqual(master["users_in_archive"], 3)
+        self.assertEqual(master["create_status"], 201)
+        self.assertEqual(sorted(master["representations"]), sorted(_RESTORE_REPRESENTATIONS))
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(worker["environment_sha256"], _RestorePodman.ENV_DIGEST)
+        self.assertIs(worker["environment_restored"], True)
+        self.assertEqual(worker["unit"], "active")
+        self.assertEqual(sorted(evidence["restore"]), ["master", "worker"])
+        self.assertEqual(evidence["restore"]["master"]["type"], "panel")
+        self.assertEqual(evidence["restore"]["master"]["archive"], _RESTORE_PANEL_ARCHIVE)
+        self.assertEqual(evidence["restore"]["worker"]["type"], "node")
+        self.assertIn("Restore completed and verified successfully.",
+                      evidence["restore"]["worker"]["tail"][-1])
+        self.assertIs(evidence["panel"]["identity_restored"], True)
+        self.assertEqual(evidence["panel"]["users_restored"], 4)
+        self.assertTrue(all(evidence["panel"]["representations_identical"].values()))
+        self.assertEqual(evidence["nodes"], {"count": 2, "connected_count": 2})
+        self.assertEqual(evidence["data_plane"], {"base64": 1, "xray-json": 2})
+        self.assertEqual(product.waits, [(multi_node.RESTORE_CASE_ID, 2)])
+        self.assertEqual(product.master.payload_calls, [multi_node.RESTORE_CASE_ID])
+        self.assertEqual(product.master.tunnel_calls, [(multi_node.RESTORE_CASE_ID, None)])
+        self.assertEqual(podman.env_sentinel, "0")
+
+    def test_it_captures_before_the_archive_and_verifies_after_the_restore(self):
+        _, podman, _ = self.run_case()
+        kinds = []
+        for _, script in podman.scripts:
+            for marker in ("--step capture", "--step mutate", "--step verify",
+                           "gowave-auto.sh backup", "gowave-auto.sh restore",
+                           ">> ", "sha256sum"):
+                if marker in script:
+                    kinds.append({
+                        "--step capture": "capture", "--step mutate": "mutate",
+                        "--step verify": "verify",
+                        "gowave-auto.sh backup": "backup",
+                        "gowave-auto.sh restore": "restore",
+                        ">> ": "mark", "sha256sum": "probe",
+                    }[marker])
+                    break
+        self.assertEqual(kinds, ["capture", "probe", "backup", "backup", "mutate",
+                                 "mark", "probe", "restore", "restore", "verify", "probe"])
+
+    def test_each_role_runs_the_archive_and_the_restore_type_it_owns(self):
+        _, podman, _ = self.run_case()
+        created = [(container, script) for container, script in podman.scripts
+                   if "gowave-auto.sh backup" in script]
+        self.assertEqual([container for container, _ in created], ["aio-master", "worker-01"])
+        self.assertIn("backup --type panel", created[0][1])
+        self.assertIn("backup --type node", created[1][1])
+        restored = [(container, script) for container, script in podman.scripts
+                    if "gowave-auto.sh restore" in script]
+        self.assertEqual([container for container, _ in restored], ["aio-master", "worker-01"])
+        self.assertIn(f"restore {_RESTORE_PANEL_ARCHIVE} --type panel", restored[0][1])
+        self.assertIn(f"restore {_RESTORE_NODE_ARCHIVE} --type node", restored[1][1])
+
+    def test_the_panel_steps_run_where_the_loopback_api_lives(self):
+        script = multi_node.restore_step_script("verify")
+        self.assertIn(aio.PANEL_SURFACE_SCRIPT, script)
+        self.assertIn("--scope restore", script)
+        self.assertIn("--step verify", script)
+        self.assertIn(f"--payload-dir {topology.PAYLOAD_MOUNT}", script)
+
+    def test_the_worker_probe_reports_a_fingerprint_rather_than_the_file(self):
+        script = multi_node.node_env_probe_script()
+        self.assertIn(f"sha256sum {multi_node.RESTORE_NODE_ENV}", script)
+        self.assertIn(f"grep -c '^{multi_node.RESTORE_SENTINEL_KEY}='", script)
+        self.assertIn("systemctl is-active gowave-node.service", script)
+        self.assertIn("printf 'digest=%s sentinel=%s active=%s", script)
+        self.assertNotIn("cat ", script)
+
+    def test_a_capture_that_did_not_create_the_client_fails_the_case(self):
+        message = self.fail(capture=_restore_capture_facts(create_status=400))
+        self.assertIn("instead of 201", message)
+
+    def test_a_capture_the_panel_did_not_read_back_fails_the_case(self):
+        message = self.fail(capture=_restore_capture_facts(readback_username_matches=False))
+        self.assertIn("did not read back the client", message)
+
+    def test_a_client_served_no_representation_fails_the_case(self):
+        message = self.fail(capture=_restore_capture_facts(
+            representations=_restore_served(status=404)))
+        self.assertIn("not served every representation", message)
+
+    def test_a_delete_that_was_not_a_success_fails_the_case(self):
+        message = self.fail(mutate=_restore_mutate_facts(delete_status=500))
+        self.assertIn("instead of 204", message)
+
+    def test_a_client_the_panel_still_lists_after_the_delete_fails_the_case(self):
+        message = self.fail(mutate=_restore_mutate_facts(user_present_after_delete=True))
+        self.assertIn("still lists the client", message)
+
+    def test_a_subscription_that_survives_the_delete_fails_the_case(self):
+        message = self.fail(mutate=_restore_mutate_facts(
+            subscription_after_delete_status=200))
+        self.assertIn("still answered 200", message)
+
+    def test_a_marker_that_could_not_be_written_fails_the_case(self):
+        message = self.fail(marker_returncode=1)
+        self.assertIn("could not mark the Worker environment", message)
+
+    def test_a_marker_that_did_not_change_the_environment_fails_the_case(self):
+        message = self.fail(marker_changes=False)
+        self.assertIn("did not change after the injected marker", message)
+
+    def test_a_backup_that_failed_fails_the_case_before_anything_is_destroyed(self):
+        message = self.fail(backup_returncode={"panel": 1})
+        self.assertIn("backup root is missing", message)
+
+    def test_a_backup_that_named_no_archive_fails_the_case(self):
+        message = self.fail(silent_archives=True)
+        self.assertIn("did not name the archive", message)
+
+    def test_a_restore_that_exited_unsuccessfully_fails_the_case(self):
+        message = self.fail(restore_returncode={"node": 1})
+        self.assertIn("archive validation failed", message)
+
+    def test_a_restore_that_did_not_report_its_own_success_fails_the_case(self):
+        message = self.fail(restore_stdout={"panel": "Restoring...\n"})
+        self.assertIn("did not report its own success", message)
+
+    def test_a_client_that_did_not_come_back_fails_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(readback_status=404))
+        self.assertIn("did not come back", message)
+
+    def test_a_restored_client_with_another_identity_fails_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(short_uuid_restored=False))
+        self.assertIn("rather than the captured identity", message)
+
+    def test_an_inventory_that_was_not_restored_fails_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(
+            inventory_restored=False, users_restored=2))
+        self.assertIn("instead of the inventory the archive captured", message)
+
+    def test_bytes_that_differ_after_the_restore_fail_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(
+            representations_identical={"base64": True, "xray-json": False,
+                                       "mihomo": True, "clash": True, "singbox": True}))
+        self.assertIn("not served the bytes it was served before", message)
+
+    def test_a_worker_environment_that_was_not_restored_fails_the_case(self):
+        message = self.fail(env_digest_restored=False)
+        self.assertIn("did not restore its credentials", message)
+
+    def test_a_worker_environment_still_carrying_the_marker_fails_the_case(self):
+        message = self.fail(env_marker_cleared=False)
+        self.assertIn("still carries the injected", message)
+
+    def test_a_worker_that_is_not_active_after_the_restore_fails_the_case(self):
+        message = self.fail(unit="failed")
+        self.assertIn("gowave-node.service is 'failed'", message)
+
+    def test_the_case_is_registered_after_the_backup_it_depends_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.RESTORE_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.RESTORE_CASE_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.BACKUP_CASE_ID),
+                        ids.index(multi_node.RESTORE_CASE_ID))
+
+
+class TestNodeEnvProbe(unittest.TestCase):
+    """The Worker fingerprint is one line of key=value facts, and nothing else."""
+
+    def test_it_reads_the_three_fields_the_probe_prints(self):
+        facts = multi_node.parse_node_env_probe("digest=abc sentinel=0 active=active\n")
+        self.assertEqual(facts, {"digest": "abc", "sentinel": "0", "active": "active"})
+
+    def test_an_empty_or_noisy_report_is_read_field_by_field(self):
+        self.assertEqual(multi_node.parse_node_env_probe(""), {})
+        facts = multi_node.parse_node_env_probe(
+            "warning: something\n\ndigest=abc sentinel=1 active=failed\n")
+        self.assertEqual(facts, {"digest": "abc", "sentinel": "1", "active": "failed"})
+
+    def test_a_restored_environment_that_matches_is_accepted(self):
+        multi_node.require_node_env(
+            "MN-RESTORE", "after the restore",
+            {"digest": "a" * 64, "sentinel": "0", "active": "active"}, "a" * 64)
+
+    def test_a_missing_or_different_fingerprint_is_refused(self):
+        for facts, message in (
+            ({"digest": "", "sentinel": "0", "active": "active"}, "did not restore its credentials"),
+            ({"digest": "b" * 64, "sentinel": "0", "active": "active"},
+             "did not restore its credentials"),
+            ({"digest": "a" * 64, "sentinel": "1", "active": "active"},
+             "still carries the injected"),
+            ({"digest": "a" * 64, "sentinel": "0", "active": "unknown"},
+             "gowave-node.service is 'unknown'"),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.require_node_env("MN-RESTORE", "after the restore", facts, "a" * 64)
+            self.assertIn(message, str(caught.exception))
+
+
+CLIENT_ADDRESS = "198.51.100.7"
+
+
+class TestPacketWrongHostCase(unittest.TestCase):
+    """MN-PKT-03: a correct Worker payload judged as the Master's has to fail.
+
+    Everything the egress half of the live sentence asks for is right in this
+    case — a 200, the right SNI, the Worker's own address — so the only thing
+    that can refuse it is the packet comparison. What this class holds is that
+    the comparison is what decides, and that the case does not settle for
+    computing FAIL without the harness actually refusing the case.
+    """
+
+    def product(self, *, master_matched=0, worker_matched=3, status=200, worker_ip=True):
+        product = _MatrixProduct()
+        self.addCleanup(product.cleanup)
+        product.master.host = product.topology
+        product.master.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        inbound = matrix.inbound(product.matrix, "REALITY")
+        port = ingress.listener_port(inbound)
+        egress = (
+            str(product.topology.plan.data_worker_ip) if worker_ip
+            else str(product.topology.plan.data_target_ip)
+        )
+        product.master.transfer_facts = lambda *args, **kwargs: {
+            "status": status, "source_ip": egress,
+        }
+
+        def bracket(request, inbound, node="", window=ingress.CAPTURE_WINDOW_SECONDS, *,
+                    intended="", identity_port=ingress.IDENTITY_PORT,
+                    probe_script=ingress.PROBE_SCRIPT, identity_engine=""):
+            return ingress.Measurement(
+                port=port, intended=intended or "master", client=CLIENT_ADDRESS,
+                captures={
+                    "master": {"captured": master_matched,
+                               "sources": {CLIENT_ADDRESS: master_matched},
+                               "stopped_by": "harness", "drops": 0},
+                    "worker": {"captured": worker_matched,
+                               "sources": {CLIENT_ADDRESS: worker_matched},
+                               "stopped_by": "harness", "drops": 0},
+                },
+                request=request(),
+            )
+
+        product.master.bracket_request = bracket
+        return product
+
+    def test_a_worker_payload_the_master_did_not_carry_is_a_fail(self):
+        evidence = multi_node.case_packet_wrong_host(self.product())
+        self.assertEqual(evidence["verdict"], ingress.FAIL)
+        self.assertEqual(evidence["intended_host"], "master")
+        self.assertEqual(evidence["capturing_host"], "worker")
+        self.assertEqual(evidence["intended_matched"], 0)
+        self.assertEqual(evidence["capturing_matched"], 3)
+        self.assertEqual(evidence["egress_source_ip"], evidence["egress_expected"])
+        self.assertEqual(evidence["worker_tuple"], "MN-DP-worker-REALITY-xray")
+
+    def test_a_payload_that_also_reached_the_master_is_not_this_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(master_matched=2))
+        self.assertIn("so the request was not the mislabelled one", str(caught.exception))
+
+    def test_a_broken_transfer_is_refused_before_the_verdict(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(status=502))
+        self.assertIn("would be reporting a broken transfer", str(caught.exception))
+
+    def test_an_egress_from_the_master_does_not_meet_the_sentence(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(worker_ip=False))
+        self.assertIn("the egress half of the sentence is not met", str(caught.exception))
+
+    def test_no_capture_at_all_cannot_stand_in_for_a_wrong_host(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(worker_matched=0))
+        self.assertIn("instead of FAIL", str(caught.exception))
+
+    def test_a_fail_that_was_not_raised_is_refused(self):
+        """Computing FAIL is not the case: the harness has to stop the case.
+
+        A bracket that returns FAIL while ``ingress.require`` lets it through
+        would leave this case green with the misplaced request recorded as a
+        pass, which is the one outcome the live sentence forbids.
+        """
+        with unittest.mock.patch.object(ingress, "require", lambda *args, **kwargs: None):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_packet_wrong_host(self.product())
+        self.assertIn("would have been recorded as a pass", str(caught.exception))
+
+    def test_the_case_is_registered_after_the_matrix_case(self):
+        suite = multi_node.cases(_StubPodman(Path(tempfile.mkdtemp())))
+        cases = {case.id: case for case in suite}
+        ids = [case.id for case in suite]
+        self.assertIn(multi_node.PKT_WRONG_HOST_CASE_ID, cases)
+        self.assertEqual(cases[multi_node.PKT_WRONG_HOST_CASE_ID].topology, "multi-node")
+        self.assertEqual(
+            cases[multi_node.PKT_WRONG_HOST_CASE_ID].timeout_seconds,
+            multi_node.PKT_WRONG_HOST_TIMEOUT_SECONDS,
+        )
+        self.assertLess(ids.index(multi_node.MATRIX_CASE_ID),
+                        ids.index(multi_node.PKT_WRONG_HOST_CASE_ID))
+
+
+class _CompensationContext:
+    """The run context the case hands its two attempt logs to."""
+
+    def __init__(self, root):
+        self.run_id = "podman-multi-node-test-00000000"
+        self.secret_dir = Path(root)
+        self.evidence = {}
+
+    def evidence_text(self, name, text):
+        self.evidence[name] = text
+        return self.secret_dir / name
+
+
+class _CompensationHost:
+    """The Worker the case addresses, with the fixture zone it steers."""
+
+    def __init__(self, root):
+        self.plan = topology.allocate_plan([])
+        self.target_name = "master-test"
+        self.worker_name = "worker-test"
+        self.dns_dir = Path(root) / "dns"
+        self.dns_dir.mkdir(parents=True, exist_ok=True)
+        self.dns_zone_file().write_text(
+            json.dumps({"ttl": 300, "records": {}}), encoding="utf-8",
+        )
+
+    def dns_zone_file(self):
+        return self.dns_dir / topology.DNS_ZONE_NAME
+
+    def write_dns_zone(self, data):
+        self.dns_zone_file().write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+    def pin_worker_address(self, address):
+        self.pinned = address
+        return f"{address} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIworkerkey"
+
+
+def compensation_cluster(host):
+    """A fresh Panel cluster: the Master, the Worker, and the node left behind."""
+    return {
+        "nodes": {
+            "status": 200,
+            "records": [
+                {"name": multi_node.LOCAL_NODE_NAME, "address": "127.0.0.1",
+                 "port": multi_node.NODE_PORT, "connected": True},
+                {"name": topology.WORKER_NODE_NAME, "address": str(host.plan.worker_ip),
+                 "port": multi_node.NODE_PORT, "connected": True},
+                {"name": multi_node.SECOND_WORKER_NODE_NAME,
+                 "address": str(host.plan.second_node_ip), "port": multi_node.NODE_PORT,
+                 "connected": True},
+            ],
+        },
+        "hosts": {
+            "status": 200,
+            "records": [
+                {"address": multi_node.SECOND_WORKER_DOMAIN, "sni": ""},
+                {"address": multi_node.SECOND_WORKER_REALITY_DOMAIN,
+                 "sni": multi_node.SECOND_WORKER_REALITY_DOMAIN},
+            ],
+        },
+    }
+
+
+class _CompensationPodman:
+    """Answers the probes the incomplete-compensation case makes, by marker.
+
+    Each answer is replaceable, so a test damages exactly the field its guard
+    reads: the resolver's reply, the watcher's start, the operator's output, the
+    journal it left behind, or the Worker's own aftermath.
+    """
+
+    def __init__(self, root, host):
+        self.context = _CompensationContext(root)
+        self.host = host
+        self.scripts = []
+        self.resolution = {
+            multi_node.SECOND_WORKER_DOMAIN: [str(host.plan.second_node_ip)],
+            multi_node.SECOND_WORKER_REALITY_DOMAIN: [str(host.plan.second_node_ip)],
+            multi_node.SECOND_WORKER_VISION_DOMAIN: ["gaierror"],
+        }
+        self.address = subprocess.CompletedProcess(
+            ["bash"], 0,
+            f"2: eth0    inet {host.plan.worker_ip}/24 scope global eth0\n"
+            f"2: eth0    inet {host.plan.second_node_ip}/24 scope global secondary eth0\n",
+            "",
+        )
+        self.watcher_start = subprocess.CompletedProcess(["bash"], 0, "watcher_pid=4242\n", "")
+        self.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.attempt_stdout(), self.attempt_stderr(),
+        )
+        self.facts = {
+            "journal": {
+                "op": "node_add",
+                "state": "NODE_ADD_ROLLBACK_REQUIRED",
+                "transaction_id": f"node_add_{multi_node.SECOND_WORKER_NODE_NAME}",
+                "node_name": multi_node.SECOND_WORKER_NODE_NAME,
+                "rollback_error": multi_node.LEDGER_REFUSAL,
+                "entities": {},
+            },
+            "journal_present": True,
+            "state_nodes": [multi_node.LOCAL_NODE_NAME, topology.WORKER_NODE_NAME,
+                            multi_node.SECOND_WORKER_NODE_NAME],
+            "watcher_log": f"emptied the ledger for {multi_node.SECOND_WORKER_NODE_NAME}",
+        }
+        self.aftermath = (
+            "service=inactive\ninstall_root=absent\nacme_vhost=absent\n"
+            "worker_vhost=absent\nstream_map=absent\nnginx_test=0\n"
+        )
+
+    @staticmethod
+    def attempt_stdout():
+        return (
+            f"{multi_node.VISION_STAGE_LINE}\n"
+            "[ROLLBACK] Remote worker deployment failed (exit code: 1). Initiating "
+            "automated compensating rollback...\n"
+            "ACME certificate lineage rollback completed successfully.\n"
+        )
+
+    @staticmethod
+    def attempt_stderr():
+        return (
+            f"{multi_node.REMOTE_FAILURE_LINE}\n"
+            f"{multi_node.LEDGER_REFUSAL}\n"
+            f"{multi_node.API_CRITICAL}\n"
+            f"{multi_node.AGGREGATE_CRITICAL}\n"
+        )
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.scripts.append((name, script))
+        if "ip addr add" in script:
+            return self.address
+        if "getaddrinfo" in script:
+            body = json.dumps(self.resolution)
+        elif "setsid python3" in script:
+            return self.watcher_start
+        elif "gowave-auto.sh node add" in script:
+            return self.add
+        elif "journal_present" in script:
+            body = json.dumps(self.facts)
+        elif "printf 'service=" in script:
+            body = self.aftermath
+        else:  # pragma: no cover - a probe this case does not make
+            body = "{}"
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, body, "")
+
+
+class _CompensationProduct:
+    """The real case's product, with only the two host-facing reads replaced."""
+
+    def __init__(self, podman, host, cluster=None):
+        self.podman = podman
+        self.context = podman.context
+        self.host = host
+        self.cluster = compensation_cluster(host) if cluster is None else cluster
+
+    def require_worker(self):
+        return self.host
+
+    def cluster_facts(self, case_id):
+        return self.cluster
+
+
+class TestVisionCompensationCase(unittest.TestCase):
+    """VIS-06: an incomplete compensation is reported, not hidden.
+
+    The case reads six answers -- the resolver, the watcher's start, the
+    operator's output, the retained journal, the Panel and the Worker -- so each
+    guard is proven by damaging exactly the answer it reads, and the happy path
+    proves that nothing else was needed to pass.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.host = _CompensationHost(self.tmp.name)
+        self.podman = _CompensationPodman(self.tmp.name, self.host)
+
+    def run_case(self, cluster=None):
+        product = _CompensationProduct(self.podman, self.host, cluster=cluster)
+        return multi_node.case_vision_incomplete_compensation(product), product
+
+    def damage(self, fragment, cluster=None):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(cluster=cluster)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_the_failed_compensation_is_reported_and_the_journal_is_retained(self):
+        evidence, product = self.run_case()
+        self.assertEqual(evidence["attempt_returncode"], 1)
+        self.assertEqual(evidence["node_name"], multi_node.SECOND_WORKER_NODE_NAME)
+        self.assertEqual(evidence["journal"]["state"], "NODE_ADD_ROLLBACK_REQUIRED")
+        self.assertEqual(evidence["journal"]["rollback_error"], multi_node.LEDGER_REFUSAL)
+        self.assertEqual(evidence["journal"]["entities"], {})
+        self.assertEqual(evidence["panel"]["nodes"], sorted([
+            multi_node.LOCAL_NODE_NAME, topology.WORKER_NODE_NAME,
+            multi_node.SECOND_WORKER_NODE_NAME,
+        ]))
+        self.assertEqual(evidence["worker_aftermath"]["service"], "inactive")
+        self.assertEqual(evidence["watcher_log"],
+                         f"emptied the ledger for {multi_node.SECOND_WORKER_NODE_NAME}")
+        # The attempt's own two streams are handed back as evidence, not summarised.
+        self.assertEqual(
+            sorted(product.context.evidence),
+            ["mn-node-add-vision-incomplete.stderr.log",
+             "mn-node-add-vision-incomplete.stdout.log"],
+        )
+
+    def test_the_case_asks_the_operator_for_a_second_node_on_the_worker(self):
+        _evidence, product = self.run_case()
+        commands = [script for _name, script in product.podman.scripts
+                    if "gowave-auto.sh node add" in script]
+        self.assertEqual(len(commands), 1, "the case dispatched something else as well")
+        self.assertIn(f"'{multi_node.SECOND_WORKER_NODE_NAME}'", commands[0])
+        self.assertIn(f"--vision-domain '{multi_node.SECOND_WORKER_VISION_DOMAIN}'", commands[0])
+        self.assertIn(f"'{self.host.plan.second_node_ip}'", commands[0])
+        self.assertNotIn(f"'{self.host.plan.worker_ip}'", commands[0])
+
+    def test_the_second_record_reaches_the_worker_through_its_own_address(self):
+        evidence, product = self.run_case()
+        address = str(self.host.plan.second_node_ip)
+        aliases = [(name, script) for name, script in product.podman.scripts
+                   if "ip addr add" in script]
+        self.assertEqual(len(aliases), 1, "the case did not add exactly one address")
+        name, script = aliases[0]
+        self.assertEqual(name, self.host.worker_name,
+                         "the alias was added somewhere other than the Worker")
+        self.assertIn(f"'{address}'", script)
+        # The prefix length comes from the interface that already carries the
+        # Worker, so the alias lands in the same subnet without being assumed.
+        self.assertIn("ip -4 -o addr show scope global", script)
+        self.assertIn("${cidr#*/}", script)
+        self.assertEqual(self.host.pinned, address,
+                         "the address the case asked the operator to trust was not pinned")
+        self.assertEqual(evidence["node_address"], address)
+        self.assertTrue(evidence["address_pinned"].startswith(address))
+
+    def test_the_rendered_address_command_adds_the_alias_and_reports_it(self):
+        """The script is run by bash against a stand-in ``ip``, not read as text.
+
+        ``read`` under ``set -e`` is exactly the kind of line that looks right and
+        ends the script early, so the rendered command is executed against a fake
+        kernel tool and its own exit status and output are the assertion.
+        """
+        bin_dir = Path(self.tmp.name) / "bin"
+        bin_dir.mkdir()
+        log = Path(self.tmp.name) / "ip.log"
+        alias = str(self.host.plan.second_node_ip)
+        worker = str(self.host.plan.worker_ip)
+        (bin_dir / "ip").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'%s\\n\' "$*" >> {log}\n'
+            'case "$*" in\n'
+            '  "-4 -o addr show scope global")\n'
+            f'    printf \'2: eth0    inet {worker}/24 scope global eth0\\n\'\n'
+            "    printf '3: eth1    inet 203.0.114.11/24 scope global eth1\\n'\n"
+            "    ;;\n"
+            '  "addr add "*) ;;\n'
+            '  "-4 -o addr show dev eth0")\n'
+            f'    printf \'2: eth0    inet {worker}/24 scope global eth0\\n\'\n'
+            f'    printf \'2: eth0    inet {alias}/24 scope global secondary eth0\\n\'\n'
+            "    ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "ip").chmod(0o755)
+        completed = subprocess.run(
+            ["bash", "-c", multi_node.second_node_address_script(alias)],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(f"addr add {alias}/24 dev eth0", log.read_text(encoding="utf-8"))
+        self.assertIn(alias, completed.stdout)
+        self.assertIn(worker, completed.stdout)
+
+    def test_the_zone_the_case_writes_answers_for_the_node_and_not_for_its_vision(self):
+        self.run_case()
+        zone = json.loads(self.host.dns_zone_file().read_text(encoding="utf-8"))
+        records = zone["records"]
+        self.assertEqual(records[multi_node.SECOND_WORKER_DOMAIN]["A"],
+                         [str(self.host.plan.second_node_ip)])
+        self.assertNotIn(multi_node.SECOND_WORKER_VISION_DOMAIN, records)
+
+    def test_the_case_fails_when_the_worker_does_not_hold_the_second_address(self):
+        self.podman.address = subprocess.CompletedProcess(
+            ["bash"], 0, f"2: eth0    inet {self.host.plan.worker_ip}/24 scope global eth0\n",
+            "",
+        )
+        self.damage("does not hold the second address")
+
+    def test_the_case_fails_when_the_attempt_exits_zero(self):
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 0, self.podman.attempt_stdout(), self.podman.attempt_stderr(),
+        )
+        self.damage("exited 0")
+
+    def test_the_case_fails_when_the_failure_came_from_another_stage(self):
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, "Fatal: upstream installer failed with exit code 1\n",
+            f"{multi_node.REMOTE_FAILURE_LINE}\n",
+        )
+        self.damage("never reached the Vision certificate stage")
+
+    def test_the_case_fails_when_the_remote_failure_is_not_reported(self):
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), "",
+        )
+        self.damage("did not report the remote failure")
+
+    def test_the_case_fails_when_the_rollback_refusal_is_suppressed(self):
+        stderr = self.podman.attempt_stderr().replace(
+            f"{multi_node.LEDGER_REFUSAL}\n", "",
+        )
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("was suppressed")
+
+    def test_the_case_fails_when_the_incomplete_api_rollback_is_not_reported(self):
+        stderr = self.podman.attempt_stderr().replace(f"{multi_node.API_CRITICAL}\n", "")
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("not reported as a CRITICAL result")
+
+    def test_the_case_fails_when_the_remote_host_is_also_reported_as_failed(self):
+        stderr = self.podman.attempt_stderr() + f"{multi_node.REMOTE_CRITICAL}\n"
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("cannot attribute the incomplete result")
+
+    def test_the_case_fails_when_the_aggregate_result_is_missing(self):
+        stderr = self.podman.attempt_stderr().replace(
+            f"{multi_node.AGGREGATE_CRITICAL}\n", "",
+        )
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("aggregate result of both rollbacks was not reported")
+
+    def test_the_case_fails_when_the_product_calls_the_node_deployed(self):
+        stderr = self.podman.attempt_stderr() + f"{multi_node.SUCCESS_LINE}\n"
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("reports the Worker as added and deployed")
+
+    def test_the_case_fails_when_the_journal_was_removed(self):
+        self.podman.facts["journal_present"] = False
+        self.damage("was removed, so the incomplete transaction is not retained")
+
+    def test_the_case_fails_when_the_journal_does_not_ask_for_an_operator(self):
+        self.podman.facts["journal"]["state"] = "NODE_ADD_ROLLED_BACK"
+        self.damage("instead of NODE_ADD_ROLLBACK_REQUIRED")
+
+    def test_the_case_fails_when_the_journal_names_no_reason(self):
+        self.podman.facts["journal"]["rollback_error"] = ""
+        self.damage("does not carry the refusal as its reason")
+
+    def test_the_case_fails_when_the_journal_names_another_node(self):
+        self.podman.facts["journal"]["node_name"] = topology.WORKER_NODE_NAME
+        self.damage("the retained journal names")
+
+    def test_the_case_fails_when_the_ledger_it_emptied_is_back(self):
+        self.podman.facts["journal"]["entities"] = [
+            {"type": "node", "action": "created", "uuid": "uuid-digest"},
+        ]
+        self.damage("the ledger the watcher emptied is back")
+
+    def test_the_case_fails_when_the_panel_no_longer_lists_the_node(self):
+        cluster = compensation_cluster(self.host)
+        cluster["nodes"]["records"] = [
+            record for record in cluster["nodes"]["records"]
+            if record["name"] != multi_node.SECOND_WORKER_NODE_NAME
+        ]
+        self.damage("lists no node named", cluster=cluster)
+
+    def test_the_case_fails_when_the_panel_lists_another_count(self):
+        cluster = compensation_cluster(self.host)
+        cluster["nodes"]["records"].append({
+            "name": "worker-3", "address": str(self.host.plan.worker_ip),
+            "port": multi_node.NODE_PORT, "connected": False,
+        })
+        self.damage("instead of the Master, the Worker", cluster=cluster)
+
+    def test_the_case_fails_when_the_vision_name_resolves_to_the_worker(self):
+        self.podman.resolution[multi_node.SECOND_WORKER_VISION_DOMAIN] = [
+            str(self.host.plan.second_node_ip),
+        ]
+        self.damage("would have validated")
+
+    def test_the_case_fails_when_the_watcher_never_started(self):
+        self.podman.watcher_start = subprocess.CompletedProcess(
+            ["bash"], 1, "", "setsid: not found",
+        )
+        self.damage("could not be started on the Master")
+
+
+PARTIAL_SUCCESS_UUID = "3d5c9a71-6f24-4b8e-9c07-2a1f5e8d4b63"
+
+PARTIAL_SUCCESS_OUTPUT = f"""\
+==> Onboarding worker-1
+
+Could not read the SSH host key of worker-2.
+
+=== Node Onboarding Summary ===
+  worker-1: registered and verified in the Panel (uuid {PARTIAL_SUCCESS_UUID})
+  worker-2: failed (phase: scan, reason: Could not read the SSH host key of worker-2.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry a failed node from the list below, or add one from the menu (option 3).
+
+=== Retry Diagnostics for worker-2 ===
+No recovery journal found at /opt/gowave/recovery/journal.json
+SSH reachability check...
+SSH unreachable: worker-2
+VPS managed state check...
+VPS not managed (no SSH key auth).
+=== End Diagnostics ===
+
+Some nodes failed. Select a node to retry, or skip:
+  1) worker-2
+  2) Skip retry for all failed nodes
+Choice: Retry skipped.
+GOWAVE_ONBOARD_EXIT=2
+"""
+
+REFUSED_OUTPUT = f"""\
+No local Panel found on this host.
+Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}...
+Panel API unreachable.
+GOWAVE_WIZARD_EXIT=1
+"""
+
+
+def refused_resolution_report(resolution="", mode="remove"):
+    """What the resolution probe prints for the refusal case's own name.
+
+    The probe runs in ``remove`` mode and reports what ``getent`` answers; the
+    default is the premise the case needs — nothing answers the name.
+    """
+    return json.dumps({
+        "mode": mode,
+        "host": aio.ADD_NODE_REFUSED_PANEL,
+        "address": "",
+        "resolution": resolution,
+        "marker_count": 0,
+        "request": None,
+    })
+
+
+class _WizardCaseTarget:
+    target_name = "master-test"
+    # The address the deployment plan registered its Worker under. The script
+    # the wizard cases run is text, so the value only has to be an address the
+    # identity marker can carry.
+    plan = topology.NetworkPlan(subnet="10.99.1.0/24")
+
+
+class _WizardCasePodman:
+    """Answers one shell run with prepared bytes; the cases read nothing else from it."""
+
+    def __init__(self, stdout="", returncode=0, stderr=""):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.scripts = []
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.scripts.append(script)
+        if aio.ADD_NODE_REFUSED_PROBE_MARKER in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc", script], 0, refused_resolution_report(), "",
+            )
+        return subprocess.CompletedProcess(
+            ["bash", "-lc", script], self.returncode, self.stdout, self.stderr,
+        )
+
+
+class _WizardCaseProduct:
+    """The product surface the wizard-orchestration cases use: a shell run and the Panel.
+
+    Neither case provisions a role: both drive code inside the Master and compare
+    the Panel's node list around it, so a fake that answers the script once and
+    hands back the recorded surfaces in order is the whole environment they need.
+    """
+
+    def __init__(self, stdout="", returncode=0, surfaces=(), stderr=""):
+        self.podman = _WizardCasePodman(stdout, returncode, stderr)
+        self._surfaces = list(surfaces)
+
+    def require_installed(self):
+        return _WizardCaseTarget()
+
+    def panel_surface(self, case_id):
+        if not self._surfaces:
+            raise AssertionError(f"{case_id}: the case read more Panel surfaces than the fake holds")
+        return self._surfaces.pop(0)
+
+
+def panel_nodes(names, connected=None, uuids=None):
+    return {
+        "surface": {
+            "nodes": {
+                "status": 200,
+                "names": list(names),
+                "connected": dict(connected or {}),
+                "uuids": dict(uuids if uuids is not None else {
+                    name: PARTIAL_SUCCESS_UUID for name in names
+                }),
+            },
+        },
+    }
+
+
+class TestPartialSuccessCase(unittest.TestCase):
+    """MN-PARTIAL-SUCCESS: one Worker fails, its sibling survives, the code says so."""
+
+    def partial(self, *, stdout=PARTIAL_SUCCESS_OUTPUT, returncode=2,
+                before=("worker-1",), after=("worker-1",),
+                connected_before=None, connected_after=None, uuids=None):
+        product = _WizardCaseProduct(
+            stdout,
+            returncode,
+            surfaces=[
+                panel_nodes(before, connected_before or {"worker-1": True}, uuids),
+                panel_nodes(after, connected_after or {"worker-1": True}),
+            ],
+        )
+        return multi_node.case_partial_success(product), product
+
+    def test_a_partial_success_is_reported_with_its_phase_diagnostic_and_exit_code(self):
+        facts, product = self.partial()
+        self.assertEqual(facts.get("partial_success_exit_code"), 2)
+        self.assertEqual(facts.get("successful_sibling"), topology.WORKER_NODE_NAME)
+        self.assertEqual(facts.get("failed_node"), "worker-2")
+        self.assertEqual(facts.get("failed_phase"), "scan")
+        self.assertTrue(facts.get("selective_retry_named_only_the_failed_node"))
+        self.assertIs(facts.get("successful_sibling_connected_before"), True)
+        self.assertIs(facts.get("successful_sibling_connected_after"), True)
+        script = product.podman.scripts[-1]
+        self.assertIn("wizard_onboard_nodes", script)
+        self.assertIn("ssh_bootstrap_onboard_one()", script)
+        self.assertIn("GOWAVE_PLAN_NODE_NAMES=(", script)
+        self.assertIn("NODE-IDENTITY:", script)
+        self.assertNotIn(PARTIAL_SUCCESS_UUID, script,
+                         "the case wrote the uuid it then requires, so the summary proves nothing")
+
+    def test_a_clean_exit_code_for_a_partial_failure_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(returncode=0)
+        self.assertIn("partial-success code", str(caught.exception))
+
+    def test_a_summary_without_the_failed_phase_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            "worker-2: failed (phase: scan, reason:", "worker-2: failed (reason:",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("without the phase", str(caught.exception))
+
+    def test_a_summary_that_calls_the_sibling_a_success_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            f"worker-1: registered and verified in the Panel (uuid {PARTIAL_SUCCESS_UUID})",
+            "worker-1: success",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("Panel's own uuid", str(caught.exception))
+
+    def test_a_uuid_the_panel_did_not_answer_for_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            PARTIAL_SUCCESS_UUID, "00000000-0000-4000-8000-000000000000",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("uuid the Panel did not answer", str(caught.exception))
+
+    def test_a_summary_that_counts_the_failed_node_as_verified_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            "Registered and verified in the Panel: 1 of 2.",
+            "Registered and verified in the Panel: 2 of 2.",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("did not count one verified node", str(caught.exception))
+
+    def test_a_panel_that_answers_no_uuid_leaves_nothing_to_compare(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(uuids={"worker-1": ""})
+        self.assertIn("reports no uuid", str(caught.exception))
+
+    def test_a_retry_offer_that_names_the_successful_sibling_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            "  1) worker-2\n", "  1) worker-2\n  2) worker-1\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("that succeeded", str(caught.exception))
+
+    def test_a_sibling_that_stopped_being_connected_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(connected_after={"worker-1": False})
+        self.assertIn("stopped being connected", str(caught.exception))
+
+    def test_the_case_needs_the_deployed_sibling_to_compare_against(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(before=(), after=())
+        self.assertIn("absent before the partial run", str(caught.exception))
+
+
+WIZARD_FLOW_UUID = "b41d7f0e-25c9-4a63-8e51-0c7d9a3b6f28"
+
+WIZARD_FLOW_STDERR = """\
+Select language / Выберите язык [en/ru]: Select deployment scheme (where will the Panel and the nodes run?)
+1) Panel and one node on this server — for evaluation and personal use. Losing this server loses the Panel and its only node.
+2) Panel here, nodes on separate servers — recommended for failure isolation. This server manages the nodes and carries no client traffic.
+3) Panel and one node here, more nodes elsewhere — not recommended: losing this server takes out the Panel and one of the nodes.
+> Panel domain (the address you open in a browser): Camouflage domain (a different host that answers probes to the Panel domain): Enable Vision for panel.invalid? [y/N]: Local node name in the Panel and subscriptions (e.g. local-01): Email for Let's Encrypt notices (not the Panel login): How many remote nodes should be onboarded? Node 1 primary domain: Node 1 camouflage domain: Enable Vision for worker-1.invalid? [y/N]: Remote node 1 name in the Panel and subscriptions (e.g. ams-01): Node 2 primary domain: Node 2 camouflage domain: worker-2.invalid is already used by an answer you already gave in this card in this plan.
+Node 2 camouflage domain: cdn1.invalid is already used by node 1 camouflage domain in this plan.
+Node 2 camouflage domain: Enable Vision for worker-2.invalid? [y/N]: Remote node 2 name in the Panel and subscriptions (e.g. ams-01): Do all hosts share one registered domain? [y/N]: Choice: Retry onboarding for worker-2.invalid now? [y/N]: Choice: Select option [0-9]: """
+
+WIZARD_FLOW_OUTPUT = f"""\
+PLAN-BEGIN
+Installation plan:
+  Panel (local-01): panel=panel.invalid camouflage=cdn.invalid vision=none
+  node 1 (worker-1): panel=worker-1.invalid camouflage=cdn1.invalid vision=none
+  node 2 (worker-2): panel=worker-2.invalid camouflage=cdn2.invalid vision=none
+Certificates this plan spends: 6
+Exit country: asked of each node after it serves, so nothing here contacts a country service
+Registered domain: one per host
+Each host uses its own registered domain, so each host spends its own Let's Encrypt budget.
+
+PLAN-END rc=0
+PLAN-VARIANT\tmulti-node
+PLAN-PANEL\tpanel.invalid\tcdn.invalid\tlocal-01\tadmin@example.invalid
+PLAN-COUNT\t2
+PLAN-NODES\tworker-1.invalid worker-2.invalid
+PLAN-COVERS\tcdn1.invalid cdn2.invalid
+PLAN-LABELS\tworker-1 worker-2
+ONBOARD-BEGIN
+
+Could not read the SSH host key of worker-2.invalid.
+
+=== Node Onboarding Summary ===
+  Panel installed: https://panel.invalid
+  worker-1.invalid: registered and verified in the Panel (uuid {WIZARD_FLOW_UUID})
+  worker-2.invalid: failed (phase: scan, reason: Could not read the SSH host key of worker-2.invalid.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry a failed node from the list below, or add one from the menu (option 3).
+
+=== Retry Diagnostics for worker-2.invalid ===
+No recovery journal found at /tmp/wizard-flow/journal-absent.json
+SSH reachability check...
+SSH host key: worker-2.invalid SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+VPS managed state check...
+VPS not managed (no SSH key auth).
+=== End Diagnostics ===
+
+Some nodes failed. Select a node to retry, or skip:
+  1) worker-2.invalid
+  2) Skip retry for all failed nodes
+Retrying worker-2.invalid...
+
+Permission denied (publickey) on worker-2.invalid.
+
+=== Node Onboarding Summary ===
+  Panel installed: https://panel.invalid
+  worker-1.invalid: registered and verified in the Panel (uuid {WIZARD_FLOW_UUID})
+  worker-2.invalid: failed (phase: authorise, reason: Permission denied (publickey) on worker-2.invalid.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry a failed node from the list below, or add one from the menu (option 3).
+
+Some nodes failed. Select a node to retry, or skip:
+  1) worker-2.invalid
+  2) Skip retry for all failed nodes
+Retry skipped.
+
+ONBOARD-END rc=2
+CALLS-BEGIN
+worker-1.invalid\tscan add_node\tok
+worker-2.invalid\tscan\tfailed
+worker-2.invalid\tauthorise\tfailed
+CALLS-END
+MENU-BEGIN
+GoWave Auto NGINX Manager
+
+ 1) Status
+ 2) New installation
+ 3) Add a node to an existing Panel
+ 0) Exit
+
+MENU-END rc=0
+"""
+
+
+class TestWizardFlowCase(unittest.TestCase):
+    """MN-WIZARD-FLOW: one plan card, a mixed batch, one retry, the menu."""
+
+    def flow(self, *, stdout=WIZARD_FLOW_OUTPUT, stderr=WIZARD_FLOW_STDERR,
+             returncode=2, before=("worker-1",), after=("worker-1",), uuids=None):
+        product = _WizardCaseProduct(
+            stdout,
+            returncode,
+            stderr=stderr,
+            surfaces=[
+                panel_nodes(before, {"worker-1": True},
+                            uuids if uuids is not None else {"worker-1": WIZARD_FLOW_UUID}),
+                panel_nodes(after, {"worker-1": True}),
+            ],
+        )
+        return multi_node.case_wizard_flow(product), product
+
+    def test_the_flow_corrects_one_field_registers_one_node_and_retries_one(self):
+        facts, product = self.flow()
+        self.assertEqual(facts.get("plan_variant"), "multi-node")
+        self.assertEqual(facts.get("plan_nodes"), ["worker-1.invalid", "worker-2.invalid"])
+        self.assertEqual(facts.get("plan_cover_domains"), ["cdn1.invalid", "cdn2.invalid"])
+        self.assertEqual(facts.get("registered_uuid"), WIZARD_FLOW_UUID)
+        self.assertEqual(facts.get("failed_worker"), "worker-2.invalid")
+        self.assertEqual(facts.get("retry_attempted_only_for"), "worker-2.invalid")
+        self.assertEqual(facts.get("final_verified_count"), "1 of 2")
+        self.assertEqual(facts.get("menu_returncode"), 0)
+        self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
+        self.assertEqual(
+            facts.get("onboarding_calls"),
+            ["worker-1.invalid\tscan add_node\tok",
+             "worker-2.invalid\tscan\tfailed",
+             "worker-2.invalid\tauthorise\tfailed"],
+        )
+        script = product.podman.scripts[-1]
+        self.assertIn("wizard_collect_plan", script)
+        self.assertIn("wizard_onboard_nodes", script)
+        self.assertIn("cmd_interactive", script)
+        self.assertIn("ssh_bootstrap_onboard_one()", script)
+        self.assertIn("NODE-IDENTITY:", script)
+        self.assertNotIn(WIZARD_FLOW_UUID, script,
+                         "the case wrote the uuid it then requires, so the summary proves nothing")
+
+    def test_the_card_carries_the_two_duplicate_cover_answers_then_the_correction(self):
+        _facts, product = self.flow()
+        script = product.podman.scripts[-1]
+        self.assertIn(
+            "\nworker-2.invalid\nworker-2.invalid\ncdn1.invalid\ncdn2.invalid\n", script,
+            "the card has to enter node 2's own domain as its cover answer and node 1's cover "
+            "domain before the corrected one",
+        )
+
+    def test_a_refusal_that_repeats_the_whole_card_fails_the_case(self):
+        damaged = WIZARD_FLOW_STDERR.replace(
+            "Panel domain (the address you open in a browser): ",
+            "Panel domain (the address you open in a browser): "
+            "Panel domain (the address you open in a browser): ",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stderr=damaged)
+        self.assertIn("instead of 1", str(caught.exception))
+
+    def test_a_refusal_that_does_not_name_the_colliding_role_fails_the_case(self):
+        damaged = WIZARD_FLOW_STDERR.replace(
+            "cdn1.invalid is already used by node 1 camouflage domain in this plan.", "",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stderr=damaged)
+        self.assertIn("did not name the role", str(caught.exception))
+
+    def test_a_plan_that_kept_the_duplicate_cover_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            "PLAN-COVERS\tcdn1.invalid cdn2.invalid",
+            "PLAN-COVERS\tcdn1.invalid worker-2.invalid",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("PLAN-COVERS", str(caught.exception))
+
+    def test_a_batch_that_ends_at_a_clean_exit_code_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace("ONBOARD-END rc=2", "ONBOARD-END rc=0")
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("partial-success code 2", str(caught.exception))
+
+    def test_a_retry_that_onboards_the_successful_node_again_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            "worker-1.invalid\tscan add_node\tok\n"
+            "worker-2.invalid\tscan\tfailed\n",
+            "worker-1.invalid\tscan add_node\tok\n"
+            "worker-1.invalid\tscan add_node\tok\n"
+            "worker-2.invalid\tscan\tfailed\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("re-enter only the failed one", str(caught.exception))
+
+    def test_a_summary_that_quotes_a_uuid_the_panel_did_not_answer_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            WIZARD_FLOW_UUID, "00000000-0000-4000-8000-000000000000",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("Panel's own uuid", str(caught.exception))
+
+    def test_a_retry_offer_that_names_the_registered_worker_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            "  1) worker-2.invalid\n",
+            "  1) worker-2.invalid\n  1) worker-1.invalid\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("named a node other than the failed one", str(caught.exception))
+
+    def test_a_flow_that_does_not_return_to_the_menu_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace("MENU-END rc=0", "MENU-END rc=1")
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("returned to a menu", str(caught.exception))
+
+    def test_a_plan_that_was_applied_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(after=("worker-1", "worker-2.invalid"))
+        self.assertIn("applied the plan", str(caught.exception))
+
+    def test_a_panel_that_answers_no_uuid_leaves_nothing_to_compare(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(uuids={"worker-1": ""})
+        self.assertIn("reports no uuid", str(caught.exception))
+
+    def test_a_worker_absent_before_the_flow_blocks_with_its_name(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(before=("local-node",))
+        self.assertIn("is absent before the flow", str(caught.exception))
+
+
+class TestAddNodeRefusedCase(unittest.TestCase):
+    """MN-ADD-NODE-REFUSED: refused before any Worker mutation."""
+
+    def refused(self, *, stdout=REFUSED_OUTPUT, returncode=1,
+                before=("worker-1",), after=("worker-1",)):
+        product = _WizardCaseProduct(
+            stdout,
+            returncode,
+            surfaces=[
+                panel_nodes(before, {"worker-1": True}),
+                panel_nodes(after, {"worker-1": True}),
+            ],
+        )
+        return multi_node.case_add_node_refused(product), product
+
+    @staticmethod
+    def wizard_script(product):
+        matches = [s for s in product.podman.scripts if "wizard_add_node_to_panel" in s]
+        if len(matches) != 1:
+            raise AssertionError(f"the case ran {len(matches)} wizard scripts, not one")
+        return matches[0]
+
+    def test_a_refused_attempt_reports_verification_and_leaves_the_panel_alone(self):
+        facts, product = self.refused()
+        self.assertEqual(facts.get("panel_address"), aio.ADD_NODE_REFUSED_PANEL)
+        self.assertTrue(facts.get("verification_failure_reported"))
+        self.assertEqual(facts.get("wizard_returncode"), 1)
+        self.assertFalse(facts.get("mutation_boundary_reached"))
+        self.assertTrue(facts.get("verification_step_reached"))
+        self.assertEqual(facts.get("panel_node_names_before"), ["worker-1"])
+        self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
+        self.assertNotIn("node add", self.wizard_script(product))
+
+    def test_the_case_reads_the_resolution_before_it_drives_the_wizard(self):
+        _facts, product = self.refused()
+        probes = [s for s in product.podman.scripts if aio.ADD_NODE_REFUSED_PROBE_MARKER in s]
+        self.assertEqual(len(probes), 1, "the premise is read once, before the wizard")
+        self.assertIn(aio.ADD_NODE_REFUSED_PANEL, probes[0])
+        self.assertLess(
+            product.podman.scripts.index(probes[0]),
+            product.podman.scripts.index(self.wizard_script(product)),
+        )
+
+    def test_a_reached_mutation_boundary_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(stdout=REFUSED_OUTPUT + "GOWAVE_CMD_NODE_CALLED\n")
+        self.assertIn("mutation began", str(caught.exception))
+
+    def test_a_refusal_without_a_verification_message_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(stdout="No local Panel found on this host.\n")
+        self.assertIn("verification failure", str(caught.exception))
+
+    def test_a_changed_panel_node_list_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(after=("worker-1", "worker-invalid"))
+        self.assertIn("changed the Panel's node list", str(caught.exception))
+
+
+ENV_CONTRACT_KNOWN_HOSTS = "/root/.ssh/known_hosts"
+ENV_CONTRACT_ADDRESS = "192.0.2.12"
+ENV_CONTRACT_BEFORE_STATE = json.dumps({
+    "nodes": [
+        {"name": "local-node", "address": "192.0.2.10"},
+        {"name": "worker-1", "address": "192.0.2.11"},
+    ],
+})
+ENV_CONTRACT_BEFORE_JOURNAL = json.dumps({
+    "op": "node_add",
+    "state": "NODE_ADD_COMMITTED",
+    "node_name": "worker-1",
+    "entities": [{"action": "created", "type": "node", "uuid": "node-1"}],
+})
+ENV_CONTRACT_BEFORE_ZONE = {
+    "records": {
+        "master.example": {"A": ["192.0.2.10"]},
+        "worker.example": {"A": ["192.0.2.11"]},
+        "reality.example": {"A": ["192.0.2.11"]},
+    },
+}
+
+
+class _EnvContractContext:
+    """The run context the case writes the operator's own logs into."""
+
+    def __init__(self):
+        self.evidence = {}
+
+    def evidence_text(self, name, text):
+        self.evidence[name] = text
+
+
+class _EnvContractHost:
+    """The pair as the case addresses it: the record files and a spare host."""
+
+    target_name = "master-test"
+
+    def __init__(self, product):
+        self.product = product
+        self.plan = type("Plan", (), {
+            "worker_ip": "192.0.2.11",
+            "second_node_ip": ENV_CONTRACT_ADDRESS,
+        })()
+        self.context = type("Context", (), {
+            "resource_name": staticmethod(lambda prefix: f"{prefix}-test"),
+        })()
+
+    def dns_zone_file(self):
+        return self.product.zone_path
+
+    def write_dns_zone(self, data):
+        self.product.zone_writes.append(copy.deepcopy(data))
+        self.zone_path = self.product.zone_path
+        self.zone_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+    def start_secondary_worker(self, container, address, domains):
+        self.product.podman.containers.append(container)
+        return {
+            "container": container,
+            "address": address,
+            "domains": sorted(domains),
+            "systemd": "ready",
+        }
+
+    def pin_secondary_trust(self, container, address):
+        # The real pin appends the host's key under the address, which is what the
+        # case has to take back out; a fake that returned a dict alone would leave
+        # the restore assertion with nothing to restore.
+        self.product.podman.files[ENV_CONTRACT_KNOWN_HOSTS] += f"{address} ssh-ed25519 AAAAcase\n"
+        return {"container": container, "address": address}
+
+
+class _EnvContractPodman:
+    """The Master's shell, answering what this case's runs actually ask for.
+
+    Three answers come back over one connection — the record probe, the resolver's
+    answer and the product's own compensation report — and the record files change
+    under the case between them, so a fake that returned fixed bytes could not show
+    a restore that did not land.
+    """
+
+    def __init__(self, product):
+        self.product = product
+        self.files = {
+            multi_node.NODE_ADD_STATE: ENV_CONTRACT_BEFORE_STATE,
+            multi_node.NODE_ADD_JOURNAL: ENV_CONTRACT_BEFORE_JOURNAL,
+            ENV_CONTRACT_KNOWN_HOSTS: "192.0.2.11 ssh-ed25519 AAAAworker\n",
+        }
+        self.before = dict(self.files)
+        self.scripts = []
+        self.containers = ["master-test", "worker-test"]
+        self.stopped = []
+        self.removed = []
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.scripts.append(script)
+        if "gowave-auto.sh node add" in script:
+            return self._result(script, self.product.add(self.files))
+        if "rollback_provisioning" in script:
+            return self._result(script, self.product.compensate(self))
+        if "sha256" in script:
+            return self._result(script, (0, self._records()))
+        if "getaddrinfo" in script:
+            return self._result(script, (0, json.dumps(self.product.resolution())))
+        raise AssertionError(f"the case ran a script this fake does not answer: {script[:200]}")
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        self.scripts.append(" ".join(argv))
+        if argv[:1] == ["cat"]:
+            return self._result(argv, (0, self.files.get(argv[1], "")))
+        if argv[:2] == ["bash", "-c"] and "cat > " in argv[2]:
+            path = argv[2].rsplit("cat > ", 1)[1].strip()
+            if self.product.restore:
+                self.files[path] = input_text or ""
+            return self._result(argv, (0, ""))
+        raise AssertionError(f"the case ran an argv this fake does not answer: {argv}")
+
+    def stop(self, name, timeout_seconds=30):
+        self.stopped.append(name)
+        return 0
+
+    def remove(self, name):
+        self.removed.append(name)
+        if name in self.containers:
+            self.containers.remove(name)
+        return 0
+
+    def run_containers(self):
+        return [{"name": name, "state": "running", "status": ""} for name in self.containers]
+
+    def _records(self):
+        """The shipped probe's own answer: sha256 of the bytes, plus the node list."""
+        state = json.loads(self.files[multi_node.NODE_ADD_STATE])
+        journal = json.loads(self.files[multi_node.NODE_ADD_JOURNAL])
+        nodes = [node for node in (state.get("nodes") or []) if isinstance(node, dict)]
+        return json.dumps({
+            "state_digest": hashlib.sha256(
+                self.files[multi_node.NODE_ADD_STATE].encode("utf-8"),
+            ).hexdigest(),
+            "journal_digest": hashlib.sha256(
+                self.files[multi_node.NODE_ADD_JOURNAL].encode("utf-8"),
+            ).hexdigest(),
+            "journal_state": journal.get("state"),
+            "journal_node_name": journal.get("node_name"),
+            "state_nodes": sorted(str(node.get("name") or "") for node in nodes),
+            "state_addresses": sorted(str(node.get("address") or "") for node in nodes),
+        }, sort_keys=True)
+
+    @staticmethod
+    def _result(argv, answer):
+        returncode, stdout = answer
+        command = [str(part) for part in argv] if isinstance(argv, (list, tuple)) else ["bash", "-lc", argv]
+        return subprocess.CompletedProcess(command, returncode, stdout, "")
+
+
+class _EnvContractProduct:
+    """The Master's Panel and the product's own answers around one registration."""
+
+    def __init__(self, *, zone_path, add_returncode=0, registered_name="worker-env", resolves=True,
+                 connected=None, undo_refusal=False, restore=True):
+        self.context = _EnvContractContext()
+        self.podman = _EnvContractPodman(self)
+        self.host = _EnvContractHost(self)
+        self.zone_path = Path(zone_path)
+        self.zone_writes = []
+        self.nodes = [
+            {"name": "local-node", "address": "192.0.2.10"},
+            {"name": "worker-1", "address": "192.0.2.11"},
+        ]
+        self.add_returncode = add_returncode
+        self.registered_name = registered_name
+        self.resolves = resolves
+        self.connected = dict(connected or {})
+        self.undo_refusal = undo_refusal
+        self.restore = restore
+        self.compensations = 0
+
+    def require_installed(self):
+        return self.host
+
+    def wait_for_nodes(self, case_id, expected):
+        names = [node["name"] for node in self.nodes]
+        if len(names) != expected:
+            raise AssertionError(
+                f"{case_id}: the Panel reports {len(names)} nodes, not {expected}: {names}"
+            )
+        return {"nodes": {"names": names, "connected": self._connected(names)}}
+
+    def panel_surface(self, case_id):
+        names = [node["name"] for node in self.nodes]
+        return {
+            "surface": {
+                "nodes": {
+                    "status": 200,
+                    "count": len(names),
+                    "names": names,
+                    "endpoints": [
+                        f"{node['address']}:{multi_node.NODE_PORT}" for node in self.nodes
+                    ],
+                    "connected": self._connected(names),
+                },
+                "hosts": {"count": len(names) + 1},
+                "profiles": {"count": len(names)},
+                "squads": {"count": 1},
+                "tokens": {"count": 1},
+                "unauthenticated_nodes_status": 401,
+            },
+        }
+
+    def add(self, files):
+        """The product's own registration: the record files and the Panel both move."""
+        if self.add_returncode == 0:
+            journal = json.loads(files[multi_node.NODE_ADD_JOURNAL])
+            journal.update({"state": "NODE_ADD_COMMITTED", "node_name": self.registered_name})
+            files[multi_node.NODE_ADD_JOURNAL] = json.dumps(journal)
+            state = json.loads(files[multi_node.NODE_ADD_STATE])
+            state["nodes"].append({"name": self.registered_name, "address": ENV_CONTRACT_ADDRESS})
+            files[multi_node.NODE_ADD_STATE] = json.dumps(state)
+            self.nodes.append({"name": self.registered_name, "address": ENV_CONTRACT_ADDRESS})
+        return self.add_returncode, ""
+
+    def compensate(self, podman):
+        """``rollback_provisioning`` as the Master runs it: both records move back."""
+        self.compensations += 1
+        if self.undo_refusal:
+            return 3, json.dumps({
+                "refused": True,
+                "state": "NODE_ADD_COMMITTED",
+                "node_name": "worker-1",
+            })
+        journal = json.loads(podman.files[multi_node.NODE_ADD_JOURNAL])
+        journal["state"] = "NODE_ADD_ROLLED_BACK"
+        podman.files[multi_node.NODE_ADD_JOURNAL] = json.dumps(journal)
+        state = json.loads(podman.files[multi_node.NODE_ADD_STATE])
+        state["nodes"] = [
+            node for node in state["nodes"] if node.get("name") != self.registered_name
+        ]
+        podman.files[multi_node.NODE_ADD_STATE] = json.dumps(state)
+        self.nodes = [node for node in self.nodes if node["name"] != self.registered_name]
+        return 0, json.dumps({
+            "refused": False,
+            "rolled_back": True,
+            "state_after": "NODE_ADD_ROLLED_BACK",
+        })
+
+    def resolution(self):
+        address = ENV_CONTRACT_ADDRESS if self.resolves else "192.0.2.99"
+        return {
+            multi_node.SECOND_WORKER_DOMAIN: [address],
+            multi_node.SECOND_WORKER_REALITY_DOMAIN: [address],
+            multi_node.SECOND_WORKER_VISION_DOMAIN: ["NXDOMAIN"],
+        }
+
+    def _connected(self, names):
+        return {name: self.connected.get(name, True) for name in names}
+
+
+class TestEnvContractCase(unittest.TestCase):
+    """MN-ENV-CONTRACT: the case body itself runs, not only its assertions.
+
+    The case had no unit test at all, so a name it referenced but never resolved
+    (`REPO_IN_CONTAINER` without its `topology.` qualifier) survived every change
+    and only surfaced as a `NameError` inside a 19-minute rootful run. Driving the
+    body with a fake product is the cheap check that reaches that failure — and,
+    now that the case registers a host of its own, that the pair is put back.
+    """
+
+    def setUp(self):
+        # The zone the fixture serves is a real file the case rewrites and puts
+        # back, so it lives in a directory this test owns and removes.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.zone_path = Path(directory.name) / "zone.json"
+        self.zone_path.write_text(
+            json.dumps(ENV_CONTRACT_BEFORE_ZONE, sort_keys=True), encoding="utf-8",
+        )
+
+    def run_case(self, **kwargs):
+        product = _EnvContractProduct(zone_path=self.zone_path, **kwargs)
+        return multi_node.case_env_contract(product), product
+
+    def run_failing(self, **kwargs):
+        product = _EnvContractProduct(zone_path=self.zone_path, **kwargs)
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_env_contract(product)
+        return product, caught.exception
+
+    def add_script(self, product):
+        return next(
+            script for script in product.podman.scripts if "gowave-auto.sh node add" in script
+        )
+
+    def test_the_environment_contract_is_what_node_add_receives(self):
+        facts, product = self.run_case()
+        script = self.add_script(product)
+        self.assertIn(f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add", script)
+        for export in (
+            "GOWAVE_NODE_NAME='worker-env'",
+            f"GOWAVE_NODE_IP='{ENV_CONTRACT_ADDRESS}'",
+            f"GOWAVE_WORKER_DOMAIN='{multi_node.SECOND_WORKER_DOMAIN}'",
+            f"GOWAVE_REALITY_DOMAIN='{multi_node.SECOND_WORKER_REALITY_DOMAIN}'",
+            "GOWAVE_SSH_USER='root'",
+            "GOWAVE_SSH_PORT='22'",
+            "GOWAVE_VISION_DOMAIN=''",
+        ):
+            self.assertIn(export, script)
+        self.assertTrue(facts.get("environment_contract_used"))
+        self.assertEqual(facts.get("node_add_returncode"), 0)
+        self.assertEqual(facts.get("env_worker_name"), "worker-env")
+        self.assertEqual(facts.get("env_worker_address"), ENV_CONTRACT_ADDRESS)
+        self.assertEqual(facts.get("worker_endpoint"), f"{ENV_CONTRACT_ADDRESS}:{multi_node.NODE_PORT}")
+        self.assertIn(
+            f"{ENV_CONTRACT_ADDRESS}:{multi_node.NODE_PORT}",
+            facts.get("panel_node_endpoints") or [],
+        )
+        self.assertIs(facts.get("panel_node_connected", {}).get("worker-env"), True)
+
+    def test_the_registration_does_not_borrow_the_workers_own_address(self):
+        # The Panel keys a node by its address, so registering the Worker's address
+        # again is refused — the refusal `MN-DUP-ADD` owns, not this case.
+        facts, product = self.run_case()
+        self.assertEqual(product.host.plan.second_node_ip, facts["env_worker_address"])
+        self.assertNotEqual(facts["env_worker_address"], product.host.plan.worker_ip)
+
+    def test_a_disabled_vision_domain_is_exported_empty_not_as_none(self):
+        # The second Worker publishes no Vision inbound: its zone carries no record
+        # for the Vision name, so asking for one would make this host compete with
+        # the Worker for a certificate that name already answers for.
+        facts, product = self.run_case()
+        script = self.add_script(product)
+        self.assertIn("GOWAVE_VISION_DOMAIN=''", script)
+        self.assertNotIn("None", script)
+        self.assertNotIn(
+            multi_node.SECOND_WORKER_VISION_DOMAIN,
+            product.zone_writes[0].get("records") or {},
+        )
+        self.assertTrue(facts.get("environment_contract_used"))
+
+    def test_the_second_worker_is_its_own_host_for_its_own_names(self):
+        facts, product = self.run_case()
+        second = facts["second_worker"]
+        self.assertEqual(second["address"], ENV_CONTRACT_ADDRESS)
+        self.assertEqual(
+            second["domains"],
+            sorted([multi_node.SECOND_WORKER_DOMAIN, multi_node.SECOND_WORKER_REALITY_DOMAIN]),
+        )
+        self.assertEqual(second["resolved"][multi_node.SECOND_WORKER_DOMAIN], [ENV_CONTRACT_ADDRESS])
+        self.assertGreaterEqual(facts["panel_hosts"]["count"], 3)
+
+    def test_the_case_puts_the_pair_back_the_way_it_found_it(self):
+        facts, product = self.run_case()
+        self.assertEqual(product.podman.files, product.podman.before)
+        self.assertIn("worker-env-test", product.podman.removed)
+        self.assertEqual(product.zone_writes[-1], ENV_CONTRACT_BEFORE_ZONE)
+        cleanup = facts["cleanup"]
+        self.assertTrue(cleanup["container_removed"])
+        self.assertTrue(cleanup["state_digest_restored"])
+        self.assertTrue(cleanup["journal_digest_restored"])
+        self.assertTrue(cleanup["known_hosts_restored"])
+        self.assertEqual(cleanup["undo"]["state_after"], "NODE_ADD_ROLLED_BACK")
+        self.assertEqual(sorted(cleanup["nodes_after"]["names"]), ["local-node", "worker-1"])
+        self.assertEqual(facts["panel_inventory_after"], facts["panel_inventory_before"])
+
+    def test_a_failed_node_add_fails_the_case_after_undoing_what_it_left(self):
+        product, error = self.run_failing(add_returncode=1)
+        self.assertIn("exit 1", str(error))
+        self.assertEqual(product.compensations, 1)
+        self.assertIn("worker-env-test", product.podman.removed)
+        self.assertEqual(product.podman.files, product.podman.before)
+        self.assertEqual(product.zone_writes[-1], ENV_CONTRACT_BEFORE_ZONE)
+
+    def test_a_panel_that_does_not_register_the_worker_fails_the_case(self):
+        product, error = self.run_failing(registered_name="worker-2")
+        self.assertIn("none of them is", str(error))
+
+    def test_a_worker_that_is_not_connected_fails_the_case(self):
+        product, error = self.run_failing(connected={"worker-env": False})
+        self.assertIn("rather than connected", str(error))
+
+    def test_the_second_address_must_answer_for_the_second_names(self):
+        product, error = self.run_failing(resolves=False)
+        self.assertIn("does not answer with", str(error))
+
+    def test_a_compensation_that_refuses_the_undo_fails_the_case(self):
+        product, error = self.run_failing(undo_refusal=True)
+        self.assertIn("did not undo the registration", str(error))
+
+    def test_a_record_the_case_could_not_restore_fails_the_case(self):
+        # A write that never landed leaves the product's own ROLLED_BACK label in
+        # the journal; the case has to read that back rather than trust its undo.
+        product, error = self.run_failing(restore=False)
+        self.assertIn("is not the one this case started with", str(error))
 
 
 if __name__ == "__main__":

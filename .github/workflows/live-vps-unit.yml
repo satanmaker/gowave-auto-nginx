@@ -1,15 +1,10 @@
 name: Live VPS runner unit tests
 
+# A push to a feature branch is a draft; only a pull request into develop is gated.
 on:
-  push:
-    branches:
-      - main
-      - 'feature/**'
-      - 'fix/**'
   pull_request:
     branches:
-      - main
-      - 'feature/**'
+      - develop
 
 permissions:
   contents: read

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -238,6 +239,220 @@ Environment="GOMEMLIMIT=250MiB"
         self.assertEqual(len(state["nodes"]), 3)
         self.assertEqual(state["nodes"][1]["name"], "worker-1")
         self.assertEqual(state["nodes"][2]["name"], "worker-2")
+
+
+class TestChannelSwitchRollback(unittest.TestCase):
+    """Tasks 7.4/7.5: a channel switch is a transaction whose failure is undone.
+
+    The switch is driven with its real snapshot code against a throwaway
+    installation, and the only thing stubbed is `systemctl`: the first restart
+    fails the way a release that cannot start fails, and every later one
+    succeeds, so the rollback's own restart can bring the installation back.
+    """
+
+    def setUp(self):
+        if os.geteuid() != 0:
+            self.skipTest("Suite root requires root privileges (EUID 0)")
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.root = Path(holder.name)
+        os.chmod(self.root, 0o700)
+
+        self.stubs = self.root / "stubs"
+        self.stubs.mkdir(mode=0o755)
+        self.systemctl_log = self.root / "systemctl.log"
+        self.write_stub(
+            "systemctl",
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            'printf "%s\\n" "$*" >> "$STUB_LOG"\n'
+            'if [[ "${1:-}" == "restart" && ! -e "$STUB_RESTART_OK" ]]; then\n'
+            '    : > "$STUB_RESTART_OK"\n'
+            "    exit 1\n"
+            "fi\n"
+            "exit 0\n",
+        )
+        self.write_stub("nginx", "#!/usr/bin/env bash\nexit 0\n")
+        # The snapshot hands the staged database to the service user, which this
+        # host does not have; the ownership hand-off is not what is under test.
+        self.write_stub("chown", "#!/usr/bin/env bash\nexit 0\n")
+        self.write_stub("runuser", '#!/usr/bin/env bash\nshift 3\nexec "$@"\n')
+
+        # The rollback restores /etc/nginx and /etc/letsencrypt, so the switch runs
+        # inside a private mount namespace where both name empty directories: the
+        # code path is real and the host's own configuration is never a target.
+        self.hidden_etc = {}
+        for target in ("/etc/nginx", "/etc/letsencrypt"):
+            empty = self.root / "empty" / target.strip("/").replace("/", "-")
+            empty.mkdir(parents=True)
+            self.hidden_etc[target] = empty
+        probe = subprocess.run(
+            ["unshare", "--mount", "--", "true"], capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            self.skipTest(f"a private mount namespace is required: {probe.stderr.strip()}")
+
+        self.gowave = self.root / "opt" / "gowave"
+        self.gowave.mkdir(parents=True)
+        self.recovery = self.root / "recovery"
+        self.recovery.mkdir(mode=0o700)
+        self.state = self.root / "state.json"
+        self.state.write_text('{"schemaVersion": 2}\n', encoding="utf-8")
+
+        self.environment = dict(os.environ)
+        self.environment.update({
+            "PATH": f"{self.stubs}:{os.environ['PATH']}",
+            "GOWAVE_DIR": str(self.gowave),
+            "RECOVERY_DIR": str(self.recovery),
+            "STATE_FILE": str(self.state),
+            "JOURNAL_FILE": str(self.recovery / "journal.json"),
+            "MUTATION_LOCK_FILE": str(self.root / "mutation.lock"),
+            "CREDENTIALS_FILE": str(self.root / "credentials.txt"),
+            "STUB_LOG": str(self.systemctl_log),
+            "STUB_RESTART_OK": str(self.root / "restart-allowed"),
+            "MOUNT_NGINX": str(self.hidden_etc["/etc/nginx"]),
+            "MOUNT_LETSENCRYPT": str(self.hidden_etc["/etc/letsencrypt"]),
+        })
+        self.populate(self.gowave)
+
+    def write_stub(self, name: str, body: str) -> None:
+        stub = self.stubs / name
+        stub.write_text(body, encoding="utf-8")
+        os.chmod(stub, 0o755)
+
+    def populate(self, directory: Path) -> None:
+        database = sqlite3.connect(directory / "gowave.db")
+        try:
+            database.execute("create table users (id integer primary key, name text)")
+            database.execute("insert into users (name) values ('alice')")
+            database.commit()
+        finally:
+            database.close()
+        (directory / ".env").write_text(
+            "GOWAVE_CHANNEL=stable\nAPP_SECRET=keep-me\n", encoding="utf-8"
+        )
+        (directory / "gowave-server").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(directory / "gowave-server", 0o755)
+        (directory / "frontend").mkdir()
+        (directory / "frontend" / "index.html").write_text("<html>panel</html>\n", encoding="utf-8")
+        (directory / "state.json").write_text('{"domain": "panel.test"}\n', encoding="utf-8")
+
+    def run_function(self, call: str) -> subprocess.CompletedProcess:
+        script = (
+            "mount --make-rprivate /\n"
+            "mount --bind \"$MOUNT_NGINX\" /etc/nginx\n"
+            "mount --bind \"$MOUNT_LETSENCRYPT\" /etc/letsencrypt\n"
+            f'source "$1/modules/recovery.sh"; {call}'
+        )
+        return subprocess.run(
+            [
+                "unshare",
+                "--mount",
+                "--",
+                "bash",
+                "-c",
+                script,
+                "test",
+                str(REPO_ROOT),
+            ],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+    def function_body(self, name: str) -> str:
+        text = (REPO_ROOT / "modules" / "recovery.sh").read_text(encoding="utf-8")
+        start = text.index(f"{name}() {{")
+        end = text.index("\n}\n", start)
+        return text[start:end]
+
+    def test_a_switch_whose_restart_fails_restores_the_snapshot(self):
+        before = (self.state).read_text(encoding="utf-8")
+        result = self.run_function("switch_channel dev")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Channel switch failed: gowave.service did not become active", result.stderr)
+        self.assertIn("File rollback completed and services verified.", result.stderr)
+        self.assertIn("Channel switch rolled back to the pre-switch state.", result.stderr)
+
+        self.assertEqual(
+            (self.gowave / ".env").read_text(encoding="utf-8"),
+            "GOWAVE_CHANNEL=stable\nAPP_SECRET=keep-me\n",
+        )
+        journal = json.loads((self.recovery / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["state"], "ROLLED_BACK")
+        self.assertEqual(journal["target_version"], "dev")
+        snapshots = sorted(self.recovery.glob("update-*"))
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(journal["snapshot_dir"], str(snapshots[0]))
+        self.assertEqual(
+            (snapshots[0] / ".env").read_text(encoding="utf-8"),
+            "GOWAVE_CHANNEL=stable\nAPP_SECRET=keep-me\n",
+        )
+        self.assertEqual((snapshots[0] / "state.json").read_text(encoding="utf-8"), before)
+        restarts = [
+            line for line in self.systemctl_log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("restart")
+        ]
+        self.assertEqual(len(restarts), 2, self.systemctl_log.read_text(encoding="utf-8"))
+
+        database = sqlite3.connect(self.gowave / "gowave.db")
+        try:
+            names = [row[0] for row in database.execute("select name from users")]
+        finally:
+            database.close()
+        self.assertEqual(names, ["alice"])
+
+    def test_a_rollback_that_cannot_restore_the_database_is_not_reported_as_done(self):
+        # A directory where the rollback stages its database makes the rename over
+        # gowave.db fail after the copy has succeeded, which is the shape of a
+        # cleanup step that cannot complete: the journal must stay uncommitted.
+        blocking = self.gowave / ".gowave.db.rollback"
+        blocking.mkdir()
+        (blocking / "occupied").write_text("x", encoding="utf-8")
+
+        result = self.run_function("switch_channel dev")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Rollback could not restore the database snapshot.", result.stderr)
+        self.assertIn("CRITICAL: the rollback did not complete", result.stderr)
+        self.assertNotIn("File rollback completed and services verified.", result.stderr)
+        journal = json.loads((self.recovery / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["state"], "ROLLBACK_REQUIRED")
+
+    def test_the_rollback_restores_the_acme_state_before_it_validates_nginx(self):
+        body = self.function_body("execute_file_rollback")
+        code = "\n".join(
+            line for line in body.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertLess(
+            code.index("/etc/letsencrypt/."), code.index("nginx -t"),
+            "the generated vhosts name certificates under /etc/letsencrypt/live, so a "
+            "corrupted lineage has to be repaired before nginx -t reads it",
+        )
+
+    def test_every_rollback_step_checks_its_own_result(self):
+        body = self.function_body("execute_file_rollback")
+        for step in (
+            'if ! systemctl stop --no-ask-password gowave.service',
+            'if ! cp -p "$snap_dir/gowave.db" "$db_tmp"',
+            'if ! install -m 0640 "$snap_dir/.env"',
+            'if ! install -m 0755 "$snap_dir/gowave-server"',
+            'if ! rm -rf "$GOWAVE_DIR/frontend"',
+            'if ! install -m 0600 "$snap_dir/state.json"',
+            '|| ! cp -a "$snap_dir/etc/letsencrypt/."',
+            'if ! cp -a "$snap_dir/etc/nginx/." /etc/nginx/',
+            'if ! nginx -t',
+            'if ! systemctl restart --no-ask-password gowave.service',
+        ):
+            self.assertIn(step, body)
+
+    def test_the_switch_restart_is_a_decision_point_and_not_an_exit(self):
+        body = self.function_body("switch_channel")
+        self.assertEqual(body.count("systemctl restart"), 1, body)
+        self.assertIn("if ! systemctl restart --no-ask-password gowave.service", body)
+        self.assertIn("rollback_channel_switch", body)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from modules.api_client import GoWaveClient, atomic_write_state
+from modules.api_client import GoWaveClient, atomic_write_state, host_label
 from modules.recovery import sqlite_online_backup
 
 
@@ -296,13 +296,15 @@ class TestIntegration(unittest.TestCase):
         host_uuids = client.provision_hosts("prof-uuid-test", inbounds, "node-uuid-test", "squad-uuid-test", "vpn.example.com", "camou.example.com")
         self.assertEqual(len(host_uuids), 5)
 
-        # Check securityLayer contracts: DEFAULT for reality, TLS for others
+        # Check securityLayer contracts: DEFAULT for reality, TLS for others. The
+        # label is the Host remark, which the Panel turns into the proxy name.
         hosts_by_remark = {h["remark"]: h for h in MockGoWaveServer.state["hosts"].values()}
-        self.assertEqual(hosts_by_remark["VLESS-REALITY-Vision@local-node"]["securityLayer"], "DEFAULT")
-        self.assertEqual(hosts_by_remark["VLESS-Vision-TLS@local-node"]["securityLayer"], "TLS")
-        self.assertEqual(hosts_by_remark["VLESS-XHTTP-TLS@local-node"]["securityLayer"], "TLS")
-        self.assertEqual(hosts_by_remark["VLESS-WS-TLS@local-node"]["securityLayer"], "TLS")
-        self.assertEqual(hosts_by_remark["Trojan-gRPC-TLS@local-node"]["securityLayer"], "TLS")
+        self.assertEqual(hosts_by_remark[host_label("vless-reality", "local-node")]["securityLayer"], "DEFAULT")
+        self.assertEqual(hosts_by_remark[host_label("vless-vision", "local-node")]["securityLayer"], "TLS")
+        self.assertEqual(hosts_by_remark[host_label("vless-xhttp", "local-node")]["securityLayer"], "TLS")
+        self.assertEqual(hosts_by_remark[host_label("vless-ws", "local-node")]["securityLayer"], "TLS")
+        self.assertEqual(hosts_by_remark[host_label("trojan-grpc", "local-node")]["securityLayer"], "TLS")
+        self.assertEqual(len(hosts_by_remark), 5, "each enabled profile is one labelled record")
 
         for remark, host in hosts_by_remark.items():
             self.assertEqual(host["fingerprint"], "firefox")

@@ -101,6 +101,21 @@ class TestVisionRegressionCoverage(unittest.TestCase):
         self.assertEqual(vision_inbound["streamSettings"]["security"], "tls")
         self.assertTrue(vision_inbound["streamSettings"]["tcpSettings"]["acceptProxyProtocol"])
 
+        # The camouflage site answers every HTTPS visitor, so the fallback that
+        # hands it out cannot be filtered on ALPN: a client that offers none would
+        # be closed rather than shown the site, which is what a live run found.
+        fallbacks = vision_inbound["settings"]["fallbacks"]
+        self.assertTrue(fallbacks, "the Vision inbound owns no fallback at all")
+        for fallback in fallbacks:
+            self.assertEqual(fallback["dest"], "127.0.0.1:9444")
+            self.assertEqual(fallback["xver"], 1)
+            self.assertEqual(fallback["name"], "vision.worker.com")
+        self.assertTrue(
+            any(not fallback.get("alpn") for fallback in fallbacks),
+            "every fallback is filtered on ALPN, so a client that offers none is refused "
+            "instead of being handed to the decoy",
+        )
+
     def test_worker_bootstrap_vhost_includes_vision_domain(self):
         """00-bootstrap-worker-acme.conf includes WORKER_VISION_DOMAIN in server_name."""
         with tempfile.TemporaryDirectory() as td:
@@ -245,23 +260,43 @@ class TestVisionRegressionCoverage(unittest.TestCase):
         harness = '''
 rollback_managed_deploy_hook() { return 0; }
 restore_acme_lineage() {
+    # An unnamed lineage cannot be restored: the rollback would delete or skip
+    # a certificate that belongs to a name this run never resolved.
+    if [[ -z "$2" ]]; then return 2; fi
+    printf '%s\n' "$2" >> "$RESTORED_LOG"
     if [[ "${FAIL_RESTORE:-0}" == "1" && "$2" == "panel.example.test" ]]; then return 1; fi
     return 0
 }
 rm() { return 0; }
 acme_tx_id=test_tx
+panel_lineage=panel.example.test
+reality_lineage=reality.example.test
+vision_lineage=vision.example.test
 panel_domain=panel.example.test
 reality_domain=reality.example.test
 vision_domain=vision.example.test
 '''
-        failed = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "1"}, text=True, capture_output=True, check=False)
-        self.assertEqual(failed.returncode, 0)
-        self.assertIn("CRITICAL: ACME rollback incomplete", failed.stderr)
-        self.assertNotIn("ACME certificate lineage rollback completed successfully", failed.stderr)
-        succeeded = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "0"}, text=True, capture_output=True, check=False)
-        self.assertEqual(succeeded.returncode, 0)
-        self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
-        self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "restored.txt"
+            env = {**os.environ, "RESTORED_LOG": str(log)}
+            failed = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**env, "FAIL_RESTORE": "1"}, text=True, capture_output=True, check=False)
+            self.assertEqual(failed.returncode, 0)
+            self.assertIn("CRITICAL: ACME rollback incomplete", failed.stderr)
+            self.assertNotIn("ACME certificate lineage rollback completed successfully", failed.stderr)
+            self.assertEqual(
+                log.read_text().split(),
+                ["panel.example.test", "reality.example.test", "vision.example.test"],
+                "the rollback restored a name other than the lineages this run resolved",
+            )
+            log.unlink()
+            succeeded = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**env, "FAIL_RESTORE": "0"}, text=True, capture_output=True, check=False)
+            self.assertEqual(succeeded.returncode, 0)
+            self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
+            self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
+            self.assertEqual(
+                log.read_text().split(),
+                ["panel.example.test", "reality.example.test", "vision.example.test"],
+            )
 
     def test_snapshot_acme_lineage_fails_when_directory_permissions_cannot_be_hardened(self):
         with tempfile.TemporaryDirectory() as td:
@@ -369,7 +404,17 @@ vision_domain=vision.example.test
         end = node_script.index("\n}\n", start) + len("\n}\n")
         compensation = node_script[start:end]
 
-        self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
+        # The fallback is inventoried with the rest of the paths this install
+        # writes, so the compensation removes it only through the before-image.
+        inventory_start = node_script.index("worker_mutation_targets() {")
+        inventory_end = node_script.index("\n}\n", inventory_start) + len("\n}\n")
+        self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf",
+                      node_script[inventory_start:inventory_end])
+        self.assertIn('restore_worker_targets_before_image \\\n'
+                      '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                      '"$_ACME_TX_ID")" ||\n'
+                      '        rollback_failed=1\n',
+                      compensation)
         self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
     def test_case_matrix_counts_match_independent_vision_topologies(self):

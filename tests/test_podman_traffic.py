@@ -29,14 +29,16 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.podman_e2e import (  # noqa: E402
     acme_fixture,
     aio,
+    client_image,
     client_trust,
+    ingress,
     matrix,
     subscription_probe,
     target_image,
     topology,
     traffic_probe,
 )
-from tools.podman_e2e.runner import CaseBlocked, RunContext  # noqa: E402
+from tools.podman_e2e.runner import CaseBlocked, CaseIncomplete, RunContext  # noqa: E402
 
 PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
 CLIENT_SECRET = "client-subscription-payload-do-not-print"
@@ -122,6 +124,8 @@ def traffic_transfers():
                 "request_id_match": True,
                 "body_match": True,
                 "source_ip": PLAN.target_ip,
+                "connect_budget_seconds": traffic_probe.connect_budget_seconds(),
+                "transfer_budget_seconds": traffic_probe.REQUEST_TIMEOUT_SECONDS,
             })
     return transfers
 
@@ -205,18 +209,112 @@ class TestTrafficProbeHelpers(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="gowave-traffic-ca-") as directory:
             ca_file = Path(directory) / "issued-root.pem"
             ca_file.write_text(PEM, encoding="utf-8")
-            config = traffic_probe.mihomo_config(SERVED_MIHOMO, str(ca_file))
-            self.assertTrue(config.startswith(SERVED_MIHOMO.rstrip("\n") + "\n"))
+            config, planned = traffic_probe.mihomo_config(SERVED_MIHOMO, str(ca_file))
+            body = SERVED_MIHOMO[SERVED_MIHOMO.index("proxies:"):].rstrip("\n")
+            self.assertIn(body, config, "the served proxies, groups and rules are copied through")
             anchor = yaml.safe_load(config)["tls"][client_trust.MIHOMO_CA_KEY]
             self.assertEqual(len(anchor), 1)
             self.assertIn("BEGIN CERTIFICATE", anchor[0])
             self.assertEqual(anchor[0].strip(), PEM.strip())
             self.assertNotIn(str(ca_file), config, "the key takes PEM documents, not paths")
+            served = subscription_probe.scan_mihomo(SERVED_MIHOMO)
+            self.assertEqual(planned["proxies"], served["proxies"])
+            self.assertEqual(planned["rules"], served["rules"])
+            self.assertEqual(planned["groups"], served["groups"])
 
     def test_a_served_yaml_that_already_declares_tls_is_rejected_not_rewritten(self):
         with self.assertRaises(SystemExit) as caught:
             traffic_probe.mihomo_config("tls:\n  insecure: true\n", "/fixtures/ca/issued-root.pem")
         self.assertIn("already declares 'tls'", str(caught.exception))
+
+    def test_the_request_budget_is_split_into_a_handshake_and_a_transfer(self):
+        self.assertEqual(traffic_probe.connect_budget_seconds(30), 15)
+        self.assertEqual(traffic_probe.connect_budget_seconds(900), 450)
+        self.assertEqual(traffic_probe.connect_budget_seconds(10), 10)
+        self.assertEqual(
+            traffic_probe.connect_budget_seconds(4), traffic_probe.MIN_CONNECT_BUDGET_SECONDS,
+            "a transfer budget under the floor still leaves the handshake the floor",
+        )
+
+    def test_the_dial_spends_the_connect_budget_then_the_transfer_budget(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            connection = traffic_probe.dial("127.0.0.1", listener.getsockname()[1], timeout=900)
+            try:
+                self.assertEqual(
+                    connection.sock.gettimeout(), 900,
+                    "an established connection carries the transfer budget, not the handshake one",
+                )
+            finally:
+                connection.close()
+
+    def test_the_launched_config_binds_collision_free_loopback_listeners(self):
+        served = "\n".join([
+            "mixed-port: 7890",
+            "socks-port: 7891",
+            "redir-port: 7892",
+            "allow-lan: true",
+            "external-controller: 0.0.0.0:9090",
+            "proxies:",
+            "  - name: vless-reality",
+            "    type: vless",
+            "rules:",
+            "  - MATCH,DIRECT",
+            "",
+        ])
+        with tempfile.TemporaryDirectory(prefix="gowave-traffic-ca-") as directory:
+            ca_file = Path(directory) / "issued-root.pem"
+            ca_file.write_text(PEM, encoding="utf-8")
+            config, planned = traffic_probe.mihomo_config(served, str(ca_file))
+            path = Path(directory) / "prepared.yaml"
+            path.write_text(config, encoding="utf-8")
+            bound = traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertNotEqual(planned["mixed_port"], 7890, "the port the Panel names is not reused")
+        self.assertNotEqual(planned["socks_port"], 7891)
+        self.assertNotEqual(planned["redir_port"], 7892)
+        self.assertIsNone(planned["tproxy_port"],
+                          "a listener the served document does not declare is not invented")
+        self.assertEqual(
+            len({planned["mixed_port"], planned["socks_port"], planned["redir_port"],
+                 planned["controller_port"]}), 4,
+            "no two listeners share a port",
+        )
+        self.assertEqual(bound["mixed_port"], planned["mixed_port"])
+        self.assertEqual(bound["allow_lan"], "false")
+        self.assertEqual(bound["bind_address"], "127.0.0.1")
+        self.assertEqual(bound["controller"], f"127.0.0.1:{planned['controller_port']}")
+        self.assertTrue(bound["preserved"])
+
+    def test_a_control_endpoint_outside_loopback_stops_the_run(self):
+        served = "proxies:\n  - name: vless-reality\n    type: vless\n"
+        text = served + "external-controller: 0.0.0.0:9090\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "served.yaml"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertIn("would bind outside loopback", str(caught.exception))
+        self.assertIn("external-controller=0.0.0.0:9090", str(caught.exception))
+
+    def test_one_port_for_two_listeners_stops_the_run(self):
+        served = "proxies:\n  - name: vless-reality\n    type: vless\n"
+        text = served + "mixed-port: 9000\nsocks-port: 9000\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "served.yaml"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertIn("assigns one port to two listeners", str(caught.exception))
+        self.assertIn("mixed-port=9000", str(caught.exception))
+
+    def test_a_document_the_preparation_rewrote_is_not_what_preservation_means(self):
+        served = "proxies:\n  - name: vless-reality\n    type: vless\nrules:\n  - MATCH,DIRECT\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "served.yaml"
+            path.write_text(served + "mixed-port: 7890\nrules:\n  - MATCH,PROXY\n", encoding="utf-8")
+            bound = traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertFalse(bound["preserved"], "a rule the Panel never issued is not a preserved rule")
 
     def test_the_matrix_reports_the_tuples_the_transfers_covered(self):
         transfers = traffic_transfers()
@@ -273,12 +371,12 @@ class TestTrafficEngine(unittest.TestCase):
         path.rmdir()
 
     def test_a_started_engine_is_recorded_and_stopped(self):
-        pid = traffic_probe.launch_engine(["sleep", "30"], self.log_path, self.pid_path, "sleep")
-        self.assertGreater(pid, 0)
-        self.assertEqual(int(self.pid_path.read_text(encoding="utf-8").strip()), pid)
-        self.assertTrue(traffic_probe.process_alive(pid))
-        traffic_probe.wait_engine_exit(pid, 5, "sleep", self.log_path)
-        self.assertFalse(traffic_probe.process_alive(pid))
+        process = traffic_probe.launch_engine(["sleep", "30"], self.log_path, self.pid_path, "sleep")
+        self.assertGreater(process.pid, 0)
+        self.assertEqual(int(self.pid_path.read_text(encoding="utf-8").strip()), process.pid)
+        self.assertTrue(traffic_probe.process_alive(process))
+        traffic_probe.wait_engine_exit(process, 5, "sleep", self.log_path)
+        self.assertFalse(traffic_probe.process_alive(process))
 
     def test_the_engine_context_manager_cleans_up_its_pid_file(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -294,19 +392,41 @@ class TestTrafficEngine(unittest.TestCase):
         with traffic_probe.Engine(
             [sys.executable, "-c", listener], self.log_path, self.pid_path, port, "the test listener",
         ) as engine:
-            self.assertTrue(traffic_probe.process_alive(engine.pid))
+            self.assertTrue(traffic_probe.process_alive(engine.process))
             self.assertTrue(self.pid_path.exists())
-        self.assertFalse(traffic_probe.process_alive(engine.pid))
+        self.assertFalse(traffic_probe.process_alive(engine.process))
         self.assertFalse(self.pid_path.exists())
 
     def test_an_engine_that_died_on_its_own_fails_the_case(self):
-        pid = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
+        process = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and traffic_probe.process_alive(pid):
+        while time.monotonic() < deadline and traffic_probe.process_alive(process):
             time.sleep(0.05)
         with self.assertRaises(SystemExit) as caught:
-            traffic_probe.wait_engine_exit(pid, 1, "sleep", self.log_path)
+            traffic_probe.wait_engine_exit(process, 1, "sleep", self.log_path)
         self.assertIn("exited on its own", str(caught.exception))
+
+    def test_a_recycled_pid_reads_as_the_engine_having_exited(self):
+        """A number the kernel handed out again is not the engine that was launched.
+
+        This is the failure the liveness check exists for: the engine exits, its
+        pid is reaped and reused, and a bare ``kill -0`` would report a live
+        process. The recorded start tick has to tell them apart, and the process
+        that inherited the number must be left alone rather than signalled.
+        """
+        process = traffic_probe.launch_engine(["sleep", "30"], self.log_path, self.pid_path, "sleep")
+        self.assertIsNotNone(process.started)
+        other_owner = traffic_probe.EngineProcess(process.pid, str(int(process.started) + 1))
+        self.assertFalse(traffic_probe.process_alive(other_owner))
+        self.assertTrue(traffic_probe.process_alive(process))
+        with self.assertRaises(SystemExit) as caught:
+            traffic_probe.wait_engine_exit(other_owner, 1, "sleep", self.log_path)
+        self.assertIn("exited on its own", str(caught.exception))
+        self.assertTrue(
+            traffic_probe.process_alive(process),
+            "a pid the kernel handed to another process must not be signalled",
+        )
+        traffic_probe.stop_engine(process)
 
     def test_an_engine_that_never_starts_fails_with_its_log(self):
         with self.assertRaises(SystemExit) as caught:
@@ -317,11 +437,11 @@ class TestTrafficEngine(unittest.TestCase):
         self.assertIn("gowave-no-such-engine-binary", str(caught.exception))
 
     def test_stopping_a_process_that_is_gone_is_not_an_error(self):
-        pid = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
+        process = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and traffic_probe.process_alive(pid):
+        while time.monotonic() < deadline and traffic_probe.process_alive(process):
             time.sleep(0.05)
-        traffic_probe.stop_engine(pid)
+        traffic_probe.stop_engine(process)
 
     def test_readiness_is_bounded_when_nothing_listens(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -448,6 +568,11 @@ class TestTrafficProbeTransfer(unittest.TestCase):
         second = traffic_probe.transfer(None, self.destination, self.label, "xray")
         self.assertNotEqual(first["request_id"], second["request_id"])
 
+    def test_a_delivered_transfer_states_the_budget_each_phase_had(self):
+        report = traffic_probe.transfer(None, self.destination, self.label, "xray", timeout=900)
+        self.assertEqual(report["connect_budget_seconds"], 450)
+        self.assertEqual(report["transfer_budget_seconds"], 900)
+
     def test_a_body_the_endpoint_did_not_receive_is_reported_as_a_mismatch(self):
         EchoStub.response = {"match": True, "body_sha256": "0" * 64}
         report = traffic_probe.transfer(None, self.destination, self.label, "xray")
@@ -484,6 +609,16 @@ class TestTrafficProbeTransfer(unittest.TestCase):
         self.assertEqual(report["engine"], "xray")
         self.assertTrue(report["reason"])
         self.assertEqual(EchoStub.received, [])
+
+    def test_a_refusal_states_the_budget_the_handshake_had(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = probe.getsockname()[1]
+        report = traffic_probe.transfer(
+            None, f"127.0.0.1:{closed}", self.label, "xray", expect_refusal=True, timeout=900,
+        )
+        self.assertEqual(report["connect_budget_seconds"], 450)
+        self.assertEqual(report["transfer_budget_seconds"], 900)
 
     def test_a_transfer_the_endpoint_answered_is_delivered_even_when_refusal_is_expected(self):
         report = traffic_probe.transfer(
@@ -552,11 +687,13 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
             {"engine": "xray", "tag": "proxy", "network": "tcp", "security": "reality",
              "server": topology.PANEL_DOMAIN,
              "sni": topology.REALITY_DOMAIN, "status": 200, "delivered": True,
-             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
+             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip,
+             "connect_budget_seconds": 15, "transfer_budget_seconds": 30},
             {"engine": "xray", "tag": "proxy", "network": "ws", "security": "tls",
              "server": topology.PANEL_DOMAIN,
              "sni": topology.PANEL_DOMAIN, "status": 200, "delivered": True,
-             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
+             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip,
+             "connect_budget_seconds": 15, "transfer_budget_seconds": 30},
         ]
 
     def fake(self, labels, calls=None):
@@ -588,6 +725,9 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
         self.assertTrue(facts["delivered"])
         self.assertEqual(facts["source_ip"], PLAN.data_target_ip)
         self.assertEqual(facts["reason"], "")
+        self.assertEqual(facts["connect_budget_seconds"], 15,
+                         "the scope reports the budget the transfer ran under")
+        self.assertEqual(facts["transfer_budget_seconds"], 30)
 
     def test_a_tuple_no_outbound_matches_is_a_missing_case_not_a_free_pass(self):
         with self.assertRaises(SystemExit) as caught:
@@ -912,18 +1052,111 @@ class TestTrafficProbeReadiness(unittest.TestCase):
         self.assertIn("destination address is required", str(caught.exception))
 
 
+class LaunchedEngine:
+    """The Mihomo process, stood in for by the facts the launch would produce."""
+
+    commands = []
+
+    def __init__(self, command, log_path, pid_path, port, label):
+        LaunchedEngine.commands.append((command, port, label))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        return False
+
+
+class TestMihomoLaunch(unittest.TestCase):
+    """The config Mihomo is started with is the one the preparation wrote."""
+
+    def launched(self, served=SERVED_MIHOMO, destination="203.0.114.30:18080"):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            ca_file = workdir / "issued-root.pem"
+            ca_file.write_text(PEM, encoding="utf-8")
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    traffic_probe.subscription_probe, "read_payload",
+                    lambda _payload_dir, _name: served,
+                ))
+                stack.enter_context(mock.patch.object(traffic_probe, "Engine", LaunchedEngine))
+                stack.enter_context(mock.patch.object(
+                    traffic_probe, "wait_port", lambda *args, **kwargs: None))
+                stack.enter_context(mock.patch.object(
+                    traffic_probe, "select_mihomo_proxy", lambda *args, **kwargs: None))
+                stack.enter_context(mock.patch.object(
+                    traffic_probe, "transfer",
+                    lambda port, target, label, engine, *args, **kwargs: {
+                        "engine": engine, **label, "request_id": "req-1",
+                        "delivered": True, "status": 200,
+                        "request_id_match": True, "body_match": True,
+                        "source_ip": PLAN.target_ip,
+                    },
+                ))
+                return traffic_probe.mihomo_transfers(
+                    "/payload", str(ca_file), destination, workdir,
+                )
+
+    def test_the_launched_document_is_read_back_not_trusted_from_the_plan(self):
+        transfers = self.launched()
+        self.assertEqual(len(transfers), 2, "one transfer per served proxy")
+        facts = transfers[0]
+        self.assertEqual(facts["mihomo_allow_lan"], "false",
+                         "the fact is the scalar the document spells, not a verdict")
+        self.assertTrue(str(facts["mihomo_controller"]).startswith("127.0.0.1:"))
+        self.assertEqual(facts["mihomo_proxies"], 2)
+        self.assertEqual(facts["mihomo_rules"], 1)
+        self.assertTrue(facts["mihomo_preserved"])
+        listeners = [
+            facts[f"mihomo_{name}_port"] for name in ("mixed", "socks", "redir")
+            if facts.get(f"mihomo_{name}_port") is not None
+        ]
+        self.assertEqual(len(set(listeners)), len(listeners))
+        self.assertNotIn(7890, listeners, "the Panel's mixed-port is not reused")
+        command, port, label = LaunchedEngine.commands[-1]
+        self.assertEqual(label, "mihomo")
+        self.assertEqual(port, facts["mihomo_mixed_port"],
+                         "the engine is waited for on the port it actually bound")
+        self.assertEqual(command[0], traffic_probe.MIHOMO_BINARY)
+        self.assertIn("-f", command, "the engine is started on the prepared file")
+
+    def test_a_served_document_with_no_proxy_is_refused_before_anything_starts(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.launched(served="rules:\n  - MATCH,DIRECT\n")
+        self.assertIn("declares no proxy", str(caught.exception))
+
+
 class ScriptedPodman:
-    """Podman stub that answers only the host-side subscription fetch."""
+    """Podman stub that answers the host-side fetch and the engine's own version."""
 
     def __init__(self, context, result=None):
         self.context = context
         self.scripts = []
+        self.execs = []
         self.result = result or (json.dumps({"subscriptions": {}}), 0)
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         stdout, returncode = self.result
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        """The engine container printing the version the matrix pinned for it.
+
+        The case reads the version of the binary that carried the payload, so the
+        stub has to answer that read from the manifest rather than from a literal:
+        a matrix whose client pin moved would otherwise leave the fake naming the
+        build the case no longer expects.
+        """
+        self.execs.append((name, list(argv)))
+        binary = list(argv)[0]
+        pinned = next(
+            (item["contains"] for item in client_image.engine_list(MATRIX)
+             if item["binary"] == binary),
+            "",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, f"{binary} {pinned} (fixture)\n", "")
 
 
 class StubEngineHost:
@@ -944,6 +1177,9 @@ class StubEngineHost:
         self.returncode = returncode
         self.stdout = stdout
         self.bodies = bodies or {}
+
+    def engine_client(self):
+        return "aio-engines"
 
     def _probe(self, body, returncode):
         return subprocess.CompletedProcess(
@@ -993,10 +1229,64 @@ def data_plane_facts(**overrides):
         "request_id_match": True,
         "body_match": True,
         "source_ip": PLAN.data_target_ip,
+        "connect_budget_seconds": traffic_probe.connect_budget_seconds(),
+        "transfer_budget_seconds": traffic_probe.REQUEST_TIMEOUT_SECONDS,
         "reason": "",
     }
     facts.update(overrides)
+    if facts["engine"] == "mihomo":
+        for key, value in {
+            "mihomo_allow_lan": "false",
+            "mihomo_controller": "127.0.0.1:39090",
+            "mihomo_mixed_port": 7890,
+            "mihomo_socks_port": 7891,
+            "mihomo_redir_port": 7892,
+            "mihomo_proxies": 2,
+            "mihomo_rules": 1,
+            "mihomo_preserved": True,
+        }.items():
+            facts.setdefault(key, value)
     return facts
+
+
+CLIENT_ADDRESS = "198.51.100.77"
+
+
+class StubIngress:
+    """The packet bracket as these cases see it, without containers.
+
+    The container plumbing — the probe, the pipes, the verdict branches — is held
+    by ``tests/test_podman_ingress.py``. What a case here depends on is that the
+    request is bracketed at all, so the stub runs the request and answers with one
+    host that saw it from the address that host reports.
+    """
+
+    @staticmethod
+    def bracket(request, inbound, node="", window=0):
+        return ingress.Measurement(
+            port=ingress.listener_port(inbound),
+            intended="local",
+            client=CLIENT_ADDRESS,
+            captures={"local": {
+                "captured": 3, "sources": {CLIENT_ADDRESS: 3},
+                "stopped_by": "harness", "drops": 0,
+            }},
+            request=request(),
+        )
+
+    @staticmethod
+    def empty(request, inbound, node="", window=0):
+        """The same bracket with a capture that started and counted no segment."""
+        return ingress.Measurement(
+            port=ingress.listener_port(inbound),
+            intended="local",
+            client=CLIENT_ADDRESS,
+            addresses={"local": CLIENT_ADDRESS},
+            captures={"local": {
+                "captured": 0, "sources": {}, "stopped_by": "harness", "drops": 0,
+            }},
+            request=request(),
+        )
 
 
 def installed_product(context, facts=None, returncode=0, stdout=None, bodies=None, vision=False):
@@ -1006,6 +1296,10 @@ def installed_product(context, facts=None, returncode=0, stdout=None, bodies=Non
         facts=facts, returncode=returncode, stdout=stdout, bodies=bodies, vision=vision,
     )
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+    # What the install read out of `rw-core version`: the tuple compares the client
+    # core with the core its node deployed, so the fake has to name that core.
+    product.server_core_version = matrix.product(MATRIX).get("xray_version", "")
+    product.bracket_request = StubIngress.bracket
     return product, podman
 
 
@@ -1030,6 +1324,7 @@ class TestDataPlaneCase(unittest.TestCase):
         inbound = self.inbound(inbound_id)
         if facts is None:
             facts = data_plane_facts(
+                engine=client,
                 network=str(inbound["transport"]),
                 security=str(inbound["security"]),
                 sni=served_sni(inbound),
@@ -1039,7 +1334,15 @@ class TestDataPlaneCase(unittest.TestCase):
         return evidence, product, podman
 
     def reject(self, expected, inbound_id="REALITY", client="xray", facts=None, **kwargs):
-        data = data_plane_facts(**kwargs)
+        inbound = self.inbound(inbound_id)
+        defaults = {
+            "engine": client,
+            "network": str(inbound["transport"]),
+            "security": str(inbound["security"]),
+            "sni": served_sni(inbound),
+        }
+        defaults.update(kwargs)
+        data = data_plane_facts(**defaults)
         if facts is not None:
             data = facts
         product, _ = installed_product(self.context, facts=data)
@@ -1092,6 +1395,56 @@ class TestDataPlaneCase(unittest.TestCase):
     def test_the_case_fails_when_the_tuple_matches_more_than_one_outbound(self):
         self.reject("expected exactly one", outbounds=2)
 
+    def test_a_capture_that_saw_nothing_leaves_its_account_beside_the_verdict(self):
+        # The runner attaches evidence only to a passing case, so an empty capture
+        # would reach a reader as one sentence and no account of what each probe
+        # printed — which is the state a red run cannot be diagnosed from.
+        product, _ = installed_product(self.context, facts=data_plane_facts(
+            engine="xray", network="tcp", security="reality", sni=served_sni(self.inbound("REALITY")),
+        ))
+        product.bracket_request = StubIngress.empty
+        with self.assertRaises(CaseIncomplete) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
+        self.assertIn("captured nothing on port 443", str(caught.exception))
+        name = "evidence/aio-dp-reality-xray-ingress.txt"
+        self.assertIn(name, self.context.evidence_files,
+                      "the file a red case wrote has to be listed on the case")
+        account = (self.context.artifact_dir / name).read_text(encoding="utf-8")
+        self.assertIn("verdict: INCOMPLETE", account)
+        self.assertIn("captured nothing on port 443", account)
+        self.assertIn(f"client: {CLIENT_ADDRESS}", account)
+        self.assertIn('"captured": 0', account, "the probe's own summary is what a reader needs")
+        self.assertIn('"stopped_by": "harness"', account)
+        self.assertIn(f"request.source_ip: {PLAN.data_target_ip}", account)
+
+    def test_a_passing_tuple_leaves_no_account_file(self):
+        self.run_case()
+        self.assertEqual(
+            [name for name in self.context.evidence_files if name.endswith("-ingress.txt")], [],
+            "a passing tuple's measurement is its evidence, not a file",
+        )
+
+    def test_a_client_core_that_differs_from_the_deployed_core_fails_the_tuple(self):
+        # The node that served the tuple names its core; a client running another
+        # build is the mismatch this comparison exists for, so the drift is made
+        # impossible to confuse with the pin rather than merely different.
+        product, _ = installed_product(self.context, facts=data_plane_facts(
+            engine="xray", network="tcp", security="reality", sni=served_sni(self.inbound("REALITY")),
+        ))
+        drifted = f"{matrix.product(MATRIX)['xray_version']}-drifted"
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray", deployed_core=drifted)
+        self.assertIn("ran an unmatched core", str(caught.exception))
+
+    def test_a_tuple_whose_node_core_was_never_read_fails_before_the_payload(self):
+        product, _ = installed_product(self.context, facts=data_plane_facts(
+            engine="xray", network="tcp", security="reality", sni=served_sni(self.inbound("REALITY")),
+        ))
+        product.server_core_version = ""
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
+        self.assertIn("was never read", str(caught.exception))
+
     def test_the_case_fails_when_the_payload_never_reached_the_endpoint(self):
         self.reject("never reached the controlled endpoint: connection refused",
                     delivered=False, status=None, reason="connection refused")
@@ -1119,6 +1472,43 @@ class TestDataPlaneCase(unittest.TestCase):
             f"dials {topology.WORKER_DOMAIN!r} instead of {topology.PANEL_DOMAIN!r}",
             server=topology.WORKER_DOMAIN,
         )
+
+    def test_the_case_records_the_budgets_it_ran_under(self):
+        evidence, _product, _podman = self.run_case()
+        self.assertEqual(evidence["connect_budget_seconds"], 15)
+        self.assertEqual(evidence["transfer_budget_seconds"], 30)
+        self.assertNotIn("mihomo_allow_lan", evidence,
+                         "an xray tuple has no Mihomo config to report")
+
+    def test_the_case_fails_when_the_handshake_budget_is_below_the_resolver_floor(self):
+        self.reject("below the 10s a resolver stall needs", connect_budget_seconds=5)
+
+    def test_the_case_fails_when_the_handshake_gets_less_than_half_the_request(self):
+        self.reject("less than half of it", connect_budget_seconds=15, transfer_budget_seconds=60)
+
+    def test_the_mihomo_case_records_the_listeners_it_launched(self):
+        evidence, _product, _podman = self.run_case(inbound_id="XHTTP", client="mihomo")
+        self.assertEqual(evidence["mihomo_allow_lan"], "false")
+        self.assertEqual(evidence["mihomo_controller"], "127.0.0.1:39090")
+        self.assertEqual(evidence["mihomo_mixed_port"], 7890)
+        self.assertEqual(evidence["mihomo_proxies"], 2)
+        self.assertEqual(evidence["mihomo_rules"], 1)
+
+    def test_the_mihomo_case_fails_when_the_launched_config_allows_lan(self):
+        self.reject("declares allow-lan 'true'", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_allow_lan="true")
+
+    def test_the_mihomo_case_fails_when_the_controller_is_not_on_loopback(self):
+        self.reject("instead of 127.0.0.1", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_controller="0.0.0.0:9090")
+
+    def test_the_mihomo_case_fails_when_the_served_rules_were_not_preserved(self):
+        self.reject("does not preserve every served proxy, group and rule",
+                    inbound_id="XHTTP", client="mihomo", engine="mihomo", mihomo_preserved=False)
+
+    def test_the_mihomo_case_fails_when_two_listeners_share_a_port(self):
+        self.reject("share a port", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_socks_port=7890)
 
     def test_the_case_fails_when_it_names_a_node_the_topology_does_not_have(self):
         product, _ = installed_product(self.context, facts=data_plane_facts())
@@ -1274,6 +1664,28 @@ class TestMatrixCase(unittest.TestCase):
 
 
 
+class InterruptedTrafficHost(StubEngineHost):
+    """The positive matrix once interrupted, as a lost race against the Panel leaves it.
+
+    The probe exits without facts the way it does when the Panel re-pushes the
+    node's users between the send and the endpoint report, so a case that read the
+    first attempt as a verdict would call access it had not revoked yet a refusal.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.traffic_calls = 0
+
+    def traffic_facts(self, scope, timeout=900, payload_dir=None):
+        self.scopes.append(scope)
+        self.payload_dirs.append(payload_dir)
+        if scope == "traffic":
+            self.traffic_calls += 1
+            if self.traffic_calls == 1:
+                return self._probe("", 1)
+        return self._probe(json.dumps(self.bodies[scope]), 0)
+
+
 class TestRevocationCase(unittest.TestCase):
     """AIO-REVOKE judges revocation by what the endpoint refused to record."""
 
@@ -1336,7 +1748,7 @@ class TestRevocationCase(unittest.TestCase):
         }
 
     def run_case(self, positive=None, negative=None, steps=None, calls=None, readiness=None,
-                 expected_sources=None):
+                 expected_sources=None, host_class=None):
         overrides = steps or {}
         bodies = {
             "warmup": readiness or {
@@ -1347,6 +1759,8 @@ class TestRevocationCase(unittest.TestCase):
             "revoked": self.revoked_facts() if negative is None else negative,
         }
         product, _ = installed_product(self.context, bodies=bodies)
+        if host_class is not None:
+            product.host = host_class(bodies=bodies)
         answers = {
             "issue": self.issue(),
             "apply": self.applied(),
@@ -1366,8 +1780,12 @@ class TestRevocationCase(unittest.TestCase):
             ), calls, product
 
     def reject(self, expected, **kwargs):
-        with self.assertRaises(AssertionError) as caught:
-            self.run_case(**kwargs)
+        # A counter-example is judged on the matrix the probe reported, so the
+        # retry deadline is spent in one attempt here: what the case says about a
+        # wrong transfer count must not wait two minutes to be said.
+        with mock.patch.object(aio, "REVOCATION_TRANSFER_TIMEOUT_SECONDS", 0):
+            with self.assertRaises(AssertionError) as caught:
+                self.run_case(**kwargs)
         self.assertIn(expected, str(caught.exception))
 
     def test_the_case_accepts_access_the_endpoint_refused_to_record(self):
@@ -1395,6 +1813,18 @@ class TestRevocationCase(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("not every served outbound carried a payload", message)
         self.assertIn("HTTP 503 without an endpoint report", message)
+
+    def test_the_positive_matrix_is_re_run_when_the_probe_reported_nothing(self):
+        with mock.patch.object(aio, "REVOCATION_TRANSFER_INTERVAL_SECONDS", 0):
+            facts, calls, product = self.run_case(host_class=InterruptedTrafficHost)
+        self.assertEqual(
+            product.host.scopes, ["warmup", "traffic", "traffic", "revoked"],
+            "the interrupted matrix is taken again before anything is revoked",
+        )
+        self.assertEqual(facts["positive_attempts"], 2)
+        self.assertEqual(facts["positive_transfer_count"], len(traffic_facts()["transfers"]))
+        self.assertEqual(calls, ["issue", "apply", "cleanup"])
+        self.assertEqual(facts["revoked_delivered"], 0)
 
     def test_the_case_fails_when_the_client_could_not_be_created(self):
         self.reject("instead of 201", steps={"issue": {"create_status": 409}})
@@ -1461,8 +1891,11 @@ class TestRevocationCase(unittest.TestCase):
         data = traffic_facts()
         data["transfer_count"] = 0
         calls = []
-        with self.assertRaises(AssertionError) as caught:
-            self.run_case(positive=data, calls=calls)
+        # The retry window is spent in a single attempt here; this test is about
+        # the cleanup, not about how long the case waits before it gives up.
+        with mock.patch.object(aio, "REVOCATION_TRANSFER_TIMEOUT_SECONDS", 0):
+            with self.assertRaises(AssertionError) as caught:
+                self.run_case(positive=data, calls=calls)
         self.assertIn("transferred through 0 transports", str(caught.exception))
         self.assertEqual(calls, ["issue", "cleanup"],
                          "the failed run must still delete the client it created")
@@ -1473,7 +1906,8 @@ class TestRevocationCase(unittest.TestCase):
         self.assertIn("AIO-REVOKE", cases)
         self.assertEqual(cases["AIO-REVOKE"].topology, "aio")
         self.assertEqual(cases["AIO-REVOKE"].timeout_seconds,
-                         aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS)
+                         aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS
+                         + aio.REVOCATION_TRANSFER_TIMEOUT_SECONDS)
 
 
 class RecordingPodman:
@@ -1484,6 +1918,7 @@ class RecordingPodman:
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
         self.connects = []
+        self.volumes = []
         self.runs = []
         self.builds = []
         self.execs = []
@@ -1499,6 +1934,15 @@ class RecordingPodman:
     def network_connect(self, name, network, ip=None):
         self.connects.append((name, network, ip))
         return name
+
+    def volume_create(self, name):
+        self.volumes.append(name)
+        return name
+
+    def volume_mountpoint(self, name):
+        mountpoint = self.context.secret_dir / "volumes" / name
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        return mountpoint
 
     def run(self, **kwargs):
         self.runs.append(kwargs)

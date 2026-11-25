@@ -6,6 +6,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import ssl
 import stat
@@ -68,11 +69,162 @@ def reality_fingerprint():
     return value
 
 
+PROFILE_LABELS = {
+    "vless-reality": "VLESS · REALITY · Vision",
+    "vless-vision": "VLESS · TLS · Vision",
+    "vless-xhttp": "VLESS · XHTTP · TLS",
+    "vless-ws": "VLESS · WebSocket · TLS",
+    "trojan-grpc": "Trojan · gRPC · TLS",
+}
+
+
+def country_flag(code):
+    """The regional-indicator pair a two-letter code renders as, or nothing.
+
+    The Panel stores the code the wizard confirmed, where the set of assigned
+    ISO 3166-1 alpha-2 codes lives (`modules/geoip.sh`). This reader only
+    renders, so an entry that is not two letters produces no flag at all rather
+    than a label carrying a broken glyph.
+    """
+    letters = str(code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", letters):
+        return ""
+    return "".join(chr(0x1F1E6 + ord(letter) - ord("A")) for letter in letters)
+
+
+def host_label(profile_key, node_name, country=""):
+    """The label a client sees for one enabled profile of one node.
+
+    ``🇳🇱 VLESS · REALITY · Vision — ams-01``. A node whose exit country was
+    never confirmed renders without the flag rather than with a guess, and the
+    node name keeps two nodes in one country apart.
+    """
+    flag = country_flag(country)
+    prefix = f"{flag} " if flag else ""
+    return f"{prefix}{PROFILE_LABELS[profile_key]} — {node_name}"
+
+
+def host_projection(panel_domain, reality_domain, node_name="local-node", vision_domain=None,
+                    country=""):
+    """The Host record one provisioned inbound is posted with, keyed by profile tag.
+
+    ``provision_hosts`` posts exactly this mapping to ``POST /api/hosts``. It is
+    a module function rather than a local so ``tests/cases/matrix.yaml`` can be
+    compared with the record the install really writes instead of with a second
+    hand-maintained copy: the matrix names the address role, SNI role, path,
+    ALPN and ``securityLayer`` of every tuple it declares.
+
+    ``remark`` is the only field that is a label: the Panel derives the proxy
+    name in both the Xray JSON and the Mihomo YAML from it, and group references
+    follow that name. Everything else here is what a client dials.
+    """
+    v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else panel_domain)
+    return {
+        "vless-reality": {
+            "remark": host_label("vless-reality", node_name, country),
+            "address": panel_domain,
+            "port": 443,
+            "sni": reality_domain,
+            "path": None,
+            "securityLayer": "DEFAULT",
+            "alpn": "h2,http/1.1",
+            "fingerprint": reality_fingerprint(),
+            "mihomoX25519": mihomo_x25519_enabled(),
+        },
+        "vless-vision": {
+            "remark": host_label("vless-vision", node_name, country),
+            "address": v_domain,
+            "port": 443,
+            "sni": v_domain,
+            "path": None,
+            "securityLayer": "TLS",
+            "alpn": "http/1.1",
+            "fingerprint": "firefox",
+        },
+        "vless-xhttp": {
+            "remark": host_label("vless-xhttp", node_name, country),
+            "address": panel_domain,
+            "port": 443,
+            "sni": panel_domain,
+            "path": "/xhttp-down/",
+            "securityLayer": "TLS",
+            "alpn": "h2,http/1.1",
+            "fingerprint": "firefox",
+        },
+        "vless-ws": {
+            "remark": host_label("vless-ws", node_name, country),
+            "address": panel_domain,
+            "port": 443,
+            "sni": panel_domain,
+            "path": "/ws",
+            "securityLayer": "TLS",
+            "alpn": "http/1.1",
+            "fingerprint": "firefox",
+        },
+        "trojan-grpc": {
+            "remark": host_label("trojan-grpc", node_name, country),
+            "address": panel_domain,
+            "port": 443,
+            "sni": panel_domain,
+            "path": "trojan-grpc",
+            "securityLayer": "TLS",
+            "alpn": "h2",
+            "fingerprint": "firefox",
+        },
+    }
+
+
 class GoWaveAPIError(Exception):
     def __init__(self, message, status_code=None, response_body=None):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+
+
+class GoWaveNodeNameTaken(GoWaveAPIError):
+    """Another server already registered under the name this run asked for.
+
+    Kept apart from the general API error because it is not a failure of the
+    Panel: a repeated install of the same node meets its own name and must be
+    reconciled, while a different server meeting it must not be adopted — the
+    registration would rewrite that node's address and silently move another
+    deployment's traffic endpoint.
+    """
+
+
+class GoWaveHostConflict(GoWaveAPIError):
+    """A Host record this run would have to relabel cannot be proven its own.
+
+    A remark is a label: the wizard writes a country flag and a node name into
+    it, so it changes between runs, and an operator can type one by hand. A
+    record that no recorded UUID and no unique inbound/node pairing claims is
+    therefore left alone, and the run stops before it writes a duplicate or
+    adopts a stranger's Host.
+    """
+
+
+def host_ownership(record):
+    """The pairing that proves a Host belongs to one inbound of one node.
+
+    ``None`` when the record does not carry all three parts: a partial pairing
+    matches too much to be a proof of ownership.
+    """
+    if not isinstance(record, dict):
+        return None
+    inbound = record.get("inbound")
+    inbound = inbound if isinstance(inbound, dict) else {}
+    profile = str(inbound.get("configProfileUuid") or "")
+    inbound_uuid = str(inbound.get("configProfileInboundUuid") or "")
+    node_ids = []
+    for item in record.get("nodes") or []:
+        if isinstance(item, dict):
+            node_ids.append(str(item.get("uuid") or item.get("id") or ""))
+        else:
+            node_ids.append(str(item))
+    node_ids = tuple(sorted(node_id for node_id in node_ids if node_id))
+    if not (profile and inbound_uuid and node_ids):
+        return None
+    return (profile, inbound_uuid, node_ids)
 
 
 def _extract_list(res, key):
@@ -349,7 +501,7 @@ class GoWaveClient:
                 }
         return None
 
-    def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None):
+    def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None, vision_cert_dir=None):
         if short_ids is None:
             short_ids = [secrets.token_hex(8) for _ in range(8)]
 
@@ -367,8 +519,12 @@ class GoWaveClient:
         # 2. Optional Inbound Vision (VLESS + XTLS Vision) - only compiled when a dedicated 3rd domain is provided
         if vision_domain:
             v_domain = vision_domain
-            cert_file = f"/etc/letsencrypt/live/{v_domain}/fullchain.pem"
-            key_file = f"/etc/letsencrypt/live/{v_domain}/privkey.pem"
+            # The certificate can live in a lineage whose name is not the served
+            # name (certbot keeps `example.com-0001` when the name was re-issued),
+            # so the directory the caller adopted is used when it names one.
+            cert_dir = (vision_cert_dir or f"/etc/letsencrypt/live/{v_domain}").rstrip("/")
+            cert_file = f"{cert_dir}/fullchain.pem"
+            key_file = f"{cert_dir}/privkey.pem"
 
             vision_template = json.loads((XRAY_ASSETS_DIR / "vless-vision.json").read_text())
             vision_template["tag"] = f"vless-vision-{node_name}"
@@ -500,6 +656,15 @@ class GoWaveClient:
             inbounds_list = []
         return {"profile_uuid": profile_uuid, "inbounds": inbounds_list}
 
+    def list_nodes(self):
+        """The nodes the Panel already holds.
+
+        The wizard reads this before it asks for a name and the registration
+        reads it before it writes anything, so a name that is already taken is
+        refused instead of adopted.
+        """
+        return _extract_list(self.request("GET", "/api/nodes"), "nodes")
+
     def associate_node(self, node_name, node_address, node_port, profile_uuid, inbound_uuids, existing_node_uuid=None):
         payload = {
             "name": node_name,
@@ -541,6 +706,19 @@ class GoWaveClient:
                 # restarted on every repeated install.
                 if _same_node_configuration(existing_node, payload):
                     return found_uuid
+                # Same name, different address or port: this is another server,
+                # and updating it would move its traffic endpoint. The retry of
+                # one node is the caller that passes its address and port again,
+                # or names the uuid it already knows.
+                if (
+                    str(existing_node.get("address") or "") != str(node_address)
+                    or str(existing_node.get("port")) != str(node_port)
+                ):
+                    raise GoWaveNodeNameTaken(
+                        f"the Panel already has a node named {existing_node.get('name')} at "
+                        f"{existing_node.get('address')}:{existing_node.get('port')}, "
+                        f"not {node_address}:{node_port}"
+                    )
                 required_before = ("name", "address", "port", "configProfile")
                 if not all(k in existing_node for k in required_before):
                     raise GoWaveAPIError(f"Cannot safely update node {found_uuid}: rollback snapshot is incomplete")
@@ -585,70 +763,18 @@ class GoWaveClient:
 
         return squad_uuid
 
-    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None):
-        v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else panel_domain)
-        # Protocol to config mapping
-        proto_map = {
-            "vless-reality": {
-                "remark": f"VLESS-REALITY-Vision@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": reality_domain,
-                "path": None,
-                "securityLayer": "DEFAULT",
-                "alpn": "h2,http/1.1",
-                "fingerprint": reality_fingerprint(),
-                "mihomoX25519": mihomo_x25519_enabled(),
-            },
-            "vless-vision": {
-                "remark": f"VLESS-Vision-TLS@{node_name}",
-                "address": v_domain,
-                "port": 443,
-                "sni": v_domain,
-                "path": None,
-                "securityLayer": "TLS",
-                "alpn": "http/1.1",
-                "fingerprint": "firefox",
-            },
-            "vless-xhttp": {
-                "remark": f"VLESS-XHTTP-TLS@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": panel_domain,
-                "path": "/xhttp-down/",
-                "securityLayer": "TLS",
-                "alpn": "h2,http/1.1",
-                "fingerprint": "firefox",
-            },
-            "vless-ws": {
-                "remark": f"VLESS-WS-TLS@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": panel_domain,
-                "path": "/ws",
-                "securityLayer": "TLS",
-                "alpn": "http/1.1",
-                "fingerprint": "firefox",
-            },
-            "trojan-grpc": {
-                "remark": f"Trojan-gRPC-TLS@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": panel_domain,
-                "path": "trojan-grpc",
-                "securityLayer": "TLS",
-                "alpn": "h2",
-                "fingerprint": "firefox",
-            },
-        }
+    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None, known_host_uuids=None, country=""):
+        proto_map = host_projection(panel_domain, reality_domain, node_name, vision_domain, country)
 
-        # Check existing hosts
+        # Every Host the Panel holds is considered, because the remark is a label
+        # and not an identity: it carries the country flag and the node name the
+        # wizard confirmed, so a relabelled node arrives here with remarks that no
+        # existing record holds, and a hand-typed remark can equal ours.
         hosts_res = self.request("GET", "/api/hosts")
         existing_hosts = _extract_list(hosts_res, "hosts")
-        existing_by_remark = {}
-        if isinstance(existing_hosts, list):
-            for h in existing_hosts:
-                existing_by_remark[h.get("remark")] = h
+        if not isinstance(existing_hosts, list):
+            existing_hosts = []
+        recorded = {str(u) for u in (known_host_uuids or []) if u}
 
         created_host_uuids = []
         for inb in inbounds_list:
@@ -690,8 +816,8 @@ class GoWaveClient:
             if "mihomoX25519" in cfg:
                 payload["mihomoX25519"] = cfg["mihomoX25519"]
 
-            if remark in existing_by_remark:
-                existing = existing_by_remark[remark]
+            existing = self._owned_host(existing_hosts, payload, recorded)
+            if existing is not None:
                 host_uuid = existing.get("uuid")
                 before_fields = [
                     "inbound", "nodes", "remark", "address", "port", "sni",
@@ -718,6 +844,40 @@ class GoWaveClient:
 
         return created_host_uuids
 
+    def _owned_host(self, existing_hosts, payload, recorded):
+        """The existing Host this payload relabels, or ``None`` to create one.
+
+        A recorded UUID settles the question even when two records claim the same
+        inbound: the operator's own identity outranks a pairing. Without one, the
+        pairing must be unique. Anything else is a conflict this run refuses to
+        resolve by guessing, and a remark that already exists on a record it
+        cannot claim is a conflict too — writing a second Host with the same label
+        would leave two entries nothing can tell apart afterwards.
+        """
+        wanted = host_ownership(payload)
+        matches = [h for h in existing_hosts if wanted is not None and host_ownership(h) == wanted]
+        chosen = next((h for h in matches if str(h.get("uuid")) in recorded), None)
+        if chosen is None and len(matches) > 1:
+            listed = ", ".join(sorted(str(h.get("uuid")) for h in matches))
+            raise GoWaveHostConflict(
+                f"{len(matches)} Host records claim inbound "
+                f"{payload['inbound']['configProfileInboundUuid']} on node "
+                f"{', '.join(payload['nodes'])}; refusing to relabel any of them "
+                f"({listed}) until the duplicates are resolved."
+            )
+        if chosen is None and matches:
+            chosen = matches[0]
+        if chosen is None:
+            taken = [h for h in existing_hosts if h.get("remark") == payload["remark"]]
+            if taken:
+                held_by = sorted(str(h.get("uuid")) for h in taken)
+                raise GoWaveHostConflict(
+                    f"The remark {payload['remark']!r} is held by Host "
+                    f"{', '.join(held_by)}, which this run cannot prove it manages; "
+                    "rename or remove that Host before retrying."
+                )
+        return chosen
+
     def provision_user(self, username, squad_uuid, expire_at="2099-01-01T00:00:00.000Z"):
         # Check existing user
         try:
@@ -737,7 +897,9 @@ class GoWaveClient:
             "status": "ACTIVE",
             "trafficLimitStrategy": "NO_RESET",
             "expireAt": expire_at,
-            "activeInternalSquads": [squad_uuid],
+            # A Panel-only install has no squad to attach yet; an empty list is
+            # a real answer, while a null entry is the defect this change fixes.
+            "activeInternalSquads": [squad_uuid] if squad_uuid else [],
         }
         pending = self._record_pending_create("user")
         res = self.request("POST", "/api/users", payload)
@@ -745,6 +907,42 @@ class GoWaveClient:
         short_uuid = data.get("shortUuid")
         self._complete_pending_create(pending, data.get("uuid") or data.get("id"))
         return short_uuid
+
+    def attach_squad_to_user(self, username, squad_uuid):
+        """Put a user that holds no squad into the squad just provisioned.
+
+        A Panel-only install creates ``default-user`` before any inbound exists, so
+        that user holds no squad; the first ``node add`` creates the squad, and
+        without this call the Panel answers the user's subscription with its own
+        "No Hosts Available" placeholder instead of the node's endpoints. A user the
+        Panel has never seen, or one that already holds a squad, is left alone —
+        assigning squads to *other* users stays the operator's decision.
+
+        Returns ``True`` when the squad was attached, ``False`` when the user was
+        already assigned, and ``None`` when there is no such user.
+        """
+        try:
+            res = self.request("GET", f"/api/users/by-username/{username}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+        user = res.get("response", res) or {}
+        squads = user.get("activeInternalSquads") or []
+        if squads:
+            return False
+        user_id = user.get("uuid") or user.get("id")
+        if user_id is None:
+            raise GoWaveAPIError(f"The Panel returned user {username} without an identifier")
+        # The read answers squad objects, the write takes identifiers.
+        before = {
+            "activeInternalSquads": [
+                item.get("uuid") if isinstance(item, dict) else item for item in squads
+            ]
+        }
+        self._record_transaction_entity("user", user_id, "updated", before)
+        self.request("PATCH", f"/api/users/{user_id}", {"activeInternalSquads": [squad_uuid]})
+        return True
 
     def issue_api_token(self, token_name="gowave-auto-sub-token"):
         scopes = [
@@ -836,6 +1034,24 @@ class GoWaveClient:
             if e.status_code == 404:
                 return None
             raise
+
+
+def confirmed_country(value, previous=""):
+    """The exit country to store for a node entry.
+
+    The value is a code the operator confirmed in the wizard, where the set of
+    assigned ISO 3166-1 alpha-2 codes lives. This function is the second reader,
+    not a second catalog: it accepts the shape and keeps whatever the entry
+    already held, so a run that was never asked cannot erase the label of a node
+    whose country the operator has already confirmed.
+    """
+    code = str(value or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", code):
+        return code
+    kept = str(previous or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", kept):
+        return kept
+    return ""
 
 
 def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.json"):
@@ -1132,6 +1348,8 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                         client.request("PATCH", "/api/internal-squads", {"uuid": uuid, **before})
                     elif etype == "host":
                         client.request("PATCH", "/api/hosts", {"uuid": uuid, **before})
+                    elif etype == "user":
+                        client.request("PATCH", f"/api/users/{uuid}", before)
                     else:
                         raise GoWaveAPIError(f"Unsupported updated entity type: {etype}")
                 elif action == "created":

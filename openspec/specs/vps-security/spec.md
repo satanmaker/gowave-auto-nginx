@@ -1,0 +1,101 @@
+# vps-security Specification
+
+## Purpose
+
+Enforces non-destructive host security hardening, firewall controls, automated security updates without auto-reboot, strict DNS-over-TLS, and conditional kernel optimizations.
+
+## Requirements
+
+### Requirement: Non-Destructive SSH Port and Socket Inspection
+The security subsystem SHALL discover active SSH ports and socket bindings using `sshd -T` and `systemctl show ssh.socket -p Listen` without modifying existing `sshd_config` or truncating root authorized keys.
+
+#### Scenario: SSH port detection and firewall safeguard
+- **GIVEN** a host with SSH running on a custom port or managed via `ssh.socket`
+- **WHEN** security configuration evaluates SSH settings
+- **THEN** effective listening ports are extracted from both daemon configuration and socket units, and whitelisted in UFW before the firewall is activated.
+
+### Requirement: Fail2ban Intrusion Prevention
+The security subsystem SHALL install `python3-systemd`, configure `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` using `backend = systemd` matching `ssh.service` and `ssh@*.service` (`ssh.socket`), and verify active jail status via `fail2ban-client status`.
+
+#### Scenario: Fail2ban jail activation and verification
+- **GIVEN** a host with `fail2ban` and `python3-systemd` installed
+- **WHEN** the security module is applied
+- **THEN** the drop-in configuration is installed with `backend = systemd` and `journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session`, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring both standalone services and socket-activated SSH sessions.
+
+### Requirement: Strict DNS-over-TLS with Rollback
+The security subsystem SHALL optionally configure `systemd-resolved` with encrypted Cloudflare and Google DoT resolvers, auto-installing the package on Debian 12 if absent, and atomically reverting on failure.
+
+#### Scenario: Successful DoT deployment on Debian 12
+- **GIVEN** a clean Debian 12 host lacking `systemd-resolved`
+- **WHEN** DNS-over-TLS is selected
+- **THEN** `systemd-resolved` is installed via APT, the drop-in configuration is written, DNS-over-TLS is verified via `resolvectl status`, and unencrypted link DNS is preserved if needed.
+
+#### Scenario: Atomic rollback on DoT network failure
+- **GIVEN** a VPS environment where upstream port 853 is blocked by the datacenter
+- **WHEN** DNS-over-TLS query verification fails
+- **THEN** the drop-in configuration is removed, original DNS settings are restored, and a warning is logged without aborting installation.
+
+#### Scenario: Edge Worker applies the same strict DoT policy
+- **GIVEN** an Edge Worker host being hardened by `gowave-node-auto.sh`
+- **WHEN** host security configuration runs
+- **THEN** the Worker receives the same strict DoT drop-in as the Master, a failed DoT verification is logged as a warning instead of aborting the deployment, and both the compensating and the standalone rollback remove only a drop-in carrying the project marker.
+
+### Requirement: UFW Firewall Port Lockdown
+The security subsystem SHALL manage UFW rules atomically, opening only necessary ports, whitelisting Control Plane IP for Node ports, and preventing administrator lockout. Because `gowave-node` binds wildcard addresses (`:3002`), UFW rules SHALL explicitly block external inbound traffic on node ports in All-in-One setups.
+
+#### Scenario: Atomic UFW activation
+- **GIVEN** a host with SSH access
+- **WHEN** firewall rules are applied
+- **THEN** SSH ports are allowed first, ports 80 and 443 are allowed publicly, internal ports (3000, 3001, 3002, 7443, 8443, 9443, 10001-10003) remain closed to external interfaces via explicit deny rules across both IPv4 and IPv6, and UFW is enabled.
+
+#### Scenario: Node control port whitelisting
+- **GIVEN** an edge node deployment with a defined `PANEL_IP`
+- **WHEN** firewall rules are applied on the node
+- **THEN** `NODE_PORT` is allowed strictly from `PANEL_IP` (for both IPv4 and IPv6 where enabled), and connections from all other external IPs are dropped.
+
+#### Scenario: Firewall persistence and dual-stack isolation across reboots
+- **GIVEN** an active UFW configuration with node port 3002 denied to external interfaces
+- **WHEN** UFW is reloaded or the operating system reboots
+- **THEN** effective iptables and ip6tables rules persist, node port 3002 remains strictly inaccessible from external IPv4 and IPv6 addresses, and loopback connectivity (`127.0.0.1`, `::1`) is unaffected.
+
+#### Scenario: Conditional UFW IPv6 handling when IPv6 is disabled in kernel
+- **GIVEN** a host with `net.ipv6.conf.all.disable_ipv6=1` or lacking IPv6 default route
+- **WHEN** firewall rules are applied
+- **THEN** `IPV6=no` is set in `/etc/default/ufw` to prevent ip6tables failures, and firewall rules are applied exclusively across IPv4 interfaces.
+
+### Requirement: Optional Swap Space Management
+The security subsystem SHALL provide filesystem-aware swap allocation (1 GiB) using `dd if=/dev/zero` or `btrfs filesystem mkswapfile` (strictly avoiding `fallocate` holes on XFS/Btrfs), safely detecting existing swap and container virtualization limitations.
+
+#### Scenario: Swap creation on low-memory VPS
+- **GIVEN** a KVM VPS with <= 1GB RAM and no active swap
+- **WHEN** swap configuration is evaluated
+- **THEN** it verifies that unmanaged `/swapfile` does not exist (refusing to overwrite), creates a 1GB swap file using filesystem-appropriate tools (handling Btrfs via `btrfs filesystem mkswapfile` and others via `fallocate`/`dd`), sets mode 0600, activates via `swapon`, and persists to `/etc/fstab` atomically only after successful activation.
+
+#### Scenario: Skip swap on containerized environments
+- **GIVEN** an LXC or OpenVZ container where `swapon` is restricted
+- **WHEN** swap configuration is evaluated
+- **THEN** swap creation is skipped gracefully without raising a fatal error.
+
+### Requirement: Automated Security Updates Without Auto-Reboot
+The security subsystem SHALL configure `unattended-upgrades` with OS-specific security repository origins and set `Automatic-Reboot "false"` by default to prevent unexpected VPN downtime.
+
+#### Scenario: Distro-specific security updates configuration
+- **GIVEN** a target host running Ubuntu or Debian
+- **WHEN** automated updates are configured
+- **THEN** `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` is written with the appropriate distro security origin pattern, and `Unattended-Upgrade::Automatic-Reboot` is set to `"false"`.
+
+### Requirement: Conditional Kernel BBR Congestion Control and MTU Probing
+The security subsystem SHALL enable BBR congestion control and path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via dedicated oneshot service `bbr-load.service` ordered before `systemd-sysctl` with graceful fallback on kernels lacking `tcp_bbr`.
+
+#### Scenario: BBR and MTU probing activation when module is available
+- **GIVEN** a Linux kernel supporting `tcp_bbr`
+- **WHEN** kernel performance tuning is requested
+- **THEN** `/etc/systemd/system/bbr-load.service` is deployed with `Before=systemd-sysctl.service` executing `modprobe tcp_bbr` and `sysctl -w net.ipv4.tcp_congestion_control=bbr` (with `-` non-fatal prefix), and `/etc/sysctl.d/99-gowave.conf` configures `net.core.default_qdisc = fq`, `net.ipv4.tcp_congestion_control = bbr`, and `net.ipv4.tcp_mtu_probing = 1`.
+
+### Requirement: NGINX and Journald Log Rotation Policy
+The security subsystem SHALL enforce log rotation policies via `/etc/logrotate.d/gowave-nginx` (daily, 7 days retention, compressed) and cap systemd journal size to 100MB to prevent disk exhaustion.
+
+#### Scenario: Logrotate and journald configuration verification
+- **GIVEN** an active GoWave installation producing access and system logs
+- **WHEN** log retention policies are configured
+- **THEN** `/etc/logrotate.d/gowave-nginx` is deployed with daily rotation and reload hooks, and `/etc/systemd/journald.conf.d/99-gowave.conf` caps journal storage at `SystemMaxUse=100M`.

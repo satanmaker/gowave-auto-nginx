@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gowave-node-auto.sh - Distributed Edge Worker Deployment and Hardening Orchestrator
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECOMMENDED_NODE_PORT=3002
@@ -8,6 +8,20 @@ RECOMMENDED_NODE_PORT=3002
 log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
 log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
+
+# Refuse to delete a tree that is not strictly below a directory this script
+# owns: ${var:?} rejects only unset and empty values, while "/", "..", or a
+# domain that resolves elsewhere all pass it.
+require_tree_under() {
+    local path="$1" parent="$2"
+    local resolved_path resolved_parent
+    [[ -n "$path" && -n "$parent" ]] || return 1
+    resolved_path=$(realpath -m -- "$path") || return 1
+    resolved_parent=$(realpath -m -- "$parent") || return 1
+    [[ "$resolved_parent" != "/" ]] || return 1
+    [[ "$resolved_path" == "$resolved_parent"/* ]] || return 1
+    [[ "$resolved_path" != "$resolved_parent" ]]
+}
 
 # Modules source if local
 if [[ -f "$SCRIPT_DIR/modules/os.sh" ]]; then
@@ -328,6 +342,11 @@ fi
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
         rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        if ! require_tree_under "$live_dir" "$letsencrypt_root" ||
+            ! require_tree_under "$archive_dir" "$letsencrypt_root"; then
+            echo "Error: Refusing to remove ACME lineage for $domain outside $letsencrypt_root." >&2
+            return 1
+        fi
         rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
@@ -427,6 +446,10 @@ cleanup_acme_snapshot() {
 
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
     if [[ -d "$snap_dir" ]]; then
+        if ! require_tree_under "$snap_dir" "$recovery_root"; then
+            echo "Error: Refusing to remove ACME snapshot outside $recovery_root (transaction $transaction_id)." >&2
+            return 1
+        fi
         rm -rf "$snap_dir"
     fi
 }
@@ -578,6 +601,66 @@ acquire_mutation_lock() {
     return 1
 }
 
+# The deploy hook outlives both the transaction that installed it and its
+# recovery snapshot, which is deleted once the install commits. Ownership is
+# therefore recorded outside the snapshot as well, so the next transaction can
+# still tell its own hook from one an operator or another product left behind.
+deploy_hook_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx/recovery}/deploy-hook-ownership.json"
+}
+
+deploy_hook_record_matches() {
+    local record="$1"
+    local hook_file="$2"
+    local digest="$3"
+    if [[ ! -f "$record" || -L "$record" ]]; then
+        return 1
+    fi
+    python3 - "$record" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+record_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(record_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+}
+
+deploy_hook_owned_by_prior_transaction() {
+    local hook_file="$1"
+    local recovery_root="$2"
+    if [[ ! -f "$hook_file" || -L "$hook_file" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$recovery_root" || -L "$recovery_root" ]]; then
+        return 1
+    fi
+    local digest
+    digest=$(sha256sum -- "$hook_file" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$digest" ]]; then
+        return 1
+    fi
+    if deploy_hook_record_matches "$(deploy_hook_ownership_record "$recovery_root")" "$hook_file" "$digest"; then
+        return 0
+    fi
+    local manifest
+    for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
+        if deploy_hook_record_matches "$manifest" "$hook_file" "$digest"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 verify_deploy_hook_preflight() {
     local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local transaction_id="${2:-}"
@@ -586,13 +669,25 @@ verify_deploy_hook_preflight() {
     if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then
         if [[ -n "$transaction_id" ]]; then
             local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-            if [[ -f "$manifest" ]]; then
+            # The manifest records that a transaction created a hook at this path;
+            # it does not say that what now sits there is that hook. A symlink, a
+            # directory or a FIFO is never adopted on the strength of the manifest
+            # alone, and neither is a file whose bytes or path differ from the
+            # recorded ones.
+            if [[ -f "$manifest" && ! -L "$manifest" && -f "$hook_file" && ! -L "$hook_file" ]]; then
                 local owned
-                owned=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+                owned=$(python3 -c 'import hashlib,json,sys; m,h=sys.argv[1:3]; d=json.load(open(m,"r",encoding="utf-8")); s=hashlib.sha256(open(h,"rb").read()).hexdigest(); print("1" if d.get("created_by_tx") is True and d.get("path")==h and d.get("sha256")==s else "0")' "$manifest" "$hook_file" 2>/dev/null || echo "0")
                 if [[ "$owned" == "1" ]]; then
                     return 0
                 fi
             fi
+        fi
+        # A repeated install finds the hook an earlier transaction installed. It is
+        # only recognised as ours when that transaction recorded this exact path and
+        # the file still hashes to what was recorded, so a hook written or edited by
+        # someone else stays a refusal rather than a file this product overwrites.
+        if deploy_hook_owned_by_prior_transaction "$hook_file" "$recovery_root"; then
+            return 0
         fi
         echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
         return 1
@@ -605,6 +700,1050 @@ verify_deploy_hook_preflight() {
         return 1
     fi
     return 0
+}
+
+worker_mutation_targets() {
+    # The paths this install creates and its rollback removes. A path that is
+    # already here is only touched when the ownership record names it.
+    cat <<'WORKER_TARGETS'
+/etc/systemd/system/gowave-node.service
+/etc/systemd/system/gowave-node.service.d
+/etc/systemd/system/remnanode.service
+/opt/gowave-node
+/run/gowave-node
+/opt/remnanode
+/usr/local/bin/gowave-node
+/usr/local/bin/xray
+/etc/nginx/conf.d/00-worker-acme-challenge.conf
+/etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+/etc/nginx/conf.d/gowave-worker-https.conf
+/etc/nginx/conf.d/gowave-worker-decoy.conf
+/etc/nginx/conf.d/gowave-worker-vision-fallback.conf
+/etc/nginx/stream-enabled/gowave-worker-stream.conf
+/var/www/gowave-acme
+/var/www/gowave-auto-nginx/cover-reality
+WORKER_TARGETS
+}
+
+worker_ownership_record() {
+    local base="${1:-/var/lib/gowave-auto-nginx}"
+    # "/" is the host itself, where the state root is the product's own.
+    [[ "$base" == "/" ]] && base="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "$base/worker-install-ownership.json"
+}
+
+verify_worker_mutation_targets_preflight() {
+    # The root and the record are arguments so a test can drive this guard over
+    # a directory it owns; the install passes neither and gets the host.
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record "$root")}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_PREFLIGHT_PY'
+import hashlib
+import json
+import os
+import sys
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def refuse(path, what):
+    print(
+        "Error: Pre-existing unowned Worker " + what + " " + path + ". Refusing to "
+        "overwrite or remove an unmanaged host resource.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+recorded = {}
+if os.path.lexists(record):
+    if os.path.islink(record) or not os.path.isfile(record):
+        print("Error: Worker ownership record " + record + " is not a regular file.", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        print("Error: Worker ownership record " + record + " is not readable JSON.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        print(
+            "Error: Worker ownership record " + record + " does not claim this product created anything.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        print("Error: Worker ownership record " + record + " names no targets.", file=sys.stderr)
+        raise SystemExit(1)
+
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    entry = recorded.get(target)
+    if os.path.islink(path):
+        # The upstream installer links the Worker binary into /usr/local/bin,
+        # so a link this install wrote is adopted by the target it recorded.
+        # Any other link stays foreign even when its target holds our bytes.
+        if isinstance(entry, dict) and entry.get("kind") == "symlink" and entry.get("target") == os.readlink(path):
+            continue
+        refuse(path, "path")
+    if os.path.isdir(path):
+        if isinstance(entry, dict) and entry.get("kind") == "directory":
+            continue
+        refuse(path, "directory")
+    if not os.path.isfile(path):
+        refuse(path, "path")
+    try:
+        current = digest(path)
+    except OSError:
+        current = ""
+    if current and isinstance(entry, dict) and entry.get("kind") == "file" and entry.get("sha256") == current:
+        continue
+    refuse(path, "file")
+WORKER_PREFLIGHT_PY
+}
+
+record_worker_mutation_targets() {
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record "$root")}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_RECORD_PY'
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+data = {"created_by_tx": True, "targets": {}}
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    if os.path.islink(path):
+        data["targets"][target] = {"kind": "symlink", "target": os.readlink(path)}
+    elif os.path.isdir(path):
+        data["targets"][target] = {"kind": "directory"}
+    elif os.path.isfile(path):
+        data["targets"][target] = {"kind": "file", "sha256": digest(path)}
+
+directory = os.path.dirname(record) or "."
+os.makedirs(directory, mode=0o700, exist_ok=True)
+handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-ownership.", suffix=".tmp")
+try:
+    os.fchmod(handle, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, record)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+directory_handle = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(directory_handle)
+finally:
+    os.close(directory_handle)
+WORKER_RECORD_PY
+}
+
+firewall_before_image() {
+    # Per transaction, beside the ACME snapshot: the recovery root is removed
+    # by remote_finalize after a verified install, so a successful run leaves
+    # no image behind and a failed one leaves exactly the one it needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${ACME_TX_ID:-}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/firewall-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/firewall-before-image"
+}
+
+firewall_image() {
+    # One heredoc, two actions: what the firewall read before this install
+    # changed it, and the only way back to that state. The rollback script
+    # carries the same text, and a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(firewall_before_image)}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: firewall_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    python3 - "$root" "$image" "$action" <<'FIREWALL_IMAGE_PY'
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root, image, action = sys.argv[1:4]
+
+CONFIG_FILES = (
+    "/etc/default/ufw",
+    "/etc/ufw/user.rules",
+    "/etc/ufw/user6.rules",
+    "/etc/ufw/before.rules",
+    "/etc/ufw/before6.rules",
+    "/etc/ufw/after.rules",
+    "/etc/ufw/after6.rules",
+)
+MANIFEST = os.path.join(image, "manifest.json")
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def run(argv, stdin_text=None):
+    result = subprocess.run(argv, capture_output=True, text=True, input=stdin_text)
+    return result.returncode, result.stdout, result.stderr
+
+
+def digest_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def digest_file(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def normalized(text):
+    """The ruleset without the bookkeeping `iptables-save` adds on its own.
+
+    Every dump is stamped with the moment it ran and carries the live
+    counters of each chain, and `iptables-restore` zeroes those counters.
+    Neither is a rule, so a read-back compares what is left.
+    """
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        if line.startswith(":") and line.endswith("]"):
+            line = line[: line.rindex("[")] + "[0:0]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".firewall-image.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Firewall before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    status_code, status_text, status_error = run(["ufw", "status", "verbose"])
+    if status_code != 0:
+        fail(
+            "ufw status verbose exited " + str(status_code) + "; refusing to change a firewall this install cannot "
+            "restore: " + status_error.strip()[-300:]
+        )
+    first = status_text.splitlines()[0].strip() if status_text.strip() else ""
+    if first not in ("Status: active", "Status: inactive"):
+        fail("ufw status verbose printed no status line; refusing to change a firewall this install cannot restore.")
+    defaults = {}
+    for line in status_text.splitlines():
+        if not line.startswith("Default:"):
+            continue
+        for part in line[len("Default:"):].split(","):
+            words = part.split()
+            if len(words) >= 2:
+                defaults[words[1].strip("()")] = words[0]
+    # `ufw status verbose` prints no Default line until the firewall has been
+    # enabled once: an inactive firewall holds no policy, so there is none to
+    # restore and the image records that instead of refusing the install.
+    if first == "Status: active" and set(defaults) != {"incoming", "outgoing", "routed"}:
+        fail(
+            "ufw status verbose printed no complete default policy line; refusing to change a firewall this "
+            "install cannot restore."
+        )
+    dumps = {}
+    for name, argv in (("iptables", ["iptables-save"]), ("ip6tables", ["ip6tables-save"])):
+        code, text, error = run(argv)
+        if code != 0:
+            if name == "ip6tables" and not os.path.exists(under("/proc/net/if_inet6")):
+                dumps[name] = None
+                continue
+            fail(
+                argv[0] + " exited " + str(code) + "; refusing to change a firewall this install cannot restore: "
+                + error.strip()[-300:]
+            )
+        dumps[name] = text
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {
+        "created_by_tx": True,
+        "enabled": first == "Status: active",
+        "status_verbose": status_text,
+        "defaults": defaults,
+        "files": {},
+        "iptables": None,
+        "ip6tables": None,
+    }
+    try:
+        for path in CONFIG_FILES:
+            real = under(path)
+            if not os.path.lexists(real):
+                continue
+            if os.path.islink(real) or not os.path.isfile(real):
+                fail(
+                    "UFW configuration " + real + " is not a regular file; refusing to change a firewall this "
+                    "install cannot restore."
+                )
+            with open(real, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + digest_bytes(path.encode("utf-8"))[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(real)
+            data["files"][path] = {
+                "copy": copy,
+                "sha256": digest_bytes(payload),
+                "mode": state.st_mode & 0o7777,
+                "uid": state.st_uid,
+                "gid": state.st_gid,
+            }
+        for name, text in dumps.items():
+            if text is None:
+                continue
+            copy = name + "-save.txt"
+            write_atomic(os.path.join(image, copy), text.encode("utf-8"), 0o600)
+            data[name] = {"copy": copy, "sha256": digest_bytes(text.encode("utf-8"))}
+        write_atomic(MANIFEST, (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8"), 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def restore():
+    if not os.path.isfile(MANIFEST):
+        fail("No firewall before-image at " + image + "; refusing to guess which rules this install added.")
+    if os.path.islink(MANIFEST):
+        fail("Firewall before-image " + MANIFEST + " is a symlink; refusing to restore from it.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail("Firewall before-image " + MANIFEST + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Firewall before-image " + MANIFEST + " does not claim this product created it.")
+    for key in ("enabled", "status_verbose", "defaults", "files", "iptables"):
+        if key not in data:
+            fail("Firewall before-image " + MANIFEST + " is incomplete: no " + key + ".")
+    if not isinstance(data["files"], dict) or not isinstance(data["iptables"], dict):
+        fail("Firewall before-image " + MANIFEST + " names no restorable files.")
+    for path, meta in data["files"].items():
+        copy = os.path.join(image, str(meta.get("copy") or ""))
+        if not os.path.isfile(copy) or os.path.islink(copy):
+            fail("Firewall before-image copy for " + path + " is missing.")
+        if digest_file(copy) != meta.get("sha256"):
+            fail("Firewall before-image copy for " + path + " changed after it was written.")
+        with open(copy, "rb") as stream:
+            payload = stream.read()
+        target = under(path)
+        write_atomic(target, payload, int(meta.get("mode") or 0o644))
+        try:
+            os.chown(target, int(meta.get("uid") or 0), int(meta.get("gid") or 0))
+        except OSError:
+            pass
+    # The enabled state first: `ufw --force disable` flushes the chains, so a
+    # dump applied before it would be the rules this install added, not these.
+    state = "enable" if data["enabled"] else "disable"
+    code, _, error = run(["ufw", "--force", state])
+    if code != 0:
+        fail("ufw --force " + state + " exited " + str(code) + ": " + error.strip()[-300:])
+    restored = {}
+    for name, argv in (("iptables", ["iptables-restore"]), ("ip6tables", ["ip6tables-restore"])):
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            continue
+        copy = os.path.join(image, str(entry.get("copy") or ""))
+        if not os.path.isfile(copy):
+            fail("Firewall before-image copy for " + name + " is missing.")
+        with open(copy, "r", encoding="utf-8") as stream:
+            text = stream.read()
+        code, _, error = run(argv, stdin_text=text)
+        if code != 0:
+            fail(argv[0] + " exited " + str(code) + ": " + error.strip()[-300:])
+        restored[name] = text
+    code, status_text, _ = run(["ufw", "status", "verbose"])
+    if code != 0 or status_text != data["status_verbose"]:
+        fail("The restored firewall does not read back as the before-image.")
+    code, saved, _ = run(["iptables-save"])
+    if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
+        fail("The restored IPv4 ruleset does not match the before-image.")
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+FIREWALL_IMAGE_PY
+}
+
+record_firewall_before_image() {
+    firewall_image capture "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+restore_firewall_before_image() {
+    firewall_image restore "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+worker_targets_before_image() {
+    # Per transaction, beside the ACME snapshot and the firewall image: what
+    # every inventoried path held before this transaction touched it. The
+    # recovery root is removed by remote_finalize after a verified install, so
+    # a successful run leaves no image behind and a failed one keeps exactly
+    # the one its rollback needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-${ACME_TX_ID:-}}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/worker-targets-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/worker-targets-before-image"
+}
+
+worker_targets_image() {
+    # The state of every inventoried path before this transaction wrote it, and
+    # the way back to that state. A created path is removed only while it is
+    # still what this install wrote — the ownership record is the proof — and a
+    # pre-existing path is put back with its content and metadata. Anything
+    # changed after the write, or that no record can prove, is preserved with
+    # the cleanup reported incomplete. The payload carries this text twice and
+    # the rollback script once; a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(worker_targets_before_image)}"
+    local record="${4:-$(worker_ownership_record "$root")}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: worker_targets_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$image" "$action" "$record" "$targets" <<'WORKER_TARGETS_PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+root, image, action, record, listed = sys.argv[1:6]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+MANIFEST = os.path.join(image, "manifest.json")
+preserved = []
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keep(path, why):
+    preserved.append(path)
+    print("Error: Preserving " + path + ": " + why + "; cleanup is incomplete.", file=sys.stderr)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-targets.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def describe(path):
+    # What sits at the path now, in the same words the ownership record uses.
+    if os.path.islink(path):
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if os.path.isdir(path):
+        return {"kind": "directory"}
+    if os.path.isfile(path):
+        return {"kind": "file", "sha256": digest(path)}
+    return None
+
+
+def record_entries():
+    # The record of what this transaction wrote, or None when there is nothing
+    # an operator can be asked to trust.
+    if not os.path.lexists(record):
+        return None
+    if os.path.islink(record) or not os.path.isfile(record):
+        return None
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        return None
+    entries = data.get("targets")
+    return entries if isinstance(entries, dict) else None
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Worker targets before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {"created_by_tx": True, "targets": {}}
+    try:
+        for target in targets:
+            path = under(target)
+            if not os.path.lexists(path):
+                data["targets"][target] = {"state": "absent"}
+                continue
+            if os.path.islink(path):
+                data["targets"][target] = {"state": "symlink", "target": os.readlink(path)}
+                continue
+            if os.path.isdir(path):
+                data["targets"][target] = {"state": "directory"}
+                continue
+            if not os.path.isfile(path):
+                fail(
+                    "Worker target " + path + " is not a regular file; refusing to record a state this install "
+                    "cannot restore."
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(path)
+            data["targets"][target] = {
+                "state": "file",
+                "copy": copy,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "mode": state.st_mode & 0o7777,
+                "owner": [state.st_uid, state.st_gid],
+            }
+        document = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        write_atomic(MANIFEST, document, 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def remove_created(path, entry):
+    # A path that did not exist before: remove it only while it is what we wrote.
+    current = describe(path)
+    if current is None:
+        keep(path, "its state cannot be read")
+        return
+    if not isinstance(entry, dict) or entry != current:
+        keep(path, "it changed after this transaction wrote it")
+        return
+    try:
+        if current["kind"] == "directory":
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as error:
+        keep(path, "it could not be removed: " + str(error))
+
+
+def restore_pre_existing(path, entry):
+    # A path that was here before: put back its recorded content and metadata.
+    state = entry.get("state")
+    if state == "symlink":
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            os.symlink(entry.get("target") or "", path)
+        except OSError as error:
+            keep(path, "the link could not be restored: " + str(error))
+            return
+        if not os.path.islink(path) or os.readlink(path) != entry.get("target"):
+            keep(path, "the restored link does not read back as the before-image")
+        return
+    if state == "directory":
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as error:
+            keep(path, "the directory could not be restored: " + str(error))
+        return
+    if state != "file":
+        keep(path, "the before-image names no state this install can restore")
+        return
+    copy = os.path.join(image, str(entry.get("copy") or ""))
+    if not os.path.isfile(copy) or os.path.islink(copy):
+        keep(path, "its before-image copy is missing")
+        return
+    with open(copy, "rb") as stream:
+        payload = stream.read()
+    if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        keep(path, "its before-image copy changed after it was written")
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        write_atomic(path, payload, int(entry.get("mode") or 0o644))
+        owner = entry.get("owner") or [0, 0]
+        os.chown(path, int(owner[0]), int(owner[1]))
+    except OSError as error:
+        keep(path, "it could not be restored: " + str(error))
+        return
+    if digest(path) != entry.get("sha256"):
+        keep(path, "the restored file does not read back as the before-image")
+
+
+def restore():
+    if not os.path.isfile(MANIFEST) or os.path.islink(MANIFEST):
+        fail("No Worker targets before-image at " + image + "; preserving every path this install wrote.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail(
+            "Worker targets before-image " + MANIFEST + " is not readable JSON; preserving every path this "
+            "install wrote."
+        )
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Worker targets before-image " + MANIFEST + " does not claim this product created it.")
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        fail("Worker targets before-image " + MANIFEST + " names no targets.")
+    entries = record_entries()
+    for target in targets:
+        path = under(target)
+        if not os.path.lexists(path):
+            continue
+        entry = recorded.get(target)
+        if not isinstance(entry, dict):
+            keep(path, "the before-image does not name it")
+            continue
+        if entry.get("state") == "absent":
+            if entries is None:
+                keep(path, "no ownership record proves this transaction wrote it")
+                continue
+            remove_created(path, entries.get(target))
+        else:
+            restore_pre_existing(path, entry)
+    if preserved:
+        print(
+            "Error: " + str(len(preserved)) + " Worker path(s) preserved, so the cleanup is incomplete: "
+            + ", ".join(preserved),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+WORKER_TARGETS_PY
+}
+
+record_worker_targets_before_image() {
+    worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
+worker_transaction_journal() {
+    # One journal per transaction, beside the ACME snapshot and the two
+    # before-images. It is the only record of a run that was killed before it
+    # could finish: the next entrypoint reads it and knows what that run had
+    # already begun to change.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "${root%/}/recovery/${transaction}/transaction-journal.json"
+}
+
+worker_journal_action() {
+    # One writer for the journal, so the install, the reconcile and the rollback
+    # all read the same bytes back. "started" is written before the first
+    # mutation, "installed" once every mutation has been verified, and a
+    # transaction that never reached "installed" is the one a later entrypoint
+    # has to reconcile.
+    local action="$1"
+    local journal="$2"
+    local transaction="$3"
+    local journal_state="${4:-}"
+    python3 - "$action" "$journal" "$transaction" "$journal_state" <<'JOURNAL_PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+action, journal, transaction, journal_state = sys.argv[1:5]
+STATES = ("started", "installed")
+
+
+def refuse(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read():
+    if os.path.islink(journal) or not os.path.isfile(journal):
+        refuse("Worker transaction journal " + journal + " is not a regular file.")
+    try:
+        with open(journal, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        refuse("Worker transaction journal " + journal + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        refuse("Worker transaction journal " + journal + " is not a journal this product wrote.")
+    if data.get("transaction") != transaction:
+        refuse(
+            "Worker transaction journal " + journal + " records "
+            + json.dumps(data.get("transaction")) + ", not " + json.dumps(transaction) + "."
+        )
+    if data.get("state") not in STATES:
+        refuse("Worker transaction journal " + journal + " records no state this product knows.")
+    return data
+
+
+def store(state):
+    # An installed transaction is closed: rewriting it as started would let a
+    # later run undo an install that already verified every path it wrote.
+    if state == "started" and os.path.lexists(journal) and read().get("state") == "installed":
+        refuse("Worker transaction journal " + journal + " is already installed; refusing to reopen it.")
+    directory = os.path.dirname(journal)
+    if os.path.islink(directory):
+        refuse("Worker transaction directory " + directory + " is a symlink.")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = {
+        "schema": 1,
+        "transaction": transaction,
+        "state": state,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".transaction-journal.", suffix=".tmp")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def remove():
+    # The directory goes only while it is strictly below the recovery root it was
+    # found in, so a transaction name can never name its way out of that root.
+    recovery_root = os.path.realpath(os.path.dirname(os.path.dirname(journal)))
+    transaction_dir = os.path.realpath(os.path.dirname(journal))
+    if recovery_root == os.sep or not transaction_dir.startswith(recovery_root + os.sep):
+        refuse("Worker transaction directory " + transaction_dir + " is not below " + recovery_root + ".")
+    if os.path.islink(os.path.dirname(journal)):
+        refuse("Worker transaction directory " + os.path.dirname(journal) + " is a symlink.")
+    if not os.path.isdir(transaction_dir):
+        refuse("Worker transaction directory " + transaction_dir + " is not a directory.")
+    shutil.rmtree(transaction_dir)
+
+
+if action == "write":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    store(journal_state)
+elif action == "mark":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    if not os.path.lexists(journal):
+        raise SystemExit(0)
+    read()
+    store(journal_state)
+elif action == "state":
+    print(read().get("state"))
+elif action == "remove":
+    read()
+    remove()
+else:
+    refuse("Unknown Worker transaction journal action " + json.dumps(action) + ".")
+JOURNAL_PY
+}
+
+record_worker_transaction_journal() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    if [[ ! "$transaction" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: A Worker transaction journal needs a valid transaction ID." >&2
+        return 1
+    fi
+    worker_journal_action write "$(worker_transaction_journal "$root" "$transaction")" "$transaction" started
+}
+
+mark_worker_transaction_state() {
+    local transaction_state="${1:-}"
+    local transaction="${2:-}"
+    local root="${3:-/var/lib/gowave-auto-nginx}"
+    worker_journal_action mark "$(worker_transaction_journal "$root" "$transaction")" "$transaction" "$transaction_state"
+}
+
+reconcile_worker_transaction_journals() {
+    # Every entrypoint pays for the previous run's crash before it writes
+    # anything of its own. A transaction that never reached "installed" is
+    # restored from its own before-images and its directory is released; a
+    # transaction this product cannot restore, or that already installed but
+    # was never finalized, keeps its journal and the new operation is refused,
+    # so a half-written host is never built upon. The state root is where the
+    # journals live and the host root is where the inventoried paths sit; the
+    # two differ only for a test that owns a scratch tree.
+    local skip="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local host_root="${3:-/}"
+    local journal transaction transaction_dir state failed=0
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    local recovery_root="${root%/}/recovery"
+    [[ -d "$recovery_root" ]] || return 0
+    for journal in "$recovery_root"/*/transaction-journal.json; do
+        [[ -e "$journal" ]] || continue
+        transaction_dir="$(dirname "$journal")"
+        transaction="$(basename "$transaction_dir")"
+        [[ -n "$skip" && "$transaction" == "$skip" ]] && continue
+        if ! state="$(worker_journal_action state "$journal" "$transaction")"; then
+            echo "Error: Uncommitted Worker transaction $transaction cannot be read back; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ "$state" != "started" ]]; then
+            echo "Error: Worker transaction $transaction is '$state' and was never finalized; refusing to start a new install and retaining $transaction_dir. Finalize or roll it back first." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/worker-targets-before-image" ]] &&
+            ! restore_worker_targets_before_image "$host_root" "$transaction_dir/worker-targets-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its Worker before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/firewall-before-image" ]] &&
+            ! restore_firewall_before_image "$host_root" "$transaction_dir/firewall-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its firewall before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if ! worker_journal_action remove "$journal" "$transaction"; then
+            echo "Error: Worker transaction $transaction was restored but its journal could not be released; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        echo "Reconciled uncommitted Worker transaction $transaction from its before-images." >&2
+    done
+    return "$failed"
+}
+
+# --- package change record -------------------------------------------------
+# HOOK-04: a rollback restores the paths this run wrote, never the packages it
+# installed. What the package manager changed is therefore recorded while the
+# transaction still knows it, so a preserved host can be reported as carrying
+# residual state instead of being called clean.
+
+worker_package_record_dir() {
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    printf '%s\n' "${root%/}/recovery/${transaction}"
+}
+
+worker_package_inventory() {
+    # One `package<TAB>version` line per installed package, sorted, so two runs
+    # of the same host agree byte for byte and a diff of them is the package
+    # change a transaction caused.
+    if ! command -v dpkg-query >/dev/null 2>&1; then
+        return 1
+    fi
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort
+}
+
+record_worker_package_baseline() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory file temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: The transaction directory $directory is absent, so a package baseline would not belong to a journal." >&2
+        return 1
+    fi
+    file="$directory/packages-before.txt"
+    temporary="$(mktemp "$directory/.packages-before.XXXXXX")" || return 1
+    if worker_package_inventory >"$temporary" && [[ -s "$temporary" ]]; then
+        :
+    else
+        # A host whose package manager cannot answer is not a host with no
+        # packages; the baseline says what it could not learn.
+        printf '%s\n' "#unavailable" >"$temporary"
+    fi
+    if ! chmod 0600 -- "$temporary" || ! sync "$temporary" ||
+        ! mv -f -- "$temporary" "$file" || ! sync "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+record_worker_package_changes() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory before after changes temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    before="$directory/packages-before.txt"
+    if [[ ! -f "$before" ]]; then
+        echo "Error: The package baseline for $transaction is absent, so the package changes it caused cannot be stated." >&2
+        return 1
+    fi
+    after="$(mktemp "$directory/.packages-after.XXXXXX")" || return 1
+    if worker_package_inventory >"$after" && [[ -s "$after" ]]; then
+        :
+    else
+        printf '%s\n' "#unavailable" >"$after"
+    fi
+    changes="$(mktemp "$directory/.package-changes.XXXXXX")" || {
+        rm -f -- "$after"
+        return 1
+    }
+    if [[ "$(head -n 1 "$before")" == "#unavailable" ]] ||
+        [[ "$(head -n 1 "$after")" == "#unavailable" ]]; then
+        printf '%s\n' "#gowave-package-changes/v1" "#unavailable" >"$changes"
+    else
+        {
+            printf '%s\n' "#gowave-package-changes/v1"
+            awk -F'\t' '
+                FNR == NR { before[$1] = $2; next }
+                { after[$1] = $2 }
+                END {
+                    for (name in after) {
+                        if (!(name in before)) print "installed\t" name "\t" after[name]
+                        else if (before[name] != after[name]) print "upgraded\t" name "\t" before[name] "\t" after[name]
+                    }
+                    for (name in before) if (!(name in after)) print "removed\t" name "\t" before[name]
+                }
+            ' "$before" "$after" | LC_ALL=C sort
+        } >"$changes"
+    fi
+    rm -f -- "$after"
+    if ! chmod 0600 -- "$changes" || ! sync "$changes" ||
+        ! mv -f -- "$changes" "$directory/package-changes.tsv" || ! sync "$directory"; then
+        rm -f -- "$changes"
+        return 1
+    fi
+}
+restore_worker_targets_before_image() {
+    worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
 install_managed_deploy_hook() {
@@ -753,6 +1892,20 @@ EOF
         echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
         return 1
     }
+    local ownership_record ownership_tmp
+    ownership_record=$(deploy_hook_ownership_record "$recovery_root")
+    ownership_tmp="${ownership_record}.tmp.$$"
+    python3 -c 'import json, os, sys; record, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0); fd = os.open(record, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$ownership_tmp" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not record deploy-hook ownership for later transactions." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$ownership_tmp" || ! sync "$ownership_tmp" ||
+        ! mv -f -- "$ownership_tmp" "$ownership_record" || ! sync "$recovery_root"; then
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not publish the deploy-hook ownership record." >&2
+        return 1
+    fi
     echo "Configured managed ACME renewal hook in $hook_file."
 }
 rollback_managed_deploy_hook() {
@@ -770,6 +1923,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi
@@ -855,6 +2043,10 @@ PY
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
         return 1
     }
+    rm -f -- "$(deploy_hook_ownership_record "$recovery_root")" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -922,6 +2114,17 @@ remote_payload() {
         return 1
     fi
 
+    local preflight_module="$SCRIPT_DIR/modules/preflight.sh"
+    if [[ ! -f "$preflight_module" ]]; then
+        echo "Error: the required-input contract is missing at $preflight_module." >&2
+        return 1
+    fi
+    local artifact_module="$SCRIPT_DIR/modules/artifact.sh"
+    if [[ ! -f "$artifact_module" ]]; then
+        echo "Error: the pinned-artifact helper is missing at $artifact_module." >&2
+        return 1
+    fi
+
     # Validate node port and warn on host collisions if worker host matches panel IP
     if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$panel_ip" ]]; then
         if [[ "$node_port" != "$RECOMMENDED_NODE_PORT" ]]; then
@@ -961,16 +2164,45 @@ remote_payload() {
         printf 'export GOWAVE_ACME_TEST_CA_B64=%q\n' "${GOWAVE_ACME_TEST_CA_B64:-}"
         printf 'export GOWAVE_PODMAN_TEST_MODE=%q\n' "${GOWAVE_PODMAN_TEST_MODE:-0}"
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
+        # The Worker's re-entrant lease belongs to this host's lock holder, which
+        # the dispatching Master holds; it is forwarded only as an export so the
+        # Worker's own management code can prove the caller owns its lock.
+        printf 'export GOWAVE_LEASE_TOKEN=%q\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
         # Secret strictly scoped, not exported globally
         printf '_NODE_SECRET_KEY=%q\n' "$SECRET_KEY"
+
+        # 1b. The required-input contract travels as the module itself, not as a
+        # copy of it: the Worker refuses the same values the controller refused
+        # because it runs the same function bodies.
+        cat "$preflight_module"
+
+        # 1c. The pinned core is fetched and verified by the same body the
+        # controller runs, for the same reason: the Worker's own copy of the
+        # pinned step calls fetch_verified_artifact, and a payload that carried
+        # the call without the helper died on it at the pin.
+        cat "$artifact_module"
 
         # 2. Remote helper functions
         cat <<'RUNNER_FUNCS'
 log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
 log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
+
+# Refuse to delete a tree that is not strictly below a directory this script
+# owns: ${var:?} rejects only unset and empty values, while "/", "..", or a
+# domain that resolves elsewhere all pass it.
+require_tree_under() {
+    local path="$1" parent="$2"
+    local resolved_path resolved_parent
+    [[ -n "$path" && -n "$parent" ]] || return 1
+    resolved_path=$(realpath -m -- "$path") || return 1
+    resolved_parent=$(realpath -m -- "$parent") || return 1
+    [[ "$resolved_parent" != "/" ]] || return 1
+    [[ "$resolved_path" == "$resolved_parent"/* ]] || return 1
+    [[ "$resolved_path" != "$resolved_parent" ]]
+}
 
 # The local ACME fixture is a test-only trust anchor. Its endpoint is pinned so
 # enabling test mode never turns GOWAVE_ACME_SERVER into an arbitrary-URL option.
@@ -1283,6 +2515,11 @@ fi
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
         rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        if ! require_tree_under "$live_dir" "$letsencrypt_root" ||
+            ! require_tree_under "$archive_dir" "$letsencrypt_root"; then
+            echo "Error: Refusing to remove ACME lineage for $domain outside $letsencrypt_root." >&2
+            return 1
+        fi
         rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
@@ -1382,6 +2619,10 @@ cleanup_acme_snapshot() {
 
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
     if [[ -d "$snap_dir" ]]; then
+        if ! require_tree_under "$snap_dir" "$recovery_root"; then
+            echo "Error: Refusing to remove ACME snapshot outside $recovery_root (transaction $transaction_id)." >&2
+            return 1
+        fi
         rm -rf "$snap_dir"
     fi
 }
@@ -1533,6 +2774,66 @@ acquire_mutation_lock() {
     return 1
 }
 
+# The deploy hook outlives both the transaction that installed it and its
+# recovery snapshot, which is deleted once the install commits. Ownership is
+# therefore recorded outside the snapshot as well, so the next transaction can
+# still tell its own hook from one an operator or another product left behind.
+deploy_hook_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx/recovery}/deploy-hook-ownership.json"
+}
+
+deploy_hook_record_matches() {
+    local record="$1"
+    local hook_file="$2"
+    local digest="$3"
+    if [[ ! -f "$record" || -L "$record" ]]; then
+        return 1
+    fi
+    python3 - "$record" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+record_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(record_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+}
+
+deploy_hook_owned_by_prior_transaction() {
+    local hook_file="$1"
+    local recovery_root="$2"
+    if [[ ! -f "$hook_file" || -L "$hook_file" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$recovery_root" || -L "$recovery_root" ]]; then
+        return 1
+    fi
+    local digest
+    digest=$(sha256sum -- "$hook_file" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$digest" ]]; then
+        return 1
+    fi
+    if deploy_hook_record_matches "$(deploy_hook_ownership_record "$recovery_root")" "$hook_file" "$digest"; then
+        return 0
+    fi
+    local manifest
+    for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
+        if deploy_hook_record_matches "$manifest" "$hook_file" "$digest"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 verify_deploy_hook_preflight() {
     local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local transaction_id="${2:-}"
@@ -1541,13 +2842,25 @@ verify_deploy_hook_preflight() {
     if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then
         if [[ -n "$transaction_id" ]]; then
             local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-            if [[ -f "$manifest" ]]; then
+            # The manifest records that a transaction created a hook at this path;
+            # it does not say that what now sits there is that hook. A symlink, a
+            # directory or a FIFO is never adopted on the strength of the manifest
+            # alone, and neither is a file whose bytes or path differ from the
+            # recorded ones.
+            if [[ -f "$manifest" && ! -L "$manifest" && -f "$hook_file" && ! -L "$hook_file" ]]; then
                 local owned
-                owned=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+                owned=$(python3 -c 'import hashlib,json,sys; m,h=sys.argv[1:3]; d=json.load(open(m,"r",encoding="utf-8")); s=hashlib.sha256(open(h,"rb").read()).hexdigest(); print("1" if d.get("created_by_tx") is True and d.get("path")==h and d.get("sha256")==s else "0")' "$manifest" "$hook_file" 2>/dev/null || echo "0")
                 if [[ "$owned" == "1" ]]; then
                     return 0
                 fi
             fi
+        fi
+        # A repeated install finds the hook an earlier transaction installed. It is
+        # only recognised as ours when that transaction recorded this exact path and
+        # the file still hashes to what was recorded, so a hook written or edited by
+        # someone else stays a refusal rather than a file this product overwrites.
+        if deploy_hook_owned_by_prior_transaction "$hook_file" "$recovery_root"; then
+            return 0
         fi
         echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
         return 1
@@ -1560,6 +2873,1050 @@ verify_deploy_hook_preflight() {
         return 1
     fi
     return 0
+}
+
+worker_mutation_targets() {
+    # The paths this install creates and its rollback removes. A path that is
+    # already here is only touched when the ownership record names it.
+    cat <<'WORKER_TARGETS'
+/etc/systemd/system/gowave-node.service
+/etc/systemd/system/gowave-node.service.d
+/etc/systemd/system/remnanode.service
+/opt/gowave-node
+/run/gowave-node
+/opt/remnanode
+/usr/local/bin/gowave-node
+/usr/local/bin/xray
+/etc/nginx/conf.d/00-worker-acme-challenge.conf
+/etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+/etc/nginx/conf.d/gowave-worker-https.conf
+/etc/nginx/conf.d/gowave-worker-decoy.conf
+/etc/nginx/conf.d/gowave-worker-vision-fallback.conf
+/etc/nginx/stream-enabled/gowave-worker-stream.conf
+/var/www/gowave-acme
+/var/www/gowave-auto-nginx/cover-reality
+WORKER_TARGETS
+}
+
+worker_ownership_record() {
+    local base="${1:-/var/lib/gowave-auto-nginx}"
+    # "/" is the host itself, where the state root is the product's own.
+    [[ "$base" == "/" ]] && base="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "$base/worker-install-ownership.json"
+}
+
+verify_worker_mutation_targets_preflight() {
+    # The root and the record are arguments so a test can drive this guard over
+    # a directory it owns; the install passes neither and gets the host.
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record "$root")}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_PREFLIGHT_PY'
+import hashlib
+import json
+import os
+import sys
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def refuse(path, what):
+    print(
+        "Error: Pre-existing unowned Worker " + what + " " + path + ". Refusing to "
+        "overwrite or remove an unmanaged host resource.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+recorded = {}
+if os.path.lexists(record):
+    if os.path.islink(record) or not os.path.isfile(record):
+        print("Error: Worker ownership record " + record + " is not a regular file.", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        print("Error: Worker ownership record " + record + " is not readable JSON.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        print(
+            "Error: Worker ownership record " + record + " does not claim this product created anything.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        print("Error: Worker ownership record " + record + " names no targets.", file=sys.stderr)
+        raise SystemExit(1)
+
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    entry = recorded.get(target)
+    if os.path.islink(path):
+        # The upstream installer links the Worker binary into /usr/local/bin,
+        # so a link this install wrote is adopted by the target it recorded.
+        # Any other link stays foreign even when its target holds our bytes.
+        if isinstance(entry, dict) and entry.get("kind") == "symlink" and entry.get("target") == os.readlink(path):
+            continue
+        refuse(path, "path")
+    if os.path.isdir(path):
+        if isinstance(entry, dict) and entry.get("kind") == "directory":
+            continue
+        refuse(path, "directory")
+    if not os.path.isfile(path):
+        refuse(path, "path")
+    try:
+        current = digest(path)
+    except OSError:
+        current = ""
+    if current and isinstance(entry, dict) and entry.get("kind") == "file" and entry.get("sha256") == current:
+        continue
+    refuse(path, "file")
+WORKER_PREFLIGHT_PY
+}
+
+record_worker_mutation_targets() {
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record "$root")}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_RECORD_PY'
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+data = {"created_by_tx": True, "targets": {}}
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    if os.path.islink(path):
+        data["targets"][target] = {"kind": "symlink", "target": os.readlink(path)}
+    elif os.path.isdir(path):
+        data["targets"][target] = {"kind": "directory"}
+    elif os.path.isfile(path):
+        data["targets"][target] = {"kind": "file", "sha256": digest(path)}
+
+directory = os.path.dirname(record) or "."
+os.makedirs(directory, mode=0o700, exist_ok=True)
+handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-ownership.", suffix=".tmp")
+try:
+    os.fchmod(handle, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, record)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+directory_handle = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(directory_handle)
+finally:
+    os.close(directory_handle)
+WORKER_RECORD_PY
+}
+
+firewall_before_image() {
+    # Per transaction, beside the ACME snapshot: the recovery root is removed
+    # by remote_finalize after a verified install, so a successful run leaves
+    # no image behind and a failed one leaves exactly the one it needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${ACME_TX_ID:-}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/firewall-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/firewall-before-image"
+}
+
+firewall_image() {
+    # One heredoc, two actions: what the firewall read before this install
+    # changed it, and the only way back to that state. The rollback script
+    # carries the same text, and a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(firewall_before_image)}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: firewall_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    python3 - "$root" "$image" "$action" <<'FIREWALL_IMAGE_PY'
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root, image, action = sys.argv[1:4]
+
+CONFIG_FILES = (
+    "/etc/default/ufw",
+    "/etc/ufw/user.rules",
+    "/etc/ufw/user6.rules",
+    "/etc/ufw/before.rules",
+    "/etc/ufw/before6.rules",
+    "/etc/ufw/after.rules",
+    "/etc/ufw/after6.rules",
+)
+MANIFEST = os.path.join(image, "manifest.json")
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def run(argv, stdin_text=None):
+    result = subprocess.run(argv, capture_output=True, text=True, input=stdin_text)
+    return result.returncode, result.stdout, result.stderr
+
+
+def digest_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def digest_file(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def normalized(text):
+    """The ruleset without the bookkeeping `iptables-save` adds on its own.
+
+    Every dump is stamped with the moment it ran and carries the live
+    counters of each chain, and `iptables-restore` zeroes those counters.
+    Neither is a rule, so a read-back compares what is left.
+    """
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        if line.startswith(":") and line.endswith("]"):
+            line = line[: line.rindex("[")] + "[0:0]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".firewall-image.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Firewall before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    status_code, status_text, status_error = run(["ufw", "status", "verbose"])
+    if status_code != 0:
+        fail(
+            "ufw status verbose exited " + str(status_code) + "; refusing to change a firewall this install cannot "
+            "restore: " + status_error.strip()[-300:]
+        )
+    first = status_text.splitlines()[0].strip() if status_text.strip() else ""
+    if first not in ("Status: active", "Status: inactive"):
+        fail("ufw status verbose printed no status line; refusing to change a firewall this install cannot restore.")
+    defaults = {}
+    for line in status_text.splitlines():
+        if not line.startswith("Default:"):
+            continue
+        for part in line[len("Default:"):].split(","):
+            words = part.split()
+            if len(words) >= 2:
+                defaults[words[1].strip("()")] = words[0]
+    # `ufw status verbose` prints no Default line until the firewall has been
+    # enabled once: an inactive firewall holds no policy, so there is none to
+    # restore and the image records that instead of refusing the install.
+    if first == "Status: active" and set(defaults) != {"incoming", "outgoing", "routed"}:
+        fail(
+            "ufw status verbose printed no complete default policy line; refusing to change a firewall this "
+            "install cannot restore."
+        )
+    dumps = {}
+    for name, argv in (("iptables", ["iptables-save"]), ("ip6tables", ["ip6tables-save"])):
+        code, text, error = run(argv)
+        if code != 0:
+            if name == "ip6tables" and not os.path.exists(under("/proc/net/if_inet6")):
+                dumps[name] = None
+                continue
+            fail(
+                argv[0] + " exited " + str(code) + "; refusing to change a firewall this install cannot restore: "
+                + error.strip()[-300:]
+            )
+        dumps[name] = text
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {
+        "created_by_tx": True,
+        "enabled": first == "Status: active",
+        "status_verbose": status_text,
+        "defaults": defaults,
+        "files": {},
+        "iptables": None,
+        "ip6tables": None,
+    }
+    try:
+        for path in CONFIG_FILES:
+            real = under(path)
+            if not os.path.lexists(real):
+                continue
+            if os.path.islink(real) or not os.path.isfile(real):
+                fail(
+                    "UFW configuration " + real + " is not a regular file; refusing to change a firewall this "
+                    "install cannot restore."
+                )
+            with open(real, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + digest_bytes(path.encode("utf-8"))[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(real)
+            data["files"][path] = {
+                "copy": copy,
+                "sha256": digest_bytes(payload),
+                "mode": state.st_mode & 0o7777,
+                "uid": state.st_uid,
+                "gid": state.st_gid,
+            }
+        for name, text in dumps.items():
+            if text is None:
+                continue
+            copy = name + "-save.txt"
+            write_atomic(os.path.join(image, copy), text.encode("utf-8"), 0o600)
+            data[name] = {"copy": copy, "sha256": digest_bytes(text.encode("utf-8"))}
+        write_atomic(MANIFEST, (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8"), 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def restore():
+    if not os.path.isfile(MANIFEST):
+        fail("No firewall before-image at " + image + "; refusing to guess which rules this install added.")
+    if os.path.islink(MANIFEST):
+        fail("Firewall before-image " + MANIFEST + " is a symlink; refusing to restore from it.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail("Firewall before-image " + MANIFEST + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Firewall before-image " + MANIFEST + " does not claim this product created it.")
+    for key in ("enabled", "status_verbose", "defaults", "files", "iptables"):
+        if key not in data:
+            fail("Firewall before-image " + MANIFEST + " is incomplete: no " + key + ".")
+    if not isinstance(data["files"], dict) or not isinstance(data["iptables"], dict):
+        fail("Firewall before-image " + MANIFEST + " names no restorable files.")
+    for path, meta in data["files"].items():
+        copy = os.path.join(image, str(meta.get("copy") or ""))
+        if not os.path.isfile(copy) or os.path.islink(copy):
+            fail("Firewall before-image copy for " + path + " is missing.")
+        if digest_file(copy) != meta.get("sha256"):
+            fail("Firewall before-image copy for " + path + " changed after it was written.")
+        with open(copy, "rb") as stream:
+            payload = stream.read()
+        target = under(path)
+        write_atomic(target, payload, int(meta.get("mode") or 0o644))
+        try:
+            os.chown(target, int(meta.get("uid") or 0), int(meta.get("gid") or 0))
+        except OSError:
+            pass
+    # The enabled state first: `ufw --force disable` flushes the chains, so a
+    # dump applied before it would be the rules this install added, not these.
+    state = "enable" if data["enabled"] else "disable"
+    code, _, error = run(["ufw", "--force", state])
+    if code != 0:
+        fail("ufw --force " + state + " exited " + str(code) + ": " + error.strip()[-300:])
+    restored = {}
+    for name, argv in (("iptables", ["iptables-restore"]), ("ip6tables", ["ip6tables-restore"])):
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            continue
+        copy = os.path.join(image, str(entry.get("copy") or ""))
+        if not os.path.isfile(copy):
+            fail("Firewall before-image copy for " + name + " is missing.")
+        with open(copy, "r", encoding="utf-8") as stream:
+            text = stream.read()
+        code, _, error = run(argv, stdin_text=text)
+        if code != 0:
+            fail(argv[0] + " exited " + str(code) + ": " + error.strip()[-300:])
+        restored[name] = text
+    code, status_text, _ = run(["ufw", "status", "verbose"])
+    if code != 0 or status_text != data["status_verbose"]:
+        fail("The restored firewall does not read back as the before-image.")
+    code, saved, _ = run(["iptables-save"])
+    if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
+        fail("The restored IPv4 ruleset does not match the before-image.")
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+FIREWALL_IMAGE_PY
+}
+
+record_firewall_before_image() {
+    firewall_image capture "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+restore_firewall_before_image() {
+    firewall_image restore "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+worker_targets_before_image() {
+    # Per transaction, beside the ACME snapshot and the firewall image: what
+    # every inventoried path held before this transaction touched it. The
+    # recovery root is removed by remote_finalize after a verified install, so
+    # a successful run leaves no image behind and a failed one keeps exactly
+    # the one its rollback needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-${ACME_TX_ID:-}}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/worker-targets-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/worker-targets-before-image"
+}
+
+worker_targets_image() {
+    # The state of every inventoried path before this transaction wrote it, and
+    # the way back to that state. A created path is removed only while it is
+    # still what this install wrote — the ownership record is the proof — and a
+    # pre-existing path is put back with its content and metadata. Anything
+    # changed after the write, or that no record can prove, is preserved with
+    # the cleanup reported incomplete. The payload carries this text twice and
+    # the rollback script once; a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(worker_targets_before_image)}"
+    local record="${4:-$(worker_ownership_record "$root")}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: worker_targets_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$image" "$action" "$record" "$targets" <<'WORKER_TARGETS_PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+root, image, action, record, listed = sys.argv[1:6]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+MANIFEST = os.path.join(image, "manifest.json")
+preserved = []
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keep(path, why):
+    preserved.append(path)
+    print("Error: Preserving " + path + ": " + why + "; cleanup is incomplete.", file=sys.stderr)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-targets.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def describe(path):
+    # What sits at the path now, in the same words the ownership record uses.
+    if os.path.islink(path):
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if os.path.isdir(path):
+        return {"kind": "directory"}
+    if os.path.isfile(path):
+        return {"kind": "file", "sha256": digest(path)}
+    return None
+
+
+def record_entries():
+    # The record of what this transaction wrote, or None when there is nothing
+    # an operator can be asked to trust.
+    if not os.path.lexists(record):
+        return None
+    if os.path.islink(record) or not os.path.isfile(record):
+        return None
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        return None
+    entries = data.get("targets")
+    return entries if isinstance(entries, dict) else None
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Worker targets before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {"created_by_tx": True, "targets": {}}
+    try:
+        for target in targets:
+            path = under(target)
+            if not os.path.lexists(path):
+                data["targets"][target] = {"state": "absent"}
+                continue
+            if os.path.islink(path):
+                data["targets"][target] = {"state": "symlink", "target": os.readlink(path)}
+                continue
+            if os.path.isdir(path):
+                data["targets"][target] = {"state": "directory"}
+                continue
+            if not os.path.isfile(path):
+                fail(
+                    "Worker target " + path + " is not a regular file; refusing to record a state this install "
+                    "cannot restore."
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(path)
+            data["targets"][target] = {
+                "state": "file",
+                "copy": copy,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "mode": state.st_mode & 0o7777,
+                "owner": [state.st_uid, state.st_gid],
+            }
+        document = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        write_atomic(MANIFEST, document, 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def remove_created(path, entry):
+    # A path that did not exist before: remove it only while it is what we wrote.
+    current = describe(path)
+    if current is None:
+        keep(path, "its state cannot be read")
+        return
+    if not isinstance(entry, dict) or entry != current:
+        keep(path, "it changed after this transaction wrote it")
+        return
+    try:
+        if current["kind"] == "directory":
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as error:
+        keep(path, "it could not be removed: " + str(error))
+
+
+def restore_pre_existing(path, entry):
+    # A path that was here before: put back its recorded content and metadata.
+    state = entry.get("state")
+    if state == "symlink":
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            os.symlink(entry.get("target") or "", path)
+        except OSError as error:
+            keep(path, "the link could not be restored: " + str(error))
+            return
+        if not os.path.islink(path) or os.readlink(path) != entry.get("target"):
+            keep(path, "the restored link does not read back as the before-image")
+        return
+    if state == "directory":
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as error:
+            keep(path, "the directory could not be restored: " + str(error))
+        return
+    if state != "file":
+        keep(path, "the before-image names no state this install can restore")
+        return
+    copy = os.path.join(image, str(entry.get("copy") or ""))
+    if not os.path.isfile(copy) or os.path.islink(copy):
+        keep(path, "its before-image copy is missing")
+        return
+    with open(copy, "rb") as stream:
+        payload = stream.read()
+    if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        keep(path, "its before-image copy changed after it was written")
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        write_atomic(path, payload, int(entry.get("mode") or 0o644))
+        owner = entry.get("owner") or [0, 0]
+        os.chown(path, int(owner[0]), int(owner[1]))
+    except OSError as error:
+        keep(path, "it could not be restored: " + str(error))
+        return
+    if digest(path) != entry.get("sha256"):
+        keep(path, "the restored file does not read back as the before-image")
+
+
+def restore():
+    if not os.path.isfile(MANIFEST) or os.path.islink(MANIFEST):
+        fail("No Worker targets before-image at " + image + "; preserving every path this install wrote.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail(
+            "Worker targets before-image " + MANIFEST + " is not readable JSON; preserving every path this "
+            "install wrote."
+        )
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Worker targets before-image " + MANIFEST + " does not claim this product created it.")
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        fail("Worker targets before-image " + MANIFEST + " names no targets.")
+    entries = record_entries()
+    for target in targets:
+        path = under(target)
+        if not os.path.lexists(path):
+            continue
+        entry = recorded.get(target)
+        if not isinstance(entry, dict):
+            keep(path, "the before-image does not name it")
+            continue
+        if entry.get("state") == "absent":
+            if entries is None:
+                keep(path, "no ownership record proves this transaction wrote it")
+                continue
+            remove_created(path, entries.get(target))
+        else:
+            restore_pre_existing(path, entry)
+    if preserved:
+        print(
+            "Error: " + str(len(preserved)) + " Worker path(s) preserved, so the cleanup is incomplete: "
+            + ", ".join(preserved),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+WORKER_TARGETS_PY
+}
+
+record_worker_targets_before_image() {
+    worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
+worker_transaction_journal() {
+    # One journal per transaction, beside the ACME snapshot and the two
+    # before-images. It is the only record of a run that was killed before it
+    # could finish: the next entrypoint reads it and knows what that run had
+    # already begun to change.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "${root%/}/recovery/${transaction}/transaction-journal.json"
+}
+
+worker_journal_action() {
+    # One writer for the journal, so the install, the reconcile and the rollback
+    # all read the same bytes back. "started" is written before the first
+    # mutation, "installed" once every mutation has been verified, and a
+    # transaction that never reached "installed" is the one a later entrypoint
+    # has to reconcile.
+    local action="$1"
+    local journal="$2"
+    local transaction="$3"
+    local journal_state="${4:-}"
+    python3 - "$action" "$journal" "$transaction" "$journal_state" <<'JOURNAL_PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+action, journal, transaction, journal_state = sys.argv[1:5]
+STATES = ("started", "installed")
+
+
+def refuse(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read():
+    if os.path.islink(journal) or not os.path.isfile(journal):
+        refuse("Worker transaction journal " + journal + " is not a regular file.")
+    try:
+        with open(journal, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        refuse("Worker transaction journal " + journal + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        refuse("Worker transaction journal " + journal + " is not a journal this product wrote.")
+    if data.get("transaction") != transaction:
+        refuse(
+            "Worker transaction journal " + journal + " records "
+            + json.dumps(data.get("transaction")) + ", not " + json.dumps(transaction) + "."
+        )
+    if data.get("state") not in STATES:
+        refuse("Worker transaction journal " + journal + " records no state this product knows.")
+    return data
+
+
+def store(state):
+    # An installed transaction is closed: rewriting it as started would let a
+    # later run undo an install that already verified every path it wrote.
+    if state == "started" and os.path.lexists(journal) and read().get("state") == "installed":
+        refuse("Worker transaction journal " + journal + " is already installed; refusing to reopen it.")
+    directory = os.path.dirname(journal)
+    if os.path.islink(directory):
+        refuse("Worker transaction directory " + directory + " is a symlink.")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = {
+        "schema": 1,
+        "transaction": transaction,
+        "state": state,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".transaction-journal.", suffix=".tmp")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def remove():
+    # The directory goes only while it is strictly below the recovery root it was
+    # found in, so a transaction name can never name its way out of that root.
+    recovery_root = os.path.realpath(os.path.dirname(os.path.dirname(journal)))
+    transaction_dir = os.path.realpath(os.path.dirname(journal))
+    if recovery_root == os.sep or not transaction_dir.startswith(recovery_root + os.sep):
+        refuse("Worker transaction directory " + transaction_dir + " is not below " + recovery_root + ".")
+    if os.path.islink(os.path.dirname(journal)):
+        refuse("Worker transaction directory " + os.path.dirname(journal) + " is a symlink.")
+    if not os.path.isdir(transaction_dir):
+        refuse("Worker transaction directory " + transaction_dir + " is not a directory.")
+    shutil.rmtree(transaction_dir)
+
+
+if action == "write":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    store(journal_state)
+elif action == "mark":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    if not os.path.lexists(journal):
+        raise SystemExit(0)
+    read()
+    store(journal_state)
+elif action == "state":
+    print(read().get("state"))
+elif action == "remove":
+    read()
+    remove()
+else:
+    refuse("Unknown Worker transaction journal action " + json.dumps(action) + ".")
+JOURNAL_PY
+}
+
+record_worker_transaction_journal() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    if [[ ! "$transaction" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: A Worker transaction journal needs a valid transaction ID." >&2
+        return 1
+    fi
+    worker_journal_action write "$(worker_transaction_journal "$root" "$transaction")" "$transaction" started
+}
+
+mark_worker_transaction_state() {
+    local transaction_state="${1:-}"
+    local transaction="${2:-}"
+    local root="${3:-/var/lib/gowave-auto-nginx}"
+    worker_journal_action mark "$(worker_transaction_journal "$root" "$transaction")" "$transaction" "$transaction_state"
+}
+
+reconcile_worker_transaction_journals() {
+    # Every entrypoint pays for the previous run's crash before it writes
+    # anything of its own. A transaction that never reached "installed" is
+    # restored from its own before-images and its directory is released; a
+    # transaction this product cannot restore, or that already installed but
+    # was never finalized, keeps its journal and the new operation is refused,
+    # so a half-written host is never built upon. The state root is where the
+    # journals live and the host root is where the inventoried paths sit; the
+    # two differ only for a test that owns a scratch tree.
+    local skip="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local host_root="${3:-/}"
+    local journal transaction transaction_dir state failed=0
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    local recovery_root="${root%/}/recovery"
+    [[ -d "$recovery_root" ]] || return 0
+    for journal in "$recovery_root"/*/transaction-journal.json; do
+        [[ -e "$journal" ]] || continue
+        transaction_dir="$(dirname "$journal")"
+        transaction="$(basename "$transaction_dir")"
+        [[ -n "$skip" && "$transaction" == "$skip" ]] && continue
+        if ! state="$(worker_journal_action state "$journal" "$transaction")"; then
+            echo "Error: Uncommitted Worker transaction $transaction cannot be read back; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ "$state" != "started" ]]; then
+            echo "Error: Worker transaction $transaction is '$state' and was never finalized; refusing to start a new install and retaining $transaction_dir. Finalize or roll it back first." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/worker-targets-before-image" ]] &&
+            ! restore_worker_targets_before_image "$host_root" "$transaction_dir/worker-targets-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its Worker before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/firewall-before-image" ]] &&
+            ! restore_firewall_before_image "$host_root" "$transaction_dir/firewall-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its firewall before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if ! worker_journal_action remove "$journal" "$transaction"; then
+            echo "Error: Worker transaction $transaction was restored but its journal could not be released; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        echo "Reconciled uncommitted Worker transaction $transaction from its before-images." >&2
+    done
+    return "$failed"
+}
+
+# --- package change record -------------------------------------------------
+# HOOK-04: a rollback restores the paths this run wrote, never the packages it
+# installed. What the package manager changed is therefore recorded while the
+# transaction still knows it, so a preserved host can be reported as carrying
+# residual state instead of being called clean.
+
+worker_package_record_dir() {
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    printf '%s\n' "${root%/}/recovery/${transaction}"
+}
+
+worker_package_inventory() {
+    # One `package<TAB>version` line per installed package, sorted, so two runs
+    # of the same host agree byte for byte and a diff of them is the package
+    # change a transaction caused.
+    if ! command -v dpkg-query >/dev/null 2>&1; then
+        return 1
+    fi
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort
+}
+
+record_worker_package_baseline() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory file temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: The transaction directory $directory is absent, so a package baseline would not belong to a journal." >&2
+        return 1
+    fi
+    file="$directory/packages-before.txt"
+    temporary="$(mktemp "$directory/.packages-before.XXXXXX")" || return 1
+    if worker_package_inventory >"$temporary" && [[ -s "$temporary" ]]; then
+        :
+    else
+        # A host whose package manager cannot answer is not a host with no
+        # packages; the baseline says what it could not learn.
+        printf '%s\n' "#unavailable" >"$temporary"
+    fi
+    if ! chmod 0600 -- "$temporary" || ! sync "$temporary" ||
+        ! mv -f -- "$temporary" "$file" || ! sync "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+record_worker_package_changes() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory before after changes temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    before="$directory/packages-before.txt"
+    if [[ ! -f "$before" ]]; then
+        echo "Error: The package baseline for $transaction is absent, so the package changes it caused cannot be stated." >&2
+        return 1
+    fi
+    after="$(mktemp "$directory/.packages-after.XXXXXX")" || return 1
+    if worker_package_inventory >"$after" && [[ -s "$after" ]]; then
+        :
+    else
+        printf '%s\n' "#unavailable" >"$after"
+    fi
+    changes="$(mktemp "$directory/.package-changes.XXXXXX")" || {
+        rm -f -- "$after"
+        return 1
+    }
+    if [[ "$(head -n 1 "$before")" == "#unavailable" ]] ||
+        [[ "$(head -n 1 "$after")" == "#unavailable" ]]; then
+        printf '%s\n' "#gowave-package-changes/v1" "#unavailable" >"$changes"
+    else
+        {
+            printf '%s\n' "#gowave-package-changes/v1"
+            awk -F'\t' '
+                FNR == NR { before[$1] = $2; next }
+                { after[$1] = $2 }
+                END {
+                    for (name in after) {
+                        if (!(name in before)) print "installed\t" name "\t" after[name]
+                        else if (before[name] != after[name]) print "upgraded\t" name "\t" before[name] "\t" after[name]
+                    }
+                    for (name in before) if (!(name in after)) print "removed\t" name "\t" before[name]
+                }
+            ' "$before" "$after" | LC_ALL=C sort
+        } >"$changes"
+    fi
+    rm -f -- "$after"
+    if ! chmod 0600 -- "$changes" || ! sync "$changes" ||
+        ! mv -f -- "$changes" "$directory/package-changes.tsv" || ! sync "$directory"; then
+        rm -f -- "$changes"
+        return 1
+    fi
+}
+restore_worker_targets_before_image() {
+    worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
 install_managed_deploy_hook() {
@@ -1708,6 +4065,20 @@ EOF
         echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
         return 1
     }
+    local ownership_record ownership_tmp
+    ownership_record=$(deploy_hook_ownership_record "$recovery_root")
+    ownership_tmp="${ownership_record}.tmp.$$"
+    python3 -c 'import json, os, sys; record, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0); fd = os.open(record, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$ownership_tmp" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not record deploy-hook ownership for later transactions." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$ownership_tmp" || ! sync "$ownership_tmp" ||
+        ! mv -f -- "$ownership_tmp" "$ownership_record" || ! sync "$recovery_root"; then
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not publish the deploy-hook ownership record." >&2
+        return 1
+    fi
     echo "Configured managed ACME renewal hook in $hook_file."
 }
 rollback_managed_deploy_hook() {
@@ -1725,6 +4096,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi
@@ -1808,6 +4214,10 @@ PY
     }
     sync "$(dirname "$hook_file")" || {
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
+    rm -f -- "$(deploy_hook_ownership_record "$recovery_root")" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
         return 1
     }
     return 0
@@ -1907,11 +4317,28 @@ configure_worker_dot() {
 
 configure_host_security() {
     # Keep MTU/file-limit tuning independent from optional BBR support.
-    mkdir -p /etc/sysctl.d
-    if [[ ! -e /etc/sysctl.d/99-gowave-node.conf ]]; then
+    local sysctl_conf="${1:-/etc/sysctl.d/99-gowave-node.conf}"
+    mkdir -p "$(dirname "$sysctl_conf")"
+    # A file this install did not write is not its to truncate: only our own
+    # marker plus our own lines is adopted, and a symlink is never written through.
+    if [[ -e "$sysctl_conf" || -L "$sysctl_conf" ]]; then
+        if [[ -L "$sysctl_conf" ]] ||
+            ! grep -qxF '# Managed by GoWave Auto NGINX' "$sysctl_conf" ||
+            grep -qvxF -e '# Managed by GoWave Auto NGINX' \
+                -e 'net.ipv4.tcp_mtu_probing = 1' \
+                -e 'fs.file-max = 1048576' \
+                -e 'net.core.default_qdisc = fq' \
+                -e 'net.ipv4.tcp_congestion_control = bbr' "$sysctl_conf"; then
+            echo "Error: Pre-existing unmanaged sysctl configuration at $sysctl_conf. Refusing to overwrite unmanaged host resource." >&2
+            _SYSCTL_CREATED_BY_US=0
+            return 1
+        fi
+    else
         _SYSCTL_CREATED_BY_US=1
     fi
     modprobe tcp_bbr 2>/dev/null || true
+    local sysctl_tmp
+    sysctl_tmp=$(mktemp "${sysctl_conf}.gowave.XXXXXX") || return 1
     {
         echo "# Managed by GoWave Auto NGINX"
         echo "net.ipv4.tcp_mtu_probing = 1"
@@ -1922,8 +4349,12 @@ configure_host_security() {
         else
             echo "Warning: BBR is unavailable in this kernel; retaining the system congestion-control default." >&2
         fi
-    } > /etc/sysctl.d/99-gowave-node.conf
-    sysctl -p /etc/sysctl.d/99-gowave-node.conf
+    } > "$sysctl_tmp" || { rm -f "$sysctl_tmp"; return 1; }
+    chmod 0644 "$sysctl_tmp" || { rm -f "$sysctl_tmp"; return 1; }
+    sync "$sysctl_tmp" 2>/dev/null || true
+    mv -f "$sysctl_tmp" "$sysctl_conf" || { rm -f "$sysctl_tmp"; return 1; }
+    sync "$(dirname "$sysctl_conf")" 2>/dev/null || true
+    sysctl -p "$sysctl_conf"
 
     # Allocate swap only on small-memory hosts. Do not persist a failed swapon.
     local mem_kb fs_type swap_tmp
@@ -2004,6 +4435,12 @@ PY
         echo "Fatal: UFW already contains an unrestricted allow rule for NODE_PORT=$NODE_PORT; remove it manually before retrying." >&2
         return 1
     fi
+
+    # What the firewall read before the first rule changes, in the transaction's
+    # own recovery directory: the rollback restores this, not "our four rules
+    # removed from whatever is left". A baseline this install cannot read back
+    # and restore is refused here, before anything is mutated.
+    record_firewall_before_image || return 1
 
     if ufw status 2>/dev/null | grep -q '^Status: active'; then
         _UFW_WAS_ACTIVE=1
@@ -2492,6 +4929,206 @@ ensure_pinned_xray_core() {
     return 1
 }
 
+# The pinned core is placed before the upstream installer runs, because an
+# executable rw-core is what makes install.sh skip its own api.github.com
+# purchase. The table is a copy of modules/xray_core.sh: this payload is one
+# file streamed over SSH and cannot source modules/.
+GOWAVE_PINNED_XRAY_VERSION="26.11.9"
+GOWAVE_PINNED_XRAY_AMD64_URL="https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip"
+GOWAVE_PINNED_XRAY_AMD64_SHA256="b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82"
+GOWAVE_PINNED_XRAY_ARM64_URL="https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-arm64-v8a.zip"
+GOWAVE_PINNED_XRAY_ARM64_SHA256="64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be"
+
+pinned_xray_artifact() {
+    local version="${1#v}"
+    local arch="$2"
+
+    [[ "$version" == "$GOWAVE_PINNED_XRAY_VERSION" ]] || return 1
+    case "$arch" in
+        amd64) printf '%s %s\n' "$GOWAVE_PINNED_XRAY_AMD64_URL" "$GOWAVE_PINNED_XRAY_AMD64_SHA256" ;;
+        arm64) printf '%s %s\n' "$GOWAVE_PINNED_XRAY_ARM64_URL" "$GOWAVE_PINNED_XRAY_ARM64_SHA256" ;;
+        *) return 1 ;;
+    esac
+}
+
+pinned_xray_arch() {
+    local m
+    m=$(uname -m)
+    case "$m" in
+        x86_64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)
+            log_err "Unsupported architecture: $m"
+            return 1
+            ;;
+    esac
+}
+
+pinned_xray_fail() {
+    local reason="$1"
+    local artifact="${2:-}"
+    local subject="pinned Xray core $GOWAVE_PINNED_XRAY_VERSION"
+    local opt_out="Set XRAY_SERVER_VERSION=latest to let the upstream installer fetch a core instead."
+
+    if [[ -n "$artifact" ]]; then
+        log_err "$subject could not be installed from $artifact: $reason. $opt_out"
+    else
+        log_err "$subject could not be installed: $reason. $opt_out"
+    fi
+    return 1
+}
+
+pinned_xray_deliver() {
+    local scratch="$1"
+    local install_dir="$2"
+    local url="$3"
+    local digest="$4"
+    local zip="$scratch/Xray.zip"
+    local member="$scratch/xray"
+    local reported=""
+    local fetch_rc=0
+
+    fetch_verified_artifact "$zip" "Xray core $GOWAVE_PINNED_XRAY_VERSION" "$url" "$digest" || fetch_rc=$?
+    if (( fetch_rc == 2 )); then
+        pinned_xray_fail "the archive did not match the pinned SHA-256" "$url"
+        return 1
+    elif (( fetch_rc != 0 )); then
+        pinned_xray_fail "no artifact host delivered the archive" "$url"
+        return 1
+    fi
+
+    if ! python3 - "$zip" "$member" <<'PY'
+import sys
+import zipfile
+
+archive, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive) as bundle, bundle.open("xray") as src, open(dest, "wb") as out:
+    out.write(src.read())
+PY
+    then
+        pinned_xray_fail "the archive carries no readable xray member" "$url"
+        return 1
+    fi
+
+    chmod 0755 "$member"
+    reported=$("$member" version 2>/dev/null || true)
+    if ! core_version_matches "$reported" "$GOWAVE_PINNED_XRAY_VERSION"; then
+        pinned_xray_fail "the extracted core reports ${reported:-nothing}, not $GOWAVE_PINNED_XRAY_VERSION" "$url"
+        return 1
+    fi
+
+    mkdir -p "$install_dir"
+    local staged="$install_dir/.rw-core.pinned.$$"
+    rm -f -- "$staged"
+    if ! install -m 0755 -- "$member" "$staged"; then
+        pinned_xray_fail "the verified core could not be staged in $install_dir" "$url"
+        return 1
+    fi
+    sync "$staged" 2>/dev/null || true
+    if ! mv -f -- "$staged" "$install_dir/rw-core"; then
+        rm -f -- "$staged" || true
+        pinned_xray_fail "the verified core could not be installed at $install_dir/rw-core" "$url"
+        return 1
+    fi
+    sync "$install_dir" 2>/dev/null || true
+
+    log_info "Installed pinned Xray core $GOWAVE_PINNED_XRAY_VERSION from $url (SHA-256 $digest)."
+}
+
+install_pinned_xray_core() {
+    local install_dir="${1:?an install directory is required}"
+    local requested="${XRAY_SERVER_VERSION:-}"
+    local version="${requested,,}"
+
+    if [[ -n "$version" ]]; then
+        version="${version#v}"
+        [[ "$version" == "$GOWAVE_PINNED_XRAY_VERSION" ]] || return 0
+    fi
+
+    local arch="" artifact=""
+    if ! arch=$(pinned_xray_arch 2>/dev/null); then
+        pinned_xray_fail "the host architecture is not described by the pin table"
+        return 1
+    fi
+    if ! artifact=$(pinned_xray_artifact "$GOWAVE_PINNED_XRAY_VERSION" "$arch"); then
+        pinned_xray_fail "no artifact is pinned for architecture $arch"
+        return 1
+    fi
+
+    local url="${artifact% *}"
+    local digest="${artifact##* }"
+    local dest="$install_dir/rw-core"
+
+    if [[ -x "$dest" ]]; then
+        local reported
+        reported=$("$dest" version 2>/dev/null || true)
+        if core_version_matches "$reported" "$GOWAVE_PINNED_XRAY_VERSION"; then
+            return 0
+        fi
+    fi
+
+    local scratch rc=0
+    scratch=$(mktemp -d "/tmp/gowave-xray-core-XXXXXX")
+    pinned_xray_deliver "$scratch" "$install_dir" "$url" "$digest" || rc=$?
+    rm -rf -- "$scratch"
+    return "$rc"
+}
+
+# gowave-node resolves the Xray core through one HTTPS GET to api.github.com with
+# a 10-second deadline and no retry of its own, so a single slow answer ends a
+# Worker whose whole provisioning then rolls back. A repeat is the only repair such
+# a hiccup has, while a configuration error would only print itself twice: the
+# retry is therefore limited to failures whose own stderr names a network fault.
+NODE_INSTALLER_ATTEMPTS=3
+NODE_INSTALLER_RETRY_DELAYS=(10 30)
+NODE_INSTALLER_NETWORK_FAULTS='context deadline exceeded|i/o timeout|TLS handshake timeout|Client\.Timeout|Temporary failure in name resolution|Could not resolve host|Connection reset by peer|Connection refused|network is unreachable|No route to host|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout'
+
+node_installer_stderr_names_network_fault() {
+    grep -Eqi "$NODE_INSTALLER_NETWORK_FAULTS" "$1"
+}
+
+# run_node_installer_with_retry INSTALLER SECRET_KEY NODE_PORT VERSION
+#
+# The installer's stderr is captured so the finished attempt can be classified;
+# it is replayed to stderr at once, so the payload's own output keeps both streams
+# apart exactly as the operator's SSH session receives them.
+run_node_installer_with_retry() {
+    local installer="$1"
+    local secret_key="$2"
+    local node_port="$3"
+    local version="$4"
+    local attempt=1 rc=0 workdir stdout_log stderr_log delay
+
+    workdir=$(mktemp -d "/tmp/gowave-node-install-attempts-XXXXXX")
+    while : ; do
+        stdout_log="$workdir/attempt-$attempt.stdout.log"
+        stderr_log="$workdir/attempt-$attempt.stderr.log"
+        rc=0
+        if ! (
+            export SECRET_KEY="$secret_key"
+            export NODE_PORT="$node_port"
+            export GOWAVE_NODE_VERSION="$version"
+            bash "$installer" </dev/null
+        ) 2>"$stderr_log" | tee "$stdout_log"; then
+            rc=${PIPESTATUS[0]}
+        fi
+        cat "$stderr_log" >&2 || true
+        if (( rc == 0 )); then
+            break
+        fi
+        if (( attempt >= NODE_INSTALLER_ATTEMPTS )) ||
+            ! node_installer_stderr_names_network_fault "$stderr_log"; then
+            break
+        fi
+        delay=${NODE_INSTALLER_RETRY_DELAYS[$(( attempt - 1 ))]}
+        echo "GoWave Node installer failed on a network fault (exit $rc); retrying in ${delay}s (attempt $(( attempt + 1 )) of $NODE_INSTALLER_ATTEMPTS)..."
+        sleep "$delay"
+        attempt=$(( attempt + 1 ))
+    done
+    rm -rf -- "$workdir"
+    return "$rc"
+}
+
 run_upstream_node_installer() {
     local tmp_inst
     : "${GOWAVE_NODE_INSTALLER_COMMIT:?Pinned upstream installer commit is required}"
@@ -2504,6 +5141,9 @@ run_upstream_node_installer() {
         echo "Fatal: invalid pinned upstream installer SHA256: expected 64-hex digest." >&2
         return 1
     }
+    # The core goes in before the installer is even fetched, so a failed pin
+    # leaves no installer temp file behind.
+    install_pinned_xray_core "/opt/gowave-node" || return 1
     tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
     if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 \
         "https://raw.githubusercontent.com/aaaSaZaN/gowave-node/$GOWAVE_NODE_INSTALLER_COMMIT/install.sh" -o "$tmp_inst"; then
@@ -2523,7 +5163,7 @@ run_upstream_node_installer() {
     if [[ "$normalized_node_ver" != "latest" && "$normalized_node_ver" != v* ]]; then
         normalized_node_ver="v$normalized_node_ver"
     fi
-    if GOWAVE_NODE_VERSION="$normalized_node_ver" bash "$tmp_inst" </dev/null; then
+    if run_node_installer_with_retry "$tmp_inst" "${SECRET_KEY:-}" "${NODE_PORT:-}" "$normalized_node_ver"; then
         rm -f "$tmp_inst"
     else
         local installer_rc=$?
@@ -2559,26 +5199,62 @@ compensate_remote_worker() {
     local rollback_failed=0
     echo "[ROLLBACK] Remote worker deployment failed (exit code: $exit_code). Initiating automated compensating rollback..." >&2
 
+    # The state root is where this transaction recorded its before-images and
+    # its ACME snapshot, and the host root is the tree those records describe.
+    # Both are the host itself for a real run, and they are the same two things
+    # a reconcile of the same journal is given. The service manager, the firewall
+    # and the swap, sysctl and NGINX files belong to the host rather than to the
+    # record, and stay where they are.
+    local state_root="${WORKER_STATE_ROOT:-/var/lib/gowave-auto-nginx}"
+    local host_root="${WORKER_HOST_ROOT:-/}"
+
+    # The before-image is the first thing this run captures and the
+    # only thing a rollback restores from. Without it nothing this run
+    # wrote can be proven and undone, so the refusal that stopped the
+    # run is the whole outcome and the steps below have nothing to do.
+    if [[ -z "${_ACME_TX_ID:-}" ]] ||
+        [[ ! -d "$(worker_targets_before_image "$state_root" "$_ACME_TX_ID")" ]]; then
+        echo "[ROLLBACK] No Worker before-image was captured; nothing to compensate." >&2
+        return "$exit_code"
+    fi
+
+    # A rollback puts the paths back and leaves the packages installed. The
+    # delta is recorded here, before the paths are restored, so the teardown
+    # report can name the residue instead of calling the host clean.
+    record_worker_package_changes "$_ACME_TX_ID" "$state_root" ||
+        echo "[ROLLBACK] The package changes this transaction caused could not be recorded; they stay on the host unrecorded." >&2
+
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
         echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
-        systemctl stop gowave-node.service 2>/dev/null || rollback_failed=1
-        systemctl disable gowave-node.service 2>/dev/null || rollback_failed=1
-        systemctl stop xray.service 2>/dev/null || rollback_failed=1
-        systemctl disable xray.service 2>/dev/null || rollback_failed=1
-        rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
-        rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+        # Xray is supervised by gowave-node in this product and the upstream
+        # installer may leave no unit of its own, so an absent unit is a clean
+        # host rather than a failed cleanup: only a unit that exists is stopped.
+        for unit in gowave-node.service xray.service; do
+            if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" ||
+                systemctl is-active --quiet "$unit" 2>/dev/null; then
+                systemctl stop "$unit" 2>/dev/null || rollback_failed=1
+                systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+            fi
+        done
         systemctl daemon-reload 2>/dev/null || rollback_failed=1
-        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
-        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
     fi
+
+    # The inventoried paths come back from the transaction's before-image, and
+    # only from it: a path that did not exist is removed only while the ownership
+    # record still matches it, a path that was here is restored with its content
+    # and metadata, and one changed afterwards is preserved with the cleanup
+    # reported incomplete. The image is named from this transaction, as the
+    # capture named it: the ambient ACME_TX_ID is empty on a fresh install, so a
+    # default lookup would read an image no transaction wrote.
+    restore_worker_targets_before_image \
+        "$host_root" "$(worker_targets_before_image "$state_root" "$_ACME_TX_ID")" ||
+        rollback_failed=1
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Cleaning up worker NGINX virtual hosts and stream routing..." >&2
-        rm -f /etc/nginx/conf.d/00-worker-acme-challenge.conf /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
         rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
-        rm -rf /var/www/gowave-acme || rollback_failed=1
         if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
             sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || rollback_failed=1
         fi
@@ -2592,7 +5268,6 @@ compensate_remote_worker() {
     # 3. Clean Cover Reality decoy site
     if [[ "${_COVER_UNPACKED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Removing cover decoy site assets..." >&2
-        rm -rf /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
         if [[ -d /var/www/gowave-auto-nginx ]]; then
             rmdir /var/www/gowave-auto-nginx 2>/dev/null || rollback_failed=1
         fi
@@ -2601,10 +5276,10 @@ compensate_remote_worker() {
     # 4. Revert ACME certificates
     if [[ -n "${_ACME_TX_ID:-}" ]]; then
         echo "[ROLLBACK] Restoring or cleaning up ACME certificates via snapshot..." >&2
-        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
-        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
         if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
+            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
         fi
     else
         if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
@@ -2619,21 +5294,13 @@ compensate_remote_worker() {
         fi
     fi
 
-    # 5. Revert UFW firewall changes
+    # 5. Restore the UFW firewall before-image. Deleting the four rules this
+    # install adds returns a firewall that never had them to the wrong state:
+    # the operator's own rules, the default policies and the enabled state are
+    # part of what this transaction changed.
     if [[ "${_UFW_RULES_CONFIGURED:-0}" -eq 1 ]]; then
-        echo "[ROLLBACK] Reverting UFW firewall rules..." >&2
-        if [[ "${_UFW_WAS_ACTIVE:-0}" -eq 0 ]]; then
-            ufw --force disable 2>/dev/null || rollback_failed=1
-        else
-            if [[ -n "${PANEL_IP:-}" ]]; then
-                ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
-            fi
-            if [[ -n "${PANEL_IPV6:-}" ]]; then
-                ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
-            fi
-            ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1
-            ufw delete allow 443/tcp 2>/dev/null || rollback_failed=1
-        fi
+        echo "[ROLLBACK] Restoring the UFW firewall before-image..." >&2
+        restore_firewall_before_image || rollback_failed=1
     fi
 
     # 6. Revert Swap
@@ -2706,7 +5373,7 @@ RUNNER_FUNCS
 
         # 3. Main entrypoint executed remotely
         cat <<'REMOTE_EOF'
-set -euo pipefail
+set -Eeuo pipefail
 main() {
     umask 077
     _ROLLBACK_IN_PROGRESS=0
@@ -2722,34 +5389,36 @@ main() {
     _STREAM_INCLUDE_ADDED=0
     _NODE_SERVICE_CONFIGURED=0
 
-    if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && -n "${GOWAVE_ACME_TEST_CA_B64:-}" ]]; then
-        printf '%s' "$GOWAVE_ACME_TEST_CA_B64" | base64 -d > /run/gowave-acme-test-ca.pem
-        chmod 0600 /run/gowave-acme-test-ca.pem
-        export GOWAVE_ACME_TEST_CA_FILE=/run/gowave-acme-test-ca.pem
-        unset GOWAVE_ACME_TEST_CA_B64
-    fi
-
     _COMPENSATED=0
     cleanup_temp_and_secrets() {
         unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64 2>/dev/null || true
         rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem 2>/dev/null || true
     }
+    compensate_once() {
+        # One compensation per run. A signal, a failing step and the EXIT trap
+        # all reach the same failure, and the compensator hands back the exit
+        # code it was given — so its nonzero return would re-enter the ERR trap
+        # and run the rollback a second time over a host the first pass already
+        # put back. The trap is disarmed before the rollback starts, and the
+        # flag closes the door for a signal that arrives while it runs.
+        local exit_code="${1:-1}"
+        [[ "${_COMPENSATED:-0}" -eq 0 ]] || return 0
+        _COMPENSATED=1
+        trap - ERR
+        compensate_remote_worker "$exit_code" ||
+            printf '[ROLLBACK] Compensation exited %s for exit code %s.\n' "$?" "$exit_code" >&2
+        return 0
+    }
     handle_signal() {
         local sig="$1"
         echo "Received signal $sig. Halting and invoking compensation..." >&2
-        if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then
-            _COMPENSATED=1
-            compensate_remote_worker 128
-        fi
+        compensate_once 128
         cleanup_temp_and_secrets
         exit 128
     }
     handle_error() {
         local exit_code="${1:-1}"
-        if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then
-            _COMPENSATED=1
-            compensate_remote_worker "$exit_code"
-        fi
+        compensate_once "$exit_code"
         cleanup_temp_and_secrets
         exit "$exit_code"
     }
@@ -2757,8 +5426,23 @@ main() {
     trap 'handle_signal HUP' HUP
     trap 'handle_signal INT' INT
     trap 'handle_signal TERM' TERM
-    trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR
+    trap 'handle_error "$?"' ERR
     trap 'cleanup_temp_and_secrets' EXIT
+
+    # The controller validates the same fields before it opens the channel; the
+    # side that has to act on them checks again, because the values arrive over
+    # the stream and nothing here may reach a mutation on a spliced payload.
+    preflight_require_inputs worker \
+        "$WORKER_DOMAIN" "$REALITY_DOMAIN" "${VISION_DOMAIN:-}" "$NODE_PORT" || return 1
+
+    # The test-only trust anchor is the next thing written, so it comes after
+    # the contract and inside the traps that remove it.
+    if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && -n "${GOWAVE_ACME_TEST_CA_B64:-}" ]]; then
+        printf '%s' "$GOWAVE_ACME_TEST_CA_B64" | base64 -d > /run/gowave-acme-test-ca.pem
+        chmod 0600 /run/gowave-acme-test-ca.pem
+        export GOWAVE_ACME_TEST_CA_FILE=/run/gowave-acme-test-ca.pem
+        unset GOWAVE_ACME_TEST_CA_B64
+    fi
 
     # Before the lease and the snapshots, not after: both are python3, and a
     # snapshot that dies for a missing interpreter has no snapshot to roll back
@@ -2766,6 +5450,9 @@ main() {
     bootstrap_early_tools </dev/null
     acquire_mutation_lock
     verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "${_ACME_TX_ID:-}" || return 1
+    # Before the first managed path is touched: a unit, a binary or a webroot
+    # this install did not write is not a rollback target.
+    verify_worker_mutation_targets_preflight || return 1
 
     validate_acme_server "${GOWAVE_ACME_SERVER:-}"
     local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
@@ -2780,12 +5467,32 @@ main() {
         echo "Error: Invalid Worker ACME transaction ID." >&2
         exit 1
     fi
+    # A run that was killed before it could finish left its journal
+    # behind: it is reconciled here, before this run records a
+    # transaction of its own.
+    reconcile_worker_transaction_journals || return 1
     snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
     snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         snapshot_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"
     fi
+    # What those inventoried paths held before this transaction writes them: the
+    # rollback restores a pre-existing object from these bytes, removes a created
+    # one only while the ownership record still matches it, and preserves
+    # anything it cannot prove.
+    record_worker_targets_before_image \
+        "/" "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" || return 1
 
+    # Recorded after the before-image and before the first mutation: a
+    # run that dies from here on leaves a journal a later entrypoint can
+    # act on.
+    record_worker_transaction_journal "$_ACME_TX_ID" || return 1
+
+    # The package inventory this run starts from, captured while the journal's
+    # directory is still the only thing written: what the package manager
+    # changes from here on is this transaction's residue, and a rollback
+    # cannot undo it.
+    record_worker_package_baseline "$_ACME_TX_ID" || return 1
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
     configure_firewall </dev/null
@@ -2802,6 +5509,20 @@ main() {
     printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT" --mode crypto-only
     nginx -t
     systemctl is-active --quiet nginx
+
+    # Every package-mutating step is behind us, so the delta between the
+    # baseline and the host now is what this run left installed.
+    record_worker_package_changes "$_ACME_TX_ID" || return 1
+
+    # What this install now owns: the next run adopts these paths by digest
+    # instead of refusing them, and a rollback can tell them apart from a host
+    # object that was already here.
+    record_worker_mutation_targets
+
+    # The journal's last word from this side: every path this run wrote
+    # has been verified, so a later entrypoint finds a transaction to
+    # finalize rather than one to undo.
+    mark_worker_transaction_state installed "$_ACME_TX_ID" || return 1
 
     # Disable ERR compensation trap on verified success
     trap - ERR
@@ -2846,9 +5567,12 @@ remote_rollback() {
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
         printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
+        # A rollback is a mutation too: the run that owns the Worker's lock passes
+        # its lease here, and a rollback started by anyone else still refuses.
+        printf 'export GOWAVE_LEASE_TOKEN=%q\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}"
 
         cat <<'ROLLBACK_REMOTE_SCRIPT'
-set -euo pipefail
+set -Eeuo pipefail
 
 if [[ -n "${ACME_TX_ID:-}" && ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
     echo "Error: Invalid Worker ACME transaction ID." >&2
@@ -2877,7 +5601,75 @@ validate_lock_path() {
     return 0
 }
 
+validate_mutation_lease() {
+    local candidate_token="$1"
+    local lease_file="${2:-$MUTATION_LEASE_FILE}"
+    local lock_file="${3:-$MUTATION_LOCK_FILE}"
+
+    python3 - "$candidate_token" "$lease_file" "$lock_file" <<'PY'
+import json
+import os
+import sys
+
+token, lease_path, lock_path = sys.argv[1:4]
+
+if not os.path.exists(lease_path):
+    sys.exit(1)
+
+if os.path.islink(lease_path):
+    sys.exit(1)
+
+st = os.stat(lease_path)
+if os.geteuid() == 0 and st.st_uid != 0:
+    sys.exit(1)
+
+try:
+    with open(lease_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+expected_token = data.get("lease_token", "")
+holder_pid = data.get("holder_pid")
+
+if not expected_token or expected_token != token:
+    sys.exit(1)
+
+if not holder_pid or not isinstance(holder_pid, int):
+    sys.exit(1)
+
+try:
+    os.kill(holder_pid, 0)
+except OSError:
+    sys.exit(1)
+
+fd_dir = f"/proc/{holder_pid}/fd"
+if os.path.exists(fd_dir):
+    try:
+        real_lock = os.path.realpath(lock_path)
+        has_fd = False
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.path.realpath(os.path.join(fd_dir, fd))
+                if target == real_lock:
+                    has_fd = True
+                    break
+            except Exception:
+                continue
+        if not has_fd:
+            sys.exit(1)
+    except Exception:
+        pass
+
+sys.exit(0)
+PY
+}
+
 acquire_mutation_lock() {
+    if [[ "${_MUTATION_LOCK_HELD:-0}" -eq 1 || "${_MUTATION_LEASE_VALIDATED:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
     validate_lock_path "$MUTATION_LOCK_FILE" || return 1
     if [[ ! -e "$MUTATION_LOCK_FILE" ]]; then
         ( umask 0177; : > "$MUTATION_LOCK_FILE" ) 2>/dev/null || {
@@ -2894,11 +5686,24 @@ acquire_mutation_lock() {
         return 1
     }
     exec 9>>"$MUTATION_LOCK_FILE" || return 1
-    if ! flock -n 9; then
-        echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+    if flock -n 9; then
+        _MUTATION_LOCK_HELD=1
+        return 0
+    fi
+
+    local candidate_token="${GOWAVE_LEASE_TOKEN:-}"
+    if [[ -n "$candidate_token" ]] \
+        && validate_mutation_lease "$candidate_token" "$MUTATION_LEASE_FILE" "$MUTATION_LOCK_FILE"; then
+        _MUTATION_LEASE_VALIDATED=1
+        return 0
+    fi
+    if [[ -n "$candidate_token" ]]; then
+        echo "Error: Invalid or stale mutation lock lease provided." >&2
         return 1
     fi
-    return 0
+
+    echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+    return 1
 }
 
 acquire_mutation_lock || {
@@ -2921,6 +5726,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi
@@ -3006,6 +5846,12 @@ PY
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
         return 1
     }
+    # This standalone recovery script carries no ownership helper, so the record
+    # that outlives the snapshot is cleared by its documented path.
+    rm -f -- "${recovery_root}/deploy-hook-ownership.json" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -3042,9 +5888,10 @@ try:
         raise ValueError("certificate metadata must be strings")
     if existed and (not serial or not fingerprint):
         raise ValueError("pre-existing lineage snapshot lacks certificate identity")
-    print("1" if existed else "0")
-    print(serial)
-    print(fingerprint)
+    # One tab-separated line: a lineage that did not exist before has an empty
+    # serial and fingerprint, and two blank lines would collapse under the
+    # command substitution, leaving the reader one field where it expects three.
+    print("\t".join(("1" if existed else "0", serial, fingerprint)))
 except Exception as exc:
     print(f"Invalid ACME lineage manifest: {type(exc).__name__}", file=sys.stderr)
     sys.exit(1)
@@ -3055,15 +5902,11 @@ PY
     }
 
     local existed serial fingerprint
-    local -a manifest_fields=()
-    mapfile -t manifest_fields <<< "$manifest_data"
-    if [[ "${#manifest_fields[@]}" -ne 3 ]]; then
+    if ! IFS=$'\t' read -r existed serial fingerprint <<< "$manifest_data" ||
+        [[ "$manifest_data" != *$'\t'*$'\t'* ]]; then
         echo "Error: ACME lineage manifest has an invalid field count for $domain." >&2
         return 1
     fi
-    existed="${manifest_fields[0]}"
-    serial="${manifest_fields[1]}"
-    fingerprint="${manifest_fields[2]}"
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
@@ -3155,7 +5998,628 @@ fi
 acquire_mutation_lock
 echo "Executing worker compensation teardown..." >&2
 
+worker_mutation_targets() {
+    # The paths this install creates and its rollback removes. A path that is
+    # already here is only touched when the ownership record names it.
+    cat <<'WORKER_TARGETS'
+/etc/systemd/system/gowave-node.service
+/etc/systemd/system/gowave-node.service.d
+/etc/systemd/system/remnanode.service
+/opt/gowave-node
+/run/gowave-node
+/opt/remnanode
+/usr/local/bin/gowave-node
+/usr/local/bin/xray
+/etc/nginx/conf.d/00-worker-acme-challenge.conf
+/etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+/etc/nginx/conf.d/gowave-worker-https.conf
+/etc/nginx/conf.d/gowave-worker-decoy.conf
+/etc/nginx/conf.d/gowave-worker-vision-fallback.conf
+/etc/nginx/stream-enabled/gowave-worker-stream.conf
+/var/www/gowave-acme
+/var/www/gowave-auto-nginx/cover-reality
+WORKER_TARGETS
+}
+
+worker_ownership_record() {
+    local base="${1:-/var/lib/gowave-auto-nginx}"
+    # "/" is the host itself, where the state root is the product's own.
+    [[ "$base" == "/" ]] && base="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "$base/worker-install-ownership.json"
+}
+
+worker_targets_before_image() {
+    # Per transaction, beside the ACME snapshot and the firewall image: what
+    # every inventoried path held before this transaction touched it. The
+    # recovery root is removed by remote_finalize after a verified install, so
+    # a successful run leaves no image behind and a failed one keeps exactly
+    # the one its rollback needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-${ACME_TX_ID:-}}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/worker-targets-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/worker-targets-before-image"
+}
+
+worker_targets_image() {
+    # The state of every inventoried path before this transaction wrote it, and
+    # the way back to that state. A created path is removed only while it is
+    # still what this install wrote — the ownership record is the proof — and a
+    # pre-existing path is put back with its content and metadata. Anything
+    # changed after the write, or that no record can prove, is preserved with
+    # the cleanup reported incomplete. The payload carries this text twice and
+    # the rollback script once; a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(worker_targets_before_image)}"
+    local record="${4:-$(worker_ownership_record "$root")}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: worker_targets_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$image" "$action" "$record" "$targets" <<'WORKER_TARGETS_PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+root, image, action, record, listed = sys.argv[1:6]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+MANIFEST = os.path.join(image, "manifest.json")
+preserved = []
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keep(path, why):
+    preserved.append(path)
+    print("Error: Preserving " + path + ": " + why + "; cleanup is incomplete.", file=sys.stderr)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-targets.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def describe(path):
+    # What sits at the path now, in the same words the ownership record uses.
+    if os.path.islink(path):
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if os.path.isdir(path):
+        return {"kind": "directory"}
+    if os.path.isfile(path):
+        return {"kind": "file", "sha256": digest(path)}
+    return None
+
+
+def record_entries():
+    # The record of what this transaction wrote, or None when there is nothing
+    # an operator can be asked to trust.
+    if not os.path.lexists(record):
+        return None
+    if os.path.islink(record) or not os.path.isfile(record):
+        return None
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        return None
+    entries = data.get("targets")
+    return entries if isinstance(entries, dict) else None
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Worker targets before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {"created_by_tx": True, "targets": {}}
+    try:
+        for target in targets:
+            path = under(target)
+            if not os.path.lexists(path):
+                data["targets"][target] = {"state": "absent"}
+                continue
+            if os.path.islink(path):
+                data["targets"][target] = {"state": "symlink", "target": os.readlink(path)}
+                continue
+            if os.path.isdir(path):
+                data["targets"][target] = {"state": "directory"}
+                continue
+            if not os.path.isfile(path):
+                fail(
+                    "Worker target " + path + " is not a regular file; refusing to record a state this install "
+                    "cannot restore."
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(path)
+            data["targets"][target] = {
+                "state": "file",
+                "copy": copy,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "mode": state.st_mode & 0o7777,
+                "owner": [state.st_uid, state.st_gid],
+            }
+        document = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        write_atomic(MANIFEST, document, 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def remove_created(path, entry):
+    # A path that did not exist before: remove it only while it is what we wrote.
+    current = describe(path)
+    if current is None:
+        keep(path, "its state cannot be read")
+        return
+    if not isinstance(entry, dict) or entry != current:
+        keep(path, "it changed after this transaction wrote it")
+        return
+    try:
+        if current["kind"] == "directory":
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as error:
+        keep(path, "it could not be removed: " + str(error))
+
+
+def restore_pre_existing(path, entry):
+    # A path that was here before: put back its recorded content and metadata.
+    state = entry.get("state")
+    if state == "symlink":
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            os.symlink(entry.get("target") or "", path)
+        except OSError as error:
+            keep(path, "the link could not be restored: " + str(error))
+            return
+        if not os.path.islink(path) or os.readlink(path) != entry.get("target"):
+            keep(path, "the restored link does not read back as the before-image")
+        return
+    if state == "directory":
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as error:
+            keep(path, "the directory could not be restored: " + str(error))
+        return
+    if state != "file":
+        keep(path, "the before-image names no state this install can restore")
+        return
+    copy = os.path.join(image, str(entry.get("copy") or ""))
+    if not os.path.isfile(copy) or os.path.islink(copy):
+        keep(path, "its before-image copy is missing")
+        return
+    with open(copy, "rb") as stream:
+        payload = stream.read()
+    if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        keep(path, "its before-image copy changed after it was written")
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        write_atomic(path, payload, int(entry.get("mode") or 0o644))
+        owner = entry.get("owner") or [0, 0]
+        os.chown(path, int(owner[0]), int(owner[1]))
+    except OSError as error:
+        keep(path, "it could not be restored: " + str(error))
+        return
+    if digest(path) != entry.get("sha256"):
+        keep(path, "the restored file does not read back as the before-image")
+
+
+def restore():
+    if not os.path.isfile(MANIFEST) or os.path.islink(MANIFEST):
+        fail("No Worker targets before-image at " + image + "; preserving every path this install wrote.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail(
+            "Worker targets before-image " + MANIFEST + " is not readable JSON; preserving every path this "
+            "install wrote."
+        )
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Worker targets before-image " + MANIFEST + " does not claim this product created it.")
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        fail("Worker targets before-image " + MANIFEST + " names no targets.")
+    entries = record_entries()
+    for target in targets:
+        path = under(target)
+        if not os.path.lexists(path):
+            continue
+        entry = recorded.get(target)
+        if not isinstance(entry, dict):
+            keep(path, "the before-image does not name it")
+            continue
+        if entry.get("state") == "absent":
+            if entries is None:
+                keep(path, "no ownership record proves this transaction wrote it")
+                continue
+            remove_created(path, entries.get(target))
+        else:
+            restore_pre_existing(path, entry)
+    if preserved:
+        print(
+            "Error: " + str(len(preserved)) + " Worker path(s) preserved, so the cleanup is incomplete: "
+            + ", ".join(preserved),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+WORKER_TARGETS_PY
+}
+
+record_worker_targets_before_image() {
+    worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
+worker_transaction_journal() {
+    # One journal per transaction, beside the ACME snapshot and the two
+    # before-images. It is the only record of a run that was killed before it
+    # could finish: the next entrypoint reads it and knows what that run had
+    # already begun to change.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "${root%/}/recovery/${transaction}/transaction-journal.json"
+}
+
+worker_journal_action() {
+    # One writer for the journal, so the install, the reconcile and the rollback
+    # all read the same bytes back. "started" is written before the first
+    # mutation, "installed" once every mutation has been verified, and a
+    # transaction that never reached "installed" is the one a later entrypoint
+    # has to reconcile.
+    local action="$1"
+    local journal="$2"
+    local transaction="$3"
+    local journal_state="${4:-}"
+    python3 - "$action" "$journal" "$transaction" "$journal_state" <<'JOURNAL_PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+action, journal, transaction, journal_state = sys.argv[1:5]
+STATES = ("started", "installed")
+
+
+def refuse(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read():
+    if os.path.islink(journal) or not os.path.isfile(journal):
+        refuse("Worker transaction journal " + journal + " is not a regular file.")
+    try:
+        with open(journal, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        refuse("Worker transaction journal " + journal + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        refuse("Worker transaction journal " + journal + " is not a journal this product wrote.")
+    if data.get("transaction") != transaction:
+        refuse(
+            "Worker transaction journal " + journal + " records "
+            + json.dumps(data.get("transaction")) + ", not " + json.dumps(transaction) + "."
+        )
+    if data.get("state") not in STATES:
+        refuse("Worker transaction journal " + journal + " records no state this product knows.")
+    return data
+
+
+def store(state):
+    # An installed transaction is closed: rewriting it as started would let a
+    # later run undo an install that already verified every path it wrote.
+    if state == "started" and os.path.lexists(journal) and read().get("state") == "installed":
+        refuse("Worker transaction journal " + journal + " is already installed; refusing to reopen it.")
+    directory = os.path.dirname(journal)
+    if os.path.islink(directory):
+        refuse("Worker transaction directory " + directory + " is a symlink.")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = {
+        "schema": 1,
+        "transaction": transaction,
+        "state": state,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".transaction-journal.", suffix=".tmp")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def remove():
+    # The directory goes only while it is strictly below the recovery root it was
+    # found in, so a transaction name can never name its way out of that root.
+    recovery_root = os.path.realpath(os.path.dirname(os.path.dirname(journal)))
+    transaction_dir = os.path.realpath(os.path.dirname(journal))
+    if recovery_root == os.sep or not transaction_dir.startswith(recovery_root + os.sep):
+        refuse("Worker transaction directory " + transaction_dir + " is not below " + recovery_root + ".")
+    if os.path.islink(os.path.dirname(journal)):
+        refuse("Worker transaction directory " + os.path.dirname(journal) + " is a symlink.")
+    if not os.path.isdir(transaction_dir):
+        refuse("Worker transaction directory " + transaction_dir + " is not a directory.")
+    shutil.rmtree(transaction_dir)
+
+
+if action == "write":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    store(journal_state)
+elif action == "mark":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    if not os.path.lexists(journal):
+        raise SystemExit(0)
+    read()
+    store(journal_state)
+elif action == "state":
+    print(read().get("state"))
+elif action == "remove":
+    read()
+    remove()
+else:
+    refuse("Unknown Worker transaction journal action " + json.dumps(action) + ".")
+JOURNAL_PY
+}
+
+record_worker_transaction_journal() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    if [[ ! "$transaction" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: A Worker transaction journal needs a valid transaction ID." >&2
+        return 1
+    fi
+    worker_journal_action write "$(worker_transaction_journal "$root" "$transaction")" "$transaction" started
+}
+
+mark_worker_transaction_state() {
+    local transaction_state="${1:-}"
+    local transaction="${2:-}"
+    local root="${3:-/var/lib/gowave-auto-nginx}"
+    worker_journal_action mark "$(worker_transaction_journal "$root" "$transaction")" "$transaction" "$transaction_state"
+}
+
+reconcile_worker_transaction_journals() {
+    # Every entrypoint pays for the previous run's crash before it writes
+    # anything of its own. A transaction that never reached "installed" is
+    # restored from its own before-images and its directory is released; a
+    # transaction this product cannot restore, or that already installed but
+    # was never finalized, keeps its journal and the new operation is refused,
+    # so a half-written host is never built upon. The state root is where the
+    # journals live and the host root is where the inventoried paths sit; the
+    # two differ only for a test that owns a scratch tree.
+    local skip="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local host_root="${3:-/}"
+    local journal transaction transaction_dir state failed=0
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    local recovery_root="${root%/}/recovery"
+    [[ -d "$recovery_root" ]] || return 0
+    for journal in "$recovery_root"/*/transaction-journal.json; do
+        [[ -e "$journal" ]] || continue
+        transaction_dir="$(dirname "$journal")"
+        transaction="$(basename "$transaction_dir")"
+        [[ -n "$skip" && "$transaction" == "$skip" ]] && continue
+        if ! state="$(worker_journal_action state "$journal" "$transaction")"; then
+            echo "Error: Uncommitted Worker transaction $transaction cannot be read back; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ "$state" != "started" ]]; then
+            echo "Error: Worker transaction $transaction is '$state' and was never finalized; refusing to start a new install and retaining $transaction_dir. Finalize or roll it back first." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/worker-targets-before-image" ]] &&
+            ! restore_worker_targets_before_image "$host_root" "$transaction_dir/worker-targets-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its Worker before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/firewall-before-image" ]] &&
+            ! restore_firewall_before_image "$host_root" "$transaction_dir/firewall-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its firewall before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if ! worker_journal_action remove "$journal" "$transaction"; then
+            echo "Error: Worker transaction $transaction was restored but its journal could not be released; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        echo "Reconciled uncommitted Worker transaction $transaction from its before-images." >&2
+    done
+    return "$failed"
+}
+
+# --- package change record -------------------------------------------------
+# HOOK-04: a rollback restores the paths this run wrote, never the packages it
+# installed. What the package manager changed is therefore recorded while the
+# transaction still knows it, so a preserved host can be reported as carrying
+# residual state instead of being called clean.
+
+worker_package_record_dir() {
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    printf '%s\n' "${root%/}/recovery/${transaction}"
+}
+
+worker_package_inventory() {
+    # One `package<TAB>version` line per installed package, sorted, so two runs
+    # of the same host agree byte for byte and a diff of them is the package
+    # change a transaction caused.
+    if ! command -v dpkg-query >/dev/null 2>&1; then
+        return 1
+    fi
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort
+}
+
+record_worker_package_baseline() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory file temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: The transaction directory $directory is absent, so a package baseline would not belong to a journal." >&2
+        return 1
+    fi
+    file="$directory/packages-before.txt"
+    temporary="$(mktemp "$directory/.packages-before.XXXXXX")" || return 1
+    if worker_package_inventory >"$temporary" && [[ -s "$temporary" ]]; then
+        :
+    else
+        # A host whose package manager cannot answer is not a host with no
+        # packages; the baseline says what it could not learn.
+        printf '%s\n' "#unavailable" >"$temporary"
+    fi
+    if ! chmod 0600 -- "$temporary" || ! sync "$temporary" ||
+        ! mv -f -- "$temporary" "$file" || ! sync "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+record_worker_package_changes() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory before after changes temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    before="$directory/packages-before.txt"
+    if [[ ! -f "$before" ]]; then
+        echo "Error: The package baseline for $transaction is absent, so the package changes it caused cannot be stated." >&2
+        return 1
+    fi
+    after="$(mktemp "$directory/.packages-after.XXXXXX")" || return 1
+    if worker_package_inventory >"$after" && [[ -s "$after" ]]; then
+        :
+    else
+        printf '%s\n' "#unavailable" >"$after"
+    fi
+    changes="$(mktemp "$directory/.package-changes.XXXXXX")" || {
+        rm -f -- "$after"
+        return 1
+    }
+    if [[ "$(head -n 1 "$before")" == "#unavailable" ]] ||
+        [[ "$(head -n 1 "$after")" == "#unavailable" ]]; then
+        printf '%s\n' "#gowave-package-changes/v1" "#unavailable" >"$changes"
+    else
+        {
+            printf '%s\n' "#gowave-package-changes/v1"
+            awk -F'\t' '
+                FNR == NR { before[$1] = $2; next }
+                { after[$1] = $2 }
+                END {
+                    for (name in after) {
+                        if (!(name in before)) print "installed\t" name "\t" after[name]
+                        else if (before[name] != after[name]) print "upgraded\t" name "\t" before[name] "\t" after[name]
+                    }
+                    for (name in before) if (!(name in after)) print "removed\t" name "\t" before[name]
+                }
+            ' "$before" "$after" | LC_ALL=C sort
+        } >"$changes"
+    fi
+    rm -f -- "$after"
+    if ! chmod 0600 -- "$changes" || ! sync "$changes" ||
+        ! mv -f -- "$changes" "$directory/package-changes.tsv" || ! sync "$directory"; then
+        rm -f -- "$changes"
+        return 1
+    fi
+}
+restore_worker_targets_before_image() {
+    worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
 rollback_failed=0
+
+# A previous run that was killed before it could finish left its
+# journal behind: it is reconciled under this lock, before this
+# entrypoint accepts work of its own.
+reconcile_worker_transaction_journals "${ACME_TX_ID:-}" || rollback_failed=1
 
 # 1. Stop and disable systemd services that are actually installed or active.
 for unit in gowave-node.service xray.service; do
@@ -3165,16 +6629,15 @@ for unit in gowave-node.service xray.service; do
         systemctl disable "$unit" 2>/dev/null || rollback_failed=1
     fi
 done
-rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
-rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+# Every inventoried path comes back from the transaction's before-image: a path
+# that did not exist is removed only while the ownership record still matches it,
+# a path that was here is restored with its content and metadata, and one changed
+# afterwards is preserved with the cleanup reported incomplete.
+restore_worker_targets_before_image || rollback_failed=1
 systemctl daemon-reload 2>/dev/null || rollback_failed=1
-rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
-rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
 
 # 2. Remove NGINX worker configs
-rm -f /etc/nginx/conf.d/00-worker-acme-challenge.conf /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
 rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
-rm -rf /var/www/gowave-acme /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
 if [[ -d /var/www/gowave-auto-nginx ]]; then
     rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
 fi
@@ -3213,9 +6676,290 @@ else
         fi
     done
 fi
-# 4. Remove UFW rules added for Control Plane. Missing rules are already clean;
-# only attempt deletion when the active ruleset confirms the exact rule exists.
-if command -v ufw >/dev/null 2>&1; then
+firewall_before_image() {
+    # Per transaction, beside the ACME snapshot: the recovery root is removed
+    # by remote_finalize after a verified install, so a successful run leaves
+    # no image behind and a failed one leaves exactly the one it needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${ACME_TX_ID:-}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/firewall-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/firewall-before-image"
+}
+
+firewall_image() {
+    # One heredoc, two actions: what the firewall read before this install
+    # changed it, and the only way back to that state. The rollback script
+    # carries the same text, and a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(firewall_before_image)}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: firewall_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    python3 - "$root" "$image" "$action" <<'FIREWALL_IMAGE_PY'
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root, image, action = sys.argv[1:4]
+
+CONFIG_FILES = (
+    "/etc/default/ufw",
+    "/etc/ufw/user.rules",
+    "/etc/ufw/user6.rules",
+    "/etc/ufw/before.rules",
+    "/etc/ufw/before6.rules",
+    "/etc/ufw/after.rules",
+    "/etc/ufw/after6.rules",
+)
+MANIFEST = os.path.join(image, "manifest.json")
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def run(argv, stdin_text=None):
+    result = subprocess.run(argv, capture_output=True, text=True, input=stdin_text)
+    return result.returncode, result.stdout, result.stderr
+
+
+def digest_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def digest_file(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def normalized(text):
+    """The ruleset without the bookkeeping `iptables-save` adds on its own.
+
+    Every dump is stamped with the moment it ran and carries the live
+    counters of each chain, and `iptables-restore` zeroes those counters.
+    Neither is a rule, so a read-back compares what is left.
+    """
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        if line.startswith(":") and line.endswith("]"):
+            line = line[: line.rindex("[")] + "[0:0]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".firewall-image.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Firewall before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    status_code, status_text, status_error = run(["ufw", "status", "verbose"])
+    if status_code != 0:
+        fail(
+            "ufw status verbose exited " + str(status_code) + "; refusing to change a firewall this install cannot "
+            "restore: " + status_error.strip()[-300:]
+        )
+    first = status_text.splitlines()[0].strip() if status_text.strip() else ""
+    if first not in ("Status: active", "Status: inactive"):
+        fail("ufw status verbose printed no status line; refusing to change a firewall this install cannot restore.")
+    defaults = {}
+    for line in status_text.splitlines():
+        if not line.startswith("Default:"):
+            continue
+        for part in line[len("Default:"):].split(","):
+            words = part.split()
+            if len(words) >= 2:
+                defaults[words[1].strip("()")] = words[0]
+    # `ufw status verbose` prints no Default line until the firewall has been
+    # enabled once: an inactive firewall holds no policy, so there is none to
+    # restore and the image records that instead of refusing the install.
+    if first == "Status: active" and set(defaults) != {"incoming", "outgoing", "routed"}:
+        fail(
+            "ufw status verbose printed no complete default policy line; refusing to change a firewall this "
+            "install cannot restore."
+        )
+    dumps = {}
+    for name, argv in (("iptables", ["iptables-save"]), ("ip6tables", ["ip6tables-save"])):
+        code, text, error = run(argv)
+        if code != 0:
+            if name == "ip6tables" and not os.path.exists(under("/proc/net/if_inet6")):
+                dumps[name] = None
+                continue
+            fail(
+                argv[0] + " exited " + str(code) + "; refusing to change a firewall this install cannot restore: "
+                + error.strip()[-300:]
+            )
+        dumps[name] = text
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {
+        "created_by_tx": True,
+        "enabled": first == "Status: active",
+        "status_verbose": status_text,
+        "defaults": defaults,
+        "files": {},
+        "iptables": None,
+        "ip6tables": None,
+    }
+    try:
+        for path in CONFIG_FILES:
+            real = under(path)
+            if not os.path.lexists(real):
+                continue
+            if os.path.islink(real) or not os.path.isfile(real):
+                fail(
+                    "UFW configuration " + real + " is not a regular file; refusing to change a firewall this "
+                    "install cannot restore."
+                )
+            with open(real, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + digest_bytes(path.encode("utf-8"))[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(real)
+            data["files"][path] = {
+                "copy": copy,
+                "sha256": digest_bytes(payload),
+                "mode": state.st_mode & 0o7777,
+                "uid": state.st_uid,
+                "gid": state.st_gid,
+            }
+        for name, text in dumps.items():
+            if text is None:
+                continue
+            copy = name + "-save.txt"
+            write_atomic(os.path.join(image, copy), text.encode("utf-8"), 0o600)
+            data[name] = {"copy": copy, "sha256": digest_bytes(text.encode("utf-8"))}
+        write_atomic(MANIFEST, (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8"), 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def restore():
+    if not os.path.isfile(MANIFEST):
+        fail("No firewall before-image at " + image + "; refusing to guess which rules this install added.")
+    if os.path.islink(MANIFEST):
+        fail("Firewall before-image " + MANIFEST + " is a symlink; refusing to restore from it.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail("Firewall before-image " + MANIFEST + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Firewall before-image " + MANIFEST + " does not claim this product created it.")
+    for key in ("enabled", "status_verbose", "defaults", "files", "iptables"):
+        if key not in data:
+            fail("Firewall before-image " + MANIFEST + " is incomplete: no " + key + ".")
+    if not isinstance(data["files"], dict) or not isinstance(data["iptables"], dict):
+        fail("Firewall before-image " + MANIFEST + " names no restorable files.")
+    for path, meta in data["files"].items():
+        copy = os.path.join(image, str(meta.get("copy") or ""))
+        if not os.path.isfile(copy) or os.path.islink(copy):
+            fail("Firewall before-image copy for " + path + " is missing.")
+        if digest_file(copy) != meta.get("sha256"):
+            fail("Firewall before-image copy for " + path + " changed after it was written.")
+        with open(copy, "rb") as stream:
+            payload = stream.read()
+        target = under(path)
+        write_atomic(target, payload, int(meta.get("mode") or 0o644))
+        try:
+            os.chown(target, int(meta.get("uid") or 0), int(meta.get("gid") or 0))
+        except OSError:
+            pass
+    # The enabled state first: `ufw --force disable` flushes the chains, so a
+    # dump applied before it would be the rules this install added, not these.
+    state = "enable" if data["enabled"] else "disable"
+    code, _, error = run(["ufw", "--force", state])
+    if code != 0:
+        fail("ufw --force " + state + " exited " + str(code) + ": " + error.strip()[-300:])
+    restored = {}
+    for name, argv in (("iptables", ["iptables-restore"]), ("ip6tables", ["ip6tables-restore"])):
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            continue
+        copy = os.path.join(image, str(entry.get("copy") or ""))
+        if not os.path.isfile(copy):
+            fail("Firewall before-image copy for " + name + " is missing.")
+        with open(copy, "r", encoding="utf-8") as stream:
+            text = stream.read()
+        code, _, error = run(argv, stdin_text=text)
+        if code != 0:
+            fail(argv[0] + " exited " + str(code) + ": " + error.strip()[-300:])
+        restored[name] = text
+    code, status_text, _ = run(["ufw", "status", "verbose"])
+    if code != 0 or status_text != data["status_verbose"]:
+        fail("The restored firewall does not read back as the before-image.")
+    code, saved, _ = run(["iptables-save"])
+    if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
+        fail("The restored IPv4 ruleset does not match the before-image.")
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+FIREWALL_IMAGE_PY
+}
+
+record_firewall_before_image() {
+    firewall_image capture "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+restore_firewall_before_image() {
+    firewall_image restore "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+# 4. Restore the UFW before-image this transaction recorded. A host installed
+# before the image existed keeps the old behaviour -- delete exactly the rules
+# this payload adds -- and says so, because the alternative is guessing.
+firewall_image_path="$(firewall_before_image)"
+if [[ -d "$firewall_image_path" ]]; then
+    echo "[ROLLBACK] Restoring the UFW firewall before-image..." >&2
+    restore_firewall_before_image || rollback_failed=1
+elif command -v ufw >/dev/null 2>&1; then
+    echo "[ROLLBACK] No firewall before-image; deleting only the rules this install adds." >&2
     ufw_rules=$(ufw status numbered 2>/dev/null) || {
         rollback_failed=1
         ufw_rules=""
@@ -3236,7 +6980,10 @@ if command -v ufw >/dev/null 2>&1; then
     fi
 fi
 # 5. Clean sysctl, project-owned DNS drop-in and scratch
-rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+if [[ -f /etc/sysctl.d/99-gowave-node.conf ]] &&
+    grep -qxF '# Managed by GoWave Auto NGINX' /etc/sysctl.d/99-gowave-node.conf; then
+    rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+fi
 if [[ -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]] &&
     grep -qF 'Managed by GoWave Auto NGINX: VPS Security' /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf; then
     rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1
@@ -3287,8 +7034,11 @@ remote_finalize() {
 
     {
         printf 'export ACME_TX_ID=%q\n' "$acme_tx_id"
+        # A finalization is a mutation too: the run that owns the Worker's lock
+        # passes its lease here, and one started by anyone else still refuses.
+        printf 'export GOWAVE_LEASE_TOKEN=%q\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}"
         cat <<'FINALIZE_REMOTE_SCRIPT'
-set -euo pipefail
+set -Eeuo pipefail
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "Error: Worker snapshot finalization requires root." >&2
     exit 1
@@ -3313,8 +7063,76 @@ if [[ ! -d "$transaction_dir" ]]; then
     echo "Error: Worker ACME snapshot path is not a directory." >&2
     exit 1
 fi
-lock_dir="/run/lock"
-lock_file="$lock_dir/gowave-managed-mutation.lock"
+# Root-only, so the module's non-root lock fallback cannot apply here.
+MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/run/lock/gowave-managed-mutation.lock}"
+MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/run/lock/gowave-mutation-lease.json}"
+
+validate_mutation_lease() {
+    local candidate_token="$1"
+    local lease_file="${2:-$MUTATION_LEASE_FILE}"
+    local lock_file="${3:-$MUTATION_LOCK_FILE}"
+
+    python3 - "$candidate_token" "$lease_file" "$lock_file" <<'PY'
+import json
+import os
+import sys
+
+token, lease_path, lock_path = sys.argv[1:4]
+
+if not os.path.exists(lease_path):
+    sys.exit(1)
+
+if os.path.islink(lease_path):
+    sys.exit(1)
+
+st = os.stat(lease_path)
+if os.geteuid() == 0 and st.st_uid != 0:
+    sys.exit(1)
+
+try:
+    with open(lease_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+expected_token = data.get("lease_token", "")
+holder_pid = data.get("holder_pid")
+
+if not expected_token or expected_token != token:
+    sys.exit(1)
+
+if not holder_pid or not isinstance(holder_pid, int):
+    sys.exit(1)
+
+try:
+    os.kill(holder_pid, 0)
+except OSError:
+    sys.exit(1)
+
+fd_dir = f"/proc/{holder_pid}/fd"
+if os.path.exists(fd_dir):
+    try:
+        real_lock = os.path.realpath(lock_path)
+        has_fd = False
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.path.realpath(os.path.join(fd_dir, fd))
+                if target == real_lock:
+                    has_fd = True
+                    break
+            except Exception:
+                continue
+        if not has_fd:
+            sys.exit(1)
+    except Exception:
+        pass
+
+sys.exit(0)
+PY
+}
+
+lock_dir="$(dirname "$MUTATION_LOCK_FILE")"
+lock_file="$MUTATION_LOCK_FILE"
 if [[ -L "$lock_dir" || -L "$lock_file" ||
       ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
     echo "Error: Mutation lock path is unsafe." >&2
@@ -3325,8 +7143,16 @@ mkdir -p "$lock_dir"
 chmod 0600 "$lock_file"
 exec 9>>"$lock_file"
 if ! flock -n 9; then
-    echo "Error: Another process currently holds the mutation lock." >&2
-    exit 1
+    # The run that owns this host holds the lock from a session of its own and
+    # publishes a lease for the work it starts; finalizing the snapshot that
+    # run's own install produced is such work. Refusing the lease here left a
+    # verified install's snapshot in place, and every later install on the host
+    # then refused with an unfinalized transaction.
+    if [[ -z "${GOWAVE_LEASE_TOKEN:-}" ]] \
+        || ! validate_mutation_lease "$GOWAVE_LEASE_TOKEN" "$MUTATION_LEASE_FILE" "$MUTATION_LOCK_FILE"; then
+        echo "Error: Another process currently holds the mutation lock." >&2
+        exit 1
+    fi
 fi
 rm -rf -- "$transaction_dir"
 echo "Worker ACME recovery snapshot finalized." >&2

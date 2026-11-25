@@ -171,11 +171,19 @@ def healthy_cluster(vision=False, worker_vision=False):
 
 
 def topology_fixture(vision=False, worker_vision=False):
-    """The topology attributes the cases read: the plan and the Worker's domains."""
+    """The topology attributes the cases read: the plan and both hosts' domains.
+
+    The Vision case reads this deployment's own four names back through the
+    parser, so all four are here: a fixture carrying only the two Panel names
+    would fail the case on a missing attribute instead of on the configuration it
+    is supposed to judge.
+    """
     return types.SimpleNamespace(
         plan=topology.allocate_plan([]),
         panel_domain=topology.PANEL_DOMAIN,
+        reality_domain=topology.REALITY_DOMAIN,
         worker_domain=topology.WORKER_DOMAIN,
+        worker_reality_domain=topology.WORKER_REALITY_DOMAIN,
         worker_vision_domain=topology.WORKER_VISION_DOMAIN if worker_vision else None,
     )
 

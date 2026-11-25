@@ -7,9 +7,19 @@ import ipaddress
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
+
+# The uTLS presets a Host record can carry are the installer's vocabulary, not a
+# second list here: a copy would let the live runner accept a preset the Host
+# record it provisions cannot mint. Appended, not prepended, so the repository
+# root only extends the search path and shadows nothing.
+if str(Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from modules.api_client import REALITY_DEFAULT_FINGERPRINT, REALITY_FINGERPRINTS  # noqa: E402
 
 WHITELIST_KEYS = {
     "MASTER_IP",
@@ -31,6 +41,7 @@ WHITELIST_KEYS = {
     "MASTER_KNOWN_HOSTS_PATH",
     "WORKER_KNOWN_HOSTS_PATH",
     "ACME_MODE",
+    "INSTALL_MODE",
     "ADMIN_EMAIL",
     "GOWAVE_PANEL_VERSION",
     "GOWAVE_NODE_VERSION",
@@ -82,11 +93,6 @@ HEX40_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
 VERSION_REGEX = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
 
-REALITY_FINGERPRINTS = (
-    "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
-    "random", "randomized",
-)
-
 
 def parse_bool(val: str, key_name: str) -> bool:
     normalized = val.strip().lower()
@@ -128,7 +134,11 @@ def validate_public_ip(val: str, key_name: str, allow_v6: bool = False) -> str:
     if allow_v6 and ip.version != 6:
         raise ValueError(f"Expected IPv6 address for {key_name}, got IPv4: '{val}'")
 
-    if not ip.is_global:
+    # `is_global` is True for a multicast group in both families (239.0.0.0/8 and
+    # ff00::/8 are neither private nor reserved), so the class the refusal message
+    # names has to be asked for separately or the message would promise a rule the
+    # check does not apply.
+    if not ip.is_global or ip.is_multicast:
         raise ValueError(
             f"{key_name} ('{val}') is not a public routable address (private, loopback, multicast, or documentation address rejected)."
         )
@@ -149,6 +159,21 @@ class LiveVPSConfig:
 
     def __getitem__(self, key: str) -> Any:
         return self.values[key]
+
+    # The teardown runner reads the hook as `restore_hook_path` and
+    # `restore_hook_sha256`, which `__getattr__` would resolve to
+    # `RESTORE_HOOK_PATH` and `RESTORE_HOOK_SHA256` — names no configuration
+    # carries, because the canonical keys are `SNAPSHOT_RESTORE_HOOK` and
+    # `SNAPSHOT_RESTORE_HOOK_SHA256`. Without these two properties the first
+    # RESTORE_SNAPSHOT teardown raised AttributeError instead of refusing, and
+    # every unit test passed because each one handed in a mock.
+    @property
+    def restore_hook_path(self) -> Any:
+        return self.values.get("SNAPSHOT_RESTORE_HOOK")
+
+    @property
+    def restore_hook_sha256(self) -> Any:
+        return self.values.get("SNAPSHOT_RESTORE_HOOK_SHA256")
 
     def __getattr__(self, name: str) -> Any:
         # Canonical storage uses uppercase environment keys; the runner uses
@@ -291,6 +316,20 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     parsed["ACME_MODE"] = acme_mode
     parsed["ADMIN_EMAIL"] = raw_pairs.get("ADMIN_EMAIL", "admin@example.com")
 
+    # Installation mode. The runner drives the flag rather than the wizard, so the
+    # mode is configuration and defaults to the topology the older runs recorded.
+    install_mode = (raw_pairs.get("INSTALL_MODE", "all-in-one").strip().lower()
+                    or "all-in-one")
+    if install_mode not in ("all-in-one", "panel-only"):
+        raise ValueError(
+            f"Invalid INSTALL_MODE: '{install_mode}'. Must be 'all-in-one' or 'panel-only'."
+        )
+    if install_mode == "panel-only" and parsed["MASTER_VISION_DOMAIN"]:
+        raise ValueError(
+            "MASTER_VISION_DOMAIN requires a traffic plane; INSTALL_MODE=panel-only deploys none on the Master."
+        )
+    parsed["INSTALL_MODE"] = install_mode
+
     # Component versions follow the upstream release channel by default: "latest"
     # is the documented value, and the runner then verifies that each component
     # reports some version instead of comparing it to a hardcoded tag. An explicit
@@ -310,9 +349,11 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
             )
         parsed[version_key] = version_value
 
-    # REALITY Host fingerprint. Defaults to firefox and must match what the
-    # installer provisions; any supported uTLS preset can be pinned explicitly.
-    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", "firefox").strip().lower() or "firefox")
+    # REALITY Host fingerprint. Defaults to the one `modules/api_client` mints
+    # for a Host record and must match what the installer provisions; any
+    # supported uTLS preset can be pinned explicitly.
+    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", REALITY_DEFAULT_FINGERPRINT).strip().lower()
+                  or REALITY_DEFAULT_FINGERPRINT)
     if reality_fp not in REALITY_FINGERPRINTS:
         raise ValueError(
             f"Invalid REALITY_FINGERPRINT: '{reality_fp}'. "

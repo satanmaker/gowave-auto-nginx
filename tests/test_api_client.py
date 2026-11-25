@@ -22,6 +22,7 @@ import modules.api_client as api_client
 from modules.api_client import (
     GoWaveAPIError,
     GoWaveClient,
+    GoWaveNodeNameTaken,
     atomic_write_state,
     save_credentials,
     rollback_provisioning,
@@ -29,6 +30,10 @@ from modules.api_client import (
     parse_core_version,
     reality_fingerprint,
     _extract_list,
+    PROFILE_LABELS,
+    country_flag,
+    host_label,
+    host_projection,
 )
 from modules.recovery import sqlite_online_backup, write_journal_atomically
 
@@ -84,6 +89,14 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             self.send_json(404, {"error": "Not found"})
 
     def do_GET(self):
+        if self.path.startswith("/api/users/by-username/"):
+            username = self.path.rsplit("/", 1)[-1]
+            user = self.users.get(username)
+            if user is None:
+                self.send_json(404, {"error": "User not found"})
+            else:
+                self.send_json(200, {"response": user})
+            return
         if self.path == "/api/system/tools/x25519/generate":
             self.send_json(200, {"response": {"keypairs": [{"privateKey": "priv-key-base64", "publicKey": "pub-key-base64"}]}})
         elif self.path == "/api/config-profiles":
@@ -157,6 +170,11 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             n_uuid = self.path.split("/")[-1]
             if n_uuid in self.nodes:
                 self.nodes[n_uuid].update(body)
+        elif self.path.startswith("/api/users/"):
+            u_id = self.path.split("/")[-1]
+            for user in self.users.values():
+                if str(user.get("uuid")) == u_id:
+                    user.update(body)
         self.send_json(200, {"response": {"status": "updated", **body}})
 
     def do_DELETE(self):
@@ -494,7 +512,8 @@ class TestAPIClient(unittest.TestCase):
         )
         self.assertEqual(len(hosts), 5)
         remarks = {MockGoWaveServer.hosts[h].get("remark") for h in hosts}
-        self.assertIn("VLESS-Vision-TLS@vision-node", remarks)
+        self.assertIn(host_label("vless-vision", "vision-node"), remarks)
+        self.assertEqual(remarks, {host_label(key, "vision-node") for key in PROFILE_LABELS})
         fps = {MockGoWaveServer.hosts[h].get("remark"): MockGoWaveServer.hosts[h].get("fingerprint") for h in hosts}
         for remark, fp in fps.items():
             self.assertEqual(fp, "firefox")
@@ -624,6 +643,106 @@ class TestAPIClient(unittest.TestCase):
         self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
         self.assertEqual(client.transaction_entities[0]["before"]["configProfile"], node["configProfile"])
 
+    def test_a_name_held_by_another_address_is_refused_without_a_patch(self):
+        # The Panel is the authority on names. Updating the node it lists under
+        # this name would rewrite that server's address and move another
+        # deployment's traffic endpoint, so the registration refuses instead.
+        node = {
+            "uuid": "node-other",
+            "name": "ams-01",
+            "address": "10.9.9.9",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-other",
+                "activeInbounds": [{"uuid": "inbound-other"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        with self.assertRaises(GoWaveNodeNameTaken) as raised:
+            client.associate_node("ams-01", "10.1.2.3", 3002, "profile-new", ["inbound-new"])
+        self.assertIn("10.9.9.9:3002", str(raised.exception))
+        self.assertIn("not 10.1.2.3:3002", str(raised.exception))
+        self.assertEqual([c for c in calls if c[0] != "GET"], [], "a foreign node was written")
+        self.assertEqual(client.transaction_entities, [], "a refused adoption was journalled as an update")
+
+    def test_the_same_address_and_port_is_the_node_being_reinstalled(self):
+        # A repeated install of one server meets its own name; that is the
+        # identity to reconcile, not a collision.
+        node = {
+            "uuid": "node-1",
+            "name": "ams-01",
+            "address": "10.1.2.3",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node("ams-01", "10.1.2.3", 3002, "profile-2", ["inbound-1"])
+        self.assertEqual(node_uuid, "node-1")
+        self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
+
+    def test_an_explicit_uuid_retries_the_node_without_looking_it_up_by_name(self):
+        node = {
+            "uuid": "node-1",
+            "name": "renamed-on-the-panel",
+            "address": "10.1.2.3",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node(
+            "ams-01", "10.1.2.3", 3002, "profile-2", ["inbound-1"], existing_node_uuid="node-1",
+        )
+        self.assertEqual(node_uuid, "node-1")
+        self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
+
+    def test_list_nodes_reads_the_panels_inventory(self):
+        client = GoWaveClient("http://panel.example.test")
+        nodes = [{"uuid": "node-1", "name": "ams-01", "address": "10.1.2.3"}]
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            self.assertEqual((method, endpoint), ("GET", "/api/nodes"))
+            return {"response": {"nodes": nodes}}
+
+        client.request = fake_request
+        self.assertEqual(client.list_nodes(), nodes)
+
     def test_parse_core_version(self):
         self.assertEqual(parse_core_version("v26.11.9"), (26, 11, 9))
         self.assertEqual(parse_core_version("26.9.9"), (26, 9, 9))
@@ -682,10 +801,11 @@ class TestAPIClient(unittest.TestCase):
         )
 
         remarks = {MockGoWaveServer.hosts[uuid].get("remark"): uuid for uuid in hosts}
-        reality_uuid = remarks[f"VLESS-REALITY-Vision@hybrid-node"]
+        reality_label = host_label("vless-reality", "hybrid-node")
+        reality_uuid = remarks[reality_label]
         self.assertIs(MockGoWaveServer.hosts[reality_uuid].get("mihomoX25519"), True)
         for remark, uuid in remarks.items():
-            if remark != f"VLESS-REALITY-Vision@hybrid-node":
+            if remark != reality_label:
                 self.assertNotIn("mihomoX25519", MockGoWaveServer.hosts[uuid], remark)
 
         # Re-provisioning keeps the flag and records it in the rollback snapshot.
@@ -713,7 +833,7 @@ class TestAPIClient(unittest.TestCase):
                 "vpn.example.com", "cdn.example.com", "legacy-node"
             )
         remarks = {MockGoWaveServer.hosts[uuid].get("remark"): uuid for uuid in hosts}
-        reality_uuid = remarks["VLESS-REALITY-Vision@legacy-node"]
+        reality_uuid = remarks[host_label("vless-reality", "legacy-node")]
         self.assertIs(MockGoWaveServer.hosts[reality_uuid].get("mihomoX25519"), False)
 
     def test_panel_discovers_master_and_worker_nodes(self):
@@ -789,8 +909,10 @@ class TestAPIClient(unittest.TestCase):
         # Verify Host entities in GET /api/hosts include both nodes
         hosts_res = self.client.request("GET", "/api/hosts")
         hosts_list = _extract_list(hosts_res, "hosts")
-        master_host_remarks = {f"{p}@local-node" for p in ["VLESS-REALITY-Vision", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
-        worker_host_remarks = {f"{p}@worker-1" for p in ["VLESS-REALITY-Vision", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
+        # Vision is not enabled in either profile here, so the projection holds four.
+        transported = [key for key in PROFILE_LABELS if key != "vless-vision"]
+        master_host_remarks = {host_label(key, "local-node") for key in transported}
+        worker_host_remarks = {host_label(key, "worker-1") for key in transported}
         all_remarks = {h.get("remark") for h in hosts_list}
         self.assertTrue(master_host_remarks.issubset(all_remarks))
         self.assertTrue(worker_host_remarks.issubset(all_remarks))
@@ -1345,6 +1467,275 @@ class TestAPIClient(unittest.TestCase):
             self.assertIn("unrelated-node", MockGoWaveServer.nodes)
 
 
+class TestHostLabels(unittest.TestCase):
+    """The label a subscription shows is one of five documented forms.
+
+    The Panel derives the proxy name in both the Xray JSON and the Mihomo YAML
+    from the Host remark, and a proxy group references that same name, so the
+    remark is the one field of the record a client reads as text. The forms are
+    written out here instead of being derived, because this is the assertion the
+    renderer has to satisfy: a shape change in `PROFILE_LABELS` has to show up as
+    a reader-visible difference, not as a test that moved with it.
+    """
+
+    EXPECTED = {
+        "vless-reality": "\U0001F1F3\U0001F1F1 VLESS · REALITY · Vision — ams-01",
+        "vless-vision": "\U0001F1F3\U0001F1F1 VLESS · TLS · Vision — ams-01",
+        "vless-xhttp": "\U0001F1F3\U0001F1F1 VLESS · XHTTP · TLS — ams-01",
+        "vless-ws": "\U0001F1F3\U0001F1F1 VLESS · WebSocket · TLS — ams-01",
+        "trojan-grpc": "\U0001F1F3\U0001F1F1 Trojan · gRPC · TLS — ams-01",
+    }
+
+    def test_the_five_profiles_render_the_documented_forms(self):
+        self.assertEqual(set(PROFILE_LABELS), set(self.EXPECTED))
+        self.assertEqual({key: host_label(key, "ams-01", "NL") for key in PROFILE_LABELS},
+                         self.EXPECTED)
+        self.assertEqual(
+            {key: record["remark"]
+             for key, record in host_projection("panel.example.com", "cdn.example.com",
+                                                "ams-01", country="NL").items()},
+            self.EXPECTED,
+        )
+
+    def test_a_node_without_a_confirmed_country_carries_no_flag(self):
+        self.assertEqual(host_label("vless-reality", "local-node"),
+                         "VLESS · REALITY · Vision — local-node")
+        self.assertEqual(host_projection("panel.example.com", "cdn.example.com")["vless-ws"]["remark"],
+                         "VLESS · WebSocket · TLS — local-node")
+
+    def test_the_code_is_case_and_space_insensitive_and_junk_renders_nothing(self):
+        self.assertEqual(country_flag("nl"), "\U0001F1F3\U0001F1F1")
+        self.assertEqual(country_flag(" DE "), "\U0001F1E9\U0001F1EA")
+        for junk in ("", "ZZZ", "1L", "N L", None):
+            with self.subTest(code=junk):
+                self.assertEqual(country_flag(junk), "")
+
+    def test_two_nodes_in_one_country_are_told_apart_by_their_names(self):
+        left = host_label("vless-xhttp", "ams-01", "NL")
+        right = host_label("vless-xhttp", "ams-02", "NL")
+        self.assertNotEqual(left, right)
+        self.assertTrue(left.startswith("\U0001F1F3\U0001F1F1 "))
+        self.assertTrue(right.endswith(" — ams-02"))
+
+    def test_a_country_changes_the_label_and_nothing_a_client_dials(self):
+        plain = host_projection("panel.example.com", "cdn.example.com", "ams-01")
+        flagged = host_projection("panel.example.com", "cdn.example.com", "ams-01", country="NL")
+        self.assertEqual(set(plain), set(flagged))
+        for key in plain:
+            with self.subTest(profile=key):
+                self.assertEqual({name: value for name, value in plain[key].items() if name != "remark"},
+                                 {name: value for name, value in flagged[key].items() if name != "remark"})
+                self.assertNotEqual(plain[key]["remark"], flagged[key]["remark"])
+
+    def test_the_label_survives_a_json_round_trip(self):
+        """The Panel stores and answers the remark as UTF-8; no byte may be lost."""
+        labels = [host_label(key, "ams-01", "NL") for key in PROFILE_LABELS]
+        self.assertEqual(json.loads(json.dumps(labels)), labels)
+        self.assertEqual(json.loads(json.dumps(labels))[0],
+                         "\U0001F1F3\U0001F1F1 VLESS · REALITY · Vision — ams-01")
+
+    def test_the_operator_page_shows_the_names_a_client_reads(self):
+        """The page is where an operator learns what the subscription will show."""
+        page = (REPO_ROOT / "docs" / "SETUP_WIZARD.md").read_text(encoding="utf-8")
+        for label in self.EXPECTED.values():
+            with self.subTest(label=label):
+                self.assertIn(label, page)
+
+
+class TestHostReconciliation(unittest.TestCase):
+    """A relabelled node keeps the Hosts it already published.
+
+    The remark is what a subscription shows, so the country flag and the node
+    name both live in it and both change it. A provisioner that looked Hosts up
+    by that label would create a second record for an inbound it already had,
+    or adopt a record the operator made by hand. Identity is the recorded UUID,
+    or the inbound/node pairing when no UUID was recorded yet.
+    """
+
+    INBOUNDS = [
+        {"uuid": "inb-reality", "tag": "vless-reality-ams-01"},
+        {"uuid": "inb-xhttp", "tag": "vless-xhttp-ams-01"},
+        {"uuid": "inb-ws", "tag": "vless-ws-ams-01"},
+        {"uuid": "inb-grpc", "tag": "trojan-grpc-ams-01"},
+    ]
+
+    def setUp(self):
+        MockGoWaveServer.hosts = {}
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), MockGoWaveServer)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def provision(self, node_name="ams-01", node_uuid="node-ams", known=None, country=""):
+        client = GoWaveClient(self.base_url)
+        return client.provision_hosts(
+            "profile-ams", self.INBOUNDS, node_uuid, "squad-ams",
+            "panel.example.com", "cdn.example.com", node_name,
+            known_host_uuids=known, country=country,
+        )
+
+    def legacy_reality_host(self, uuid="host-legacy", remark="VLESS-REALITY@ams-01", node="node-ams"):
+        record = {
+            "uuid": uuid,
+            "remark": remark,
+            "address": "panel.example.com",
+            "port": 443,
+            "sni": "cdn.example.com",
+            "path": None,
+            "host": None,
+            "alpn": "h2,http/1.1",
+            "fingerprint": "firefox",
+            "securityLayer": "DEFAULT",
+            "internalSquads": {"mode": "ALLOW_ONLY", "squads": ["squad-ams"]},
+            "isDisabled": False,
+            "mihomoX25519": True,
+            "inbound": {"configProfileUuid": "profile-ams", "configProfileInboundUuid": "inb-reality"},
+            "nodes": [node],
+        }
+        MockGoWaveServer.hosts[uuid] = record
+        return record
+
+    def test_a_relabel_updates_the_managed_hosts_in_place(self):
+        first = self.provision(node_name="ams-01", country="NL")
+        self.assertEqual(len(first), 4)
+        self.assertEqual(len(MockGoWaveServer.hosts), 4)
+        before = {uuid: dict(record) for uuid, record in MockGoWaveServer.hosts.items()}
+        self.assertEqual(before[first[0]]["remark"], "\U0001F1F3\U0001F1F1 VLESS · REALITY · Vision — ams-01")
+
+        second = self.provision(node_name="ams-eu", country="DE")
+
+        self.assertEqual(second, first, "a relabel must return the identities it updated")
+        self.assertEqual(len(MockGoWaveServer.hosts), 4, "a relabel must not add records")
+        remarks = {uuid: record["remark"] for uuid, record in MockGoWaveServer.hosts.items()}
+        self.assertEqual(remarks[first[0]], "\U0001F1E9\U0001F1EA VLESS · REALITY · Vision — ams-eu")
+        self.assertEqual(remarks[first[3]], "\U0001F1E9\U0001F1EA Trojan · gRPC · TLS — ams-eu")
+        for uuid, record in before.items():
+            self.assertEqual(MockGoWaveServer.hosts[uuid]["inbound"], record["inbound"])
+            self.assertEqual(MockGoWaveServer.hosts[uuid]["nodes"], record["nodes"])
+            self.assertEqual(MockGoWaveServer.hosts[uuid]["address"], record["address"])
+
+    def test_a_legacy_record_is_adopted_by_its_ownership_not_its_label(self):
+        self.legacy_reality_host()
+
+        hosts = self.provision(node_name="ams-01")
+
+        self.assertEqual(hosts[0], "host-legacy", "the record with this inbound and node is ours")
+        self.assertEqual(len(MockGoWaveServer.hosts), 4, "the three missing inbounds are created, the fourth is updated")
+        self.assertEqual(
+            MockGoWaveServer.hosts["host-legacy"]["remark"],
+            host_label("vless-reality", "ams-01"),
+            "adoption relabels the record it proves it owns",
+        )
+
+    def test_a_stranger_holding_our_label_is_refused_rather_than_adopted(self):
+        stranger = self.legacy_reality_host(
+            uuid="host-stranger",
+            remark=host_label("vless-reality", "ams-01"),
+            node="node-other",
+        )
+        snapshot = json.loads(json.dumps(stranger))
+
+        with self.assertRaises(api_client.GoWaveHostConflict) as caught:
+            self.provision(node_name="ams-01")
+
+        self.assertIn("host-stranger", str(caught.exception))
+        self.assertIn("cannot prove it manages", str(caught.exception))
+        self.assertEqual(MockGoWaveServer.hosts, {"host-stranger": snapshot})
+        self.assertEqual(len(snapshot["nodes"]), 1)
+
+    def test_ambiguous_ownership_is_refused_and_nothing_is_written(self):
+        self.legacy_reality_host(uuid="host-a", remark="VLESS-REALITY-Vision@ams-01")
+        self.legacy_reality_host(uuid="host-b", remark="VLESS-REALITY-Vision@ams-01")
+        snapshot = {uuid: dict(record) for uuid, record in MockGoWaveServer.hosts.items()}
+
+        with self.assertRaises(api_client.GoWaveHostConflict) as caught:
+            self.provision(node_name="ams-01")
+
+        message = str(caught.exception)
+        self.assertIn("2 Host records claim inbound inb-reality on node node-ams", message)
+        self.assertIn("host-a", message)
+        self.assertIn("host-b", message)
+        self.assertEqual(set(MockGoWaveServer.hosts), {"host-a", "host-b"})
+        for uuid, record in snapshot.items():
+            self.assertEqual(MockGoWaveServer.hosts[uuid]["remark"], record["remark"])
+
+    def test_a_recorded_uuid_settles_an_otherwise_ambiguous_ownership(self):
+        self.legacy_reality_host(uuid="host-a", remark="VLESS-REALITY-Vision@ams-01")
+        self.legacy_reality_host(uuid="host-b", remark="VLESS-REALITY-Vision@ams-01")
+
+        hosts = self.provision(node_name="ams-01", known=["host-a"])
+
+        self.assertEqual(hosts[0], "host-a")
+        self.assertEqual(MockGoWaveServer.hosts["host-a"]["remark"], host_label("vless-reality", "ams-01"))
+        self.assertEqual(MockGoWaveServer.hosts["host-b"]["remark"], "VLESS-REALITY-Vision@ams-01")
+        self.assertEqual(len(MockGoWaveServer.hosts), 5, "the duplicate is left alone, the other three are created")
+
+    def test_rollback_puts_the_prior_labels_back(self):
+        first = self.provision(node_name="ams-01")
+        client = GoWaveClient(self.base_url)
+        client.provision_hosts(
+            "profile-ams", self.INBOUNDS, "node-ams", "squad-ams",
+            "panel.example.com", "cdn.example.com", "ams-eu",
+            known_host_uuids=first,
+        )
+        self.assertEqual(
+            MockGoWaveServer.hosts[first[0]]["remark"], host_label("vless-reality", "ams-eu")
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+            jdata = {
+                "transaction_id": "provision_relabel",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-24T00:00:00Z",
+                "entities": client.transaction_entities,
+            }
+            self.assertTrue(jdata["entities"], "the relabel must have recorded what it changed")
+            jfile.write_text(json.dumps(jdata))
+            sfile.write_text(json.dumps({"schemaVersion": 2}))
+
+            self.assertTrue(
+                rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=self.base_url)
+            )
+
+        self.assertEqual(set(MockGoWaveServer.hosts), set(first), "a rollback restores, it never recreates")
+        remarks = {uuid: record["remark"] for uuid, record in MockGoWaveServer.hosts.items()}
+        self.assertEqual(remarks[first[0]], host_label("vless-reality", "ams-01"))
+        self.assertEqual(remarks[first[3]], host_label("trojan-grpc", "ams-01"))
+
+    def test_only_the_enabled_profiles_are_labelled(self):
+        """Vision is the optional fifth profile: no inbound, no Host, no label."""
+        four = self.provision(node_name="ams-01", country="NL")
+        self.assertEqual(
+            {MockGoWaveServer.hosts[uuid]["remark"] for uuid in four},
+            {host_label(key, "ams-01", "NL") for key in
+             ("vless-reality", "vless-xhttp", "vless-ws", "trojan-grpc")},
+        )
+
+        with_vision = self.INBOUNDS + [{"uuid": "inb-vision", "tag": "vless-vision-ams-01"}]
+        client = GoWaveClient(self.base_url)
+        five = client.provision_hosts(
+            "profile-ams", with_vision, "node-ams", "squad-ams",
+            "panel.example.com", "cdn.example.com", "ams-01",
+            known_host_uuids=four, country="NL",
+        )
+
+        self.assertEqual(len(five), 5)
+        self.assertIn(host_label("vless-vision", "ams-01", "NL"),
+                      {MockGoWaveServer.hosts[uuid]["remark"] for uuid in five})
+
+
 class TestRepeatedInstallContract(unittest.TestCase):
     """A second operator run must reuse what the installed Panel already publishes."""
 
@@ -1474,6 +1865,92 @@ class TestRepeatedInstallContract(unittest.TestCase):
                 client.existing_reality_material("GoWave MVP Unified Profile - local-node",
                                                  "reality.example.com")
             )
+
+
+class TestAttachSquadToUser(unittest.TestCase):
+    """A Panel-only user is created without a squad and joins the first one."""
+
+    def setUp(self):
+        MockGoWaveServer.users = {}
+        MockGoWaveServer.squads = {}
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), MockGoWaveServer)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        self.client = GoWaveClient(f"http://127.0.0.1:{self.port}")
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def seed_user(self, squads):
+        MockGoWaveServer.users["default-user"] = {
+            "uuid": "user-1",
+            "username": "default-user",
+            "shortUuid": "suuid-12345",
+            "activeInternalSquads": squads,
+        }
+
+    def test_a_user_without_a_squad_joins_the_new_one(self):
+        self.seed_user([])
+        self.assertIs(self.client.attach_squad_to_user("default-user", "squad-1"), True)
+        self.assertEqual(
+            MockGoWaveServer.users["default-user"]["activeInternalSquads"], ["squad-1"]
+        )
+        # The attach is journalled with the state it replaced, so a failed node add
+        # takes the squad back off the user.
+        self.assertEqual(
+            self.client.transaction_entities,
+            [{
+                "type": "user",
+                "uuid": "user-1",
+                "action": "updated",
+                "before": {"activeInternalSquads": []},
+            }],
+        )
+
+    def test_a_user_that_already_holds_a_squad_is_left_alone(self):
+        self.seed_user([{"uuid": "squad-old", "name": "Operator Squad"}])
+        self.assertIs(self.client.attach_squad_to_user("default-user", "squad-1"), False)
+        self.assertEqual(
+            MockGoWaveServer.users["default-user"]["activeInternalSquads"],
+            [{"uuid": "squad-old", "name": "Operator Squad"}],
+        )
+        self.assertEqual(self.client.transaction_entities, [])
+
+    def test_an_absent_user_is_not_created(self):
+        self.assertIsNone(self.client.attach_squad_to_user("default-user", "squad-1"))
+        self.assertEqual(MockGoWaveServer.users, {})
+        self.assertEqual(self.client.transaction_entities, [])
+
+    def test_the_rollback_takes_the_squad_back_off_the_user(self):
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        self.seed_user([])
+        self.assertTrue(self.client.attach_squad_to_user("default-user", "squad-1"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal = Path(tmpdir) / "journal.json"
+            state = Path(tmpdir) / "state.json"
+            credentials = Path(tmpdir) / "credentials.txt"
+            save_credentials(
+                "admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(credentials)
+            )
+            state.write_text(json.dumps({"schemaVersion": 2, "nodes": [{"name": "worker-1"}]}), encoding="utf-8")
+            write_journal_atomically(str(journal), {
+                "transaction_id": "node_add_worker-1",
+                "op": "node_add",
+                "state": "NODE_ADD_VERIFYING",
+                "node_name": "worker-1",
+                "timestamp": "2026-11-20T00:00:00Z",
+                "entities": self.client.transaction_entities,
+            })
+            self.assertTrue(
+                rollback_provisioning(
+                    str(journal), str(state), str(credentials),
+                    base_url=f"http://127.0.0.1:{self.port}",
+                )
+            )
+        self.assertEqual(MockGoWaveServer.users["default-user"]["activeInternalSquads"], [])
 
 
 if __name__ == "__main__":

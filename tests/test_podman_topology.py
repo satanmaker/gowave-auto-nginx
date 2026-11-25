@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Suite nonroot: the AIO topology uses only run-scoped, pinned, two-network pieces."""
+import contextlib
+import io
 import ipaddress
 import subprocess
 import sys
@@ -11,7 +13,8 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import acme_fixture, target_image, topology  # noqa: E402
+from tools import run_podman_e2e  # noqa: E402
+from tools.podman_e2e import acme_fixture, panel_only, target_image, topology  # noqa: E402
 from tools.podman_e2e.runner import RunContext  # noqa: E402
 
 PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
@@ -23,6 +26,7 @@ class FakePodman:
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
         self.connects = []
+        self.volumes = []
         self.used_subnets = ["10.89.0.0/24", "10.90.0.0/24", "10.88.0.0/16"]
         self.runs = []
         self.waits = []
@@ -43,6 +47,16 @@ class FakePodman:
     def network_connect(self, name, network, ip=None):
         self.connects.append((name, network, ip))
         return name
+
+    def volume_create(self, name):
+        """The run's archive volume; a real one is a Podman volume, a directory here."""
+        self.volumes.append(name)
+        return name
+
+    def volume_mountpoint(self, name):
+        mountpoint = self.context.secret_dir / "volumes" / name
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        return mountpoint
 
     def run(self, **kwargs):
         self.runs.append(kwargs)
@@ -167,8 +181,45 @@ class TestPodmanTopology(unittest.TestCase):
             "nameserver 192.168.1.1\nnameserver 9.9.9.9\n",
             encoding="utf-8",
         )
-        self.assertEqual(topology.egress_resolvers(resolv), ["192.168.1.1", "9.9.9.9"])
-        self.assertEqual(topology.egress_resolvers(directory / "absent"), [])
+        self.assertEqual(topology.egress_resolvers(resolv, upstreams=()), ["192.168.1.1", "9.9.9.9"])
+        self.assertEqual(topology.egress_resolvers(directory / "absent", upstreams=()), [])
+
+    def test_a_stub_only_resolv_conf_follows_the_upstream_list(self):
+        # A host running systemd-resolved answers /etc/resolv.conf with its own
+        # 127.0.0.53 listener, which does not exist inside the container. The
+        # upstream file beside it is the only address the target can use.
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        stub = directory / "resolv.conf"
+        stub.write_text("nameserver 127.0.0.53\nnameserver ::1\n", encoding="utf-8")
+        upstream = directory / "upstream.conf"
+        upstream.write_text(
+            "nameserver 168.63.129.16\nnameserver 127.0.0.1\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            topology.egress_resolvers(stub, upstreams=(upstream,)),
+            ["168.63.129.16"],
+        )
+
+    def test_a_real_address_in_the_host_file_is_not_replaced(self):
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        resolv = directory / "resolv.conf"
+        resolv.write_text("nameserver 192.168.1.1\n", encoding="utf-8")
+        upstream = directory / "upstream.conf"
+        upstream.write_text("nameserver 9.9.9.9\n", encoding="utf-8")
+        self.assertEqual(topology.egress_resolvers(resolv, upstreams=(upstream,)), ["192.168.1.1"])
+
+    def test_a_stub_only_host_without_an_upstream_file_yields_nothing(self):
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        stub = directory / "resolv.conf"
+        stub.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
+        self.assertEqual(
+            topology.egress_resolvers(stub, upstreams=(directory / "absent.conf",)),
+            [],
+        )
 
     def test_a_run_without_an_egress_resolver_never_starts(self):
         instance, podman = self.topology(egress_resolvers=[])
@@ -340,6 +391,115 @@ class TestPodmanTopology(unittest.TestCase):
         with self.assertRaises(target_image.TargetImageError):
             topology.AioTopology(podman, distribution="centos-9")
         self.assertEqual(podman.runs, [])
+
+
+class TestPanelOnlyTopology(unittest.TestCase):
+    """The Panel-only drive: the operator's own flag, no Vision, and five declared cases.
+
+    The mode is a product deployment the installer documents, so the harness has
+    to invoke it through the command an operator would type rather than through a
+    second entry point. These tests hold the rendered command, the refusal of the
+    Vision arguments the mode cannot honour, and the suite the entrypoint builds.
+    """
+
+    def make(self, **overrides):
+        podman = FakePodman(**{
+            key: overrides[key]
+            for key in ("install_output", "install_returncode") if key in overrides
+        })
+        self.addCleanup(podman.context.run_cleanup)
+        overrides.setdefault("egress_resolvers", ["192.0.2.53"])
+        instance = topology.PanelOnlyTopology(
+            podman, **{
+                key: value for key, value in overrides.items()
+                if key not in ("install_output", "install_returncode")
+            }
+        )
+        return instance, podman
+
+    def test_the_rendered_command_is_the_documented_panel_only_flag(self):
+        instance, _podman = self.make()
+        self.assertEqual(
+            instance.install_script(),
+            f"bash /repo/gowave-auto.sh install --panel-only '{topology.PANEL_DOMAIN}' "
+            f"'{topology.REALITY_DOMAIN}' '{instance.admin_email}'",
+            "the harness must drive the flag the operator documentation names",
+        )
+        self.assertEqual(instance.install_script().count("'"), 6, "three positionals, no Vision")
+
+    def test_the_mode_refuses_a_vision_domain_it_cannot_terminate(self):
+        with self.assertRaises(ValueError) as caught:
+            self.make(vision_domain="vision.testbed.internal")
+        self.assertIn("no Vision domain", str(caught.exception))
+
+    def test_install_and_reinstall_keep_their_own_evidence(self):
+        instance, podman = self.make(install_output="panel-only ok")
+        outcome = instance.install()
+        self.assertTrue(outcome.ok)
+        evidence = podman.context.artifact_dir / "evidence"
+        self.assertTrue((evidence / "panel-only-install.stdout.log").is_file())
+        self.assertTrue((evidence / "panel-only-install.stderr.log").is_file())
+        self.assertIn("install --panel-only", podman.install_script)
+        instance.reinstall()
+        self.assertTrue((evidence / "panel-only-reinstall.stdout.log").is_file())
+        self.assertIn("install --panel-only", podman.install_script)
+
+    def test_the_host_and_its_record_are_named_by_the_mode(self):
+        instance, _podman = self.make()
+        self.assertEqual(instance.target_role, "panel-only")
+        self.assertNotEqual(instance.target_name, instance.context.resource_name("aio"))
+        record = instance.evidence(instance.install())
+        self.assertEqual(record["installation_mode"], "panel-only")
+        self.assertEqual(record["install_command"], instance.install_script())
+        self.assertEqual(record["vision_domain"], "")
+
+    def test_the_topology_declares_the_six_panel_only_cases(self):
+        suite = panel_only.cases(FakePodman())
+        self.assertEqual(
+            [case.id for case in suite],
+            [
+                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
+                # The add-node refusal needs a Panel and no Worker, so both
+                # topologies run it: Panel-only is where the mutation boundary it
+                # asserts stays crossed by construction.
+                "MN-ADD-NODE-REFUSED",
+            ],
+        )
+        self.assertEqual({case.topology for case in suite}, {"panel-only"})
+
+    def test_the_entrypoint_lists_the_third_topology(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as caught:
+            run_podman_e2e.main(["--help"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("panel-only", out.getvalue())
+
+    def _refused(self, arguments):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            run_podman_e2e.main([*arguments, "--artifact-root", directory])
+        return caught.exception.code, err.getvalue()
+
+    def test_the_vision_flags_are_refused_before_any_container(self):
+        for flag in ("--vision", "--worker-vision"):
+            with self.subTest(flag=flag):
+                code, err = self._refused(["--topology", "panel-only", flag])
+                self.assertEqual(code, 2)
+                self.assertIn("topology has none", err)
+
+    def test_the_entrypoint_builds_the_declared_panel_only_suite(self):
+        suite = run_podman_e2e.build_suite(
+            FakePodman(), "panel-only", run_podman_e2e.DEFAULT_DISTRIBUTION,
+        )
+        self.assertEqual(
+            [case.id for case in suite],
+            [
+                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
+                "MN-ADD-NODE-REFUSED",
+            ],
+        )
+        self.assertEqual(run_podman_e2e.TOPOLOGIES, ("aio", "multi-node", "panel-only"))
 
 
 if __name__ == "__main__":

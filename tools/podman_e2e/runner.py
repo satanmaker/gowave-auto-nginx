@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from tools.live_vps.redaction import redact, register_secret
+from tools.podman_e2e import catalog as catalog_data
+from tools.podman_e2e import groups
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -114,6 +116,7 @@ class CaseResult:
     duration: float = 0.0
     message: str = ""
     evidence: Dict[str, Any] = field(default_factory=dict)
+    evidence_files: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -123,6 +126,7 @@ class CaseResult:
             "duration": round(self.duration, 3),
             "message": redact(self.message),
             "evidence": {key: redact(str(value)) for key, value in self.evidence.items()},
+            "evidence_files": list(self.evidence_files),
         }
 
 
@@ -136,6 +140,21 @@ class Case:
 
 class BudgetExhausted(Exception):
     pass
+
+
+class HarnessLimit(Exception):
+    """A container command outlasted the ceiling the harness gave it.
+
+    Reported as INCOMPLETE rather than FAIL: the command was not allowed to
+    finish, so what the case saw cannot decide anything about the product. The
+    message names the command and the ceiling, because the limit is a fact about
+    the harness and the operator has to be able to see which one fired.
+    """
+
+    def __init__(self, command: str, ceiling: float) -> None:
+        super().__init__(f"{command} did not finish within {ceiling:.0f}s")
+        self.command = command
+        self.ceiling = ceiling
 
 
 class CaseBlocked(Exception):
@@ -157,6 +176,16 @@ class CaseIncomplete(Exception):
 
 class CaseTimeout(Exception):
     pass
+
+
+class CaseNotApplicable(Exception):
+    """The environment does not contain the subject the case would judge.
+
+    Distinct from INCOMPLETE (the subject was observed, but what was seen cannot
+    decide the question) and from SKIP (a declared case that was not executed):
+    here there is nothing to observe, and saying so is not a failure of the
+    product. A run made only of these proves nothing and is not green either.
+    """
 
 
 class RunAborted(Exception):
@@ -198,6 +227,9 @@ class RunContext:
         self.labels.update(labels or {})
         self.cleanup_actions: List[Callable[[], None]] = []
         self.environment: Dict[str, Any] = {}
+        # Every evidence file is listed here as it is written, so a case result can
+        # name the files it produced instead of only inlining their content.
+        self.evidence_files: List[str] = []
         # Secrets never live under artifact_dir: artifacts are retained and shared.
         self.secret_dir = Path(tempfile.mkdtemp(prefix=f"gowave-e2e-{self.run_id}-"))
         self.secret_dir.chmod(0o700)
@@ -254,6 +286,9 @@ class RunContext:
         path.write_text(redact(text), encoding="utf-8")
         path.chmod(0o600)
         hand_back_artifacts(path, self.operator)
+        relative = str(path.relative_to(self.artifact_dir))
+        if relative not in self.evidence_files:
+            self.evidence_files.append(relative)
         return path
 
     def run_cleanup(self) -> List[str]:
@@ -271,9 +306,32 @@ class Runner:
         self.context = context
         self.cases: List[Case] = []
         self.results: List[CaseResult] = []
+        # Failure collectors are registered by the entrypoint instead of the
+        # runner: collection needs Podman, while the runner stays a result
+        # machine a unit test can drive without one.
+        self.failure_hooks: List[Callable[[CaseResult], None]] = []
+        self.required_groups: List[str] = []
+        self._groups_applied = False
+        self._diagnosed = False
+        self._pending_abort = ""
 
     def add(self, case: Case) -> None:
         self.cases.append(case)
+
+    def require_group(self, group: str) -> None:
+        """Declare a set of case ids this run must contain and pass.
+
+        A case can be dropped from a suite by an ordinary edit and the remaining
+        run still reports PASS; naming the group makes that loss a red verdict
+        and records the audit in ``result.json``. The declaration is validated
+        here rather than at report time so a typo fails before the install.
+        """
+        groups.required_ids(group, self.context.topology)
+        self.required_groups.append(group)
+
+    def on_failure(self, hook: Callable[[CaseResult], None]) -> None:
+        """Register a collector that runs for every non-green case, before cleanup."""
+        self.failure_hooks.append(hook)
 
     def execute(self) -> int:
         self.context.install_signal_handlers()
@@ -285,6 +343,7 @@ class Runner:
                     unexecuted = list(self.cases[index:])
                     break
                 started = time.monotonic()
+                evidence_before = len(self.context.evidence_files)
                 timeout, capped_by_budget = self._case_timeout(case)
                 try:
                     self._arm_timeout(timeout)
@@ -297,7 +356,10 @@ class Runner:
                     abort_message = str(exc)
                     unexecuted = list(self.cases[index + 1:])
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=abort_message)
-                    self.results.append(result)
+                    # No diagnostics here: the operator asked the run to stop, so
+                    # probe time is the one thing this path must not spend. The
+                    # containers are removed immediately afterwards anyway.
+                    self.results.append(self._finish(result, started, evidence_before))
                     break
                 except CaseTimeout:
                     status = INCOMPLETE if capped_by_budget else FAIL
@@ -307,9 +369,13 @@ class Runner:
                     result = CaseResult(case.id, case.topology, FAIL, message=str(exc))
                 except CaseBlocked as exc:
                     result = CaseResult(case.id, case.topology, BLOCKED, message=str(exc))
+                except CaseNotApplicable as exc:
+                    result = CaseResult(case.id, case.topology, NOT_APPLICABLE, message=str(exc))
                 except CaseIncomplete as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except BudgetExhausted as exc:
+                    result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
+                except HarnessLimit as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except Exception as exc:  # unexpected harness error is never PASS
                     result = CaseResult(
@@ -318,8 +384,11 @@ class Runner:
                         FAIL,
                         message=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                     )
-                result.duration = time.monotonic() - started
-                self.results.append(result)
+                self.results.append(self._finish_result(result, started, evidence_before))
+                if self._pending_abort:
+                    abort_message = self._pending_abort
+                    unexecuted = list(self.cases[index + 1:])
+                    break
         finally:
             # Cleanup must survive every exit path, so signal handlers are restored
             # before running it; a second SIGINT then behaves like an operator abort.
@@ -343,6 +412,52 @@ class Runner:
             return remaining, True
         return declared, False
 
+    def _finish_result(self, result: CaseResult, started: float, evidence_before: int) -> CaseResult:
+        """Stamp the case, collecting the failure bundle while its hosts still exist."""
+        if self._should_diagnose(result.status):
+            self._diagnosed = True
+            self._collect_failure_diagnostics(result)
+        return self._finish(result, started, evidence_before)
+
+    def _should_diagnose(self, status: str) -> bool:
+        """Which non-green outcomes owe a bundle.
+
+        A blocked case is a consequence, not the failure: the case that blocked it
+        already collected the state, and probing again for each of the fifty cases
+        behind one failed install would spend minutes re-recording the same
+        machine. A red run in which no case actually failed still gets one
+        bundle, because then the blocked case is the only account of the run.
+        """
+        return status in (FAIL, INCOMPLETE) or (status == BLOCKED and not self._diagnosed)
+
+    def _collect_failure_diagnostics(self, result: CaseResult) -> None:
+        """Run the registered collectors for a non-green case.
+
+        A collector that breaks must not change the verdict: the case already has
+        one, and losing the bundle is a smaller loss than reporting a different
+        outcome. The breakage is appended to the message so the gap is visible in
+        result.json rather than silently absent.
+        """
+        for hook in self.failure_hooks:
+            try:
+                hook(result)
+            except RunAborted as exc:
+                # The operator interrupted while the bundle was being read. The
+                # case keeps the verdict it earned; the run stops after it rather
+                # than spending the rest of the budget on the next cases.
+                self._pending_abort = str(exc)
+                return
+            except Exception as exc:
+                result.message = (
+                    f"{result.message}\n[failure diagnostics: {type(exc).__name__}: {exc}]"
+                )
+
+    def _finish(self, result: CaseResult, started: float, evidence_before: int) -> CaseResult:
+        """Stamp the duration and the evidence files this case produced."""
+        result.duration = time.monotonic() - started
+        result.evidence_files = self.context.evidence_files[evidence_before:]
+        return result
+
     def _arm_timeout(self, seconds: float) -> None:
         self._armed = False
         if seconds <= 0 or not hasattr(signal, "SIGALRM") or not self._main_thread():
@@ -364,21 +479,131 @@ class Runner:
         return threading.current_thread() is threading.main_thread()
 
     def report(self) -> int:
-        data = {
-            "schema": "gowave-podman-e2e-result/v1",
-            "run_id": self.context.run_id,
-            "topology": self.context.topology,
-            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - self.context.elapsed())),
-            "duration": round(self.context.elapsed(), 3),
-            "budget_seconds": self.context.budget_seconds,
-            "environment": {**self.context.environment, "repository": repository_state()},
-            "cases": [result.to_dict() for result in self.results],
-        }
-        overall = overall_status(self.results)
-        data["overall"] = overall
+        self._apply_required_groups()
+        # The id says which case ran; the digest says which sentence it asserted.
+        # Recording it here is what lets the divergence guard compare this run
+        # with the live suite's, and refuse a case that recorded neither.
+        digests = catalog_data.assertion_digests()
+
+        def case_record(result: "CaseResult") -> Dict[str, Any]:
+            record = result.to_dict()
+            if result.id in digests:
+                record["assertion_sha256"] = digests[result.id]
+            return record
+
+        def payload() -> Dict[str, Any]:
+            return {
+                "schema": "gowave-podman-e2e-result/v1",
+                "run_id": self.context.run_id,
+                "topology": self.context.topology,
+                "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - self.context.elapsed())),
+                "duration": round(self.context.elapsed(), 3),
+                "budget_seconds": self.context.budget_seconds,
+                "environment": {**self.context.environment, "repository": repository_state()},
+                "cases": [case_record(result) for result in self.results],
+            }
+
+        data = payload()
+        data["overall"] = overall_status(self.results)
         write_result(self.context.artifact_dir, data)
+
+        audit = redaction_audit(self.context.artifact_dir)
+        self.context.environment["redaction_audit"] = audit
+        if audit["offences"]:
+            # A file that changes when redacted is holding something the policy
+            # forbids in a retained artifact. Scrub it, then fail the run rather
+            # than ship a credential behind a green verdict.
+            scrubbed: List[str] = []
+            unscrubbable: List[str] = []
+            for name in audit["offences"]:
+                done, error = scrub_artifact(self.context.artifact_dir, name)
+                (scrubbed if done else unscrubbable).append(done or error)
+            message = "retained artifacts held secrets and were scrubbed: " + ", ".join(scrubbed)
+            if unscrubbable:
+                message += "; could not scrub: " + "; ".join(unscrubbable)
+            self.results.append(
+                CaseResult("REDACTION", self.context.topology, FAIL, message=message)
+            )
+
+        # The second write is what puts the audit itself into the artifact: a green
+        # run then carries the file count it read, so "no offences" can be told
+        # apart from "nothing was audited".
+        data = payload()
+        data["overall"] = overall_status(self.results)
+        write_result(self.context.artifact_dir, data)
+
         hand_back_artifacts(self.context.artifact_dir, self.context.operator)
-        return 0 if overall == PASS else 1
+        return 0 if data["overall"] == PASS else 1
+
+    def _apply_required_groups(self) -> None:
+        """Read the declared groups back and fail the run when one is unmet.
+
+        The audit travels in ``environment.required_groups`` so a green artifact
+        says which case ids the run promised, not only that nothing failed. The
+        failing verdict is a case result like any other, which keeps it visible
+        in JUnit and in the aggregate status instead of only in a log line.
+        """
+        if not self.required_groups or self._groups_applied:
+            return
+        self._groups_applied = True
+        audit: Dict[str, Any] = {}
+        problems: List[str] = []
+        for group in self.required_groups:
+            required = groups.required_ids(group, self.context.topology)
+            unmet = groups.unmet(required, self.results, passing=PASS)
+            audit[group] = {
+                "topology": self.context.topology,
+                "required": list(required),
+                "unmet": unmet,
+            }
+            problems.extend(f"{group}: {problem}" for problem in unmet)
+        self.context.environment["required_groups"] = audit
+        if problems:
+            self.results.append(CaseResult(
+                "REQUIRED-GROUP",
+                self.context.topology,
+                FAIL,
+                message="required cases missing or not passing: " + "; ".join(problems),
+            ))
+
+
+def redaction_audit(artifact_dir: Path) -> Dict[str, Any]:
+    """Read the artifact tree back and find files that are not a fixed point of ``redact``.
+
+    Every writer in the suite passes its text through ``redact()`` before it
+    reaches a retained artifact, and this is what makes that promise checkable
+    instead of assumed: a writer that forgets the filter, or a secret registered
+    after a file was already written, shows up as content that changes when it is
+    redacted. Files that are not UTF-8 text cannot be audited this way and are
+    named rather than silently passed.
+    """
+    offences: List[str] = []
+    skipped: List[str] = []
+    files = 0
+    for path in sorted(artifact_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        files += 1
+        relative = str(path.relative_to(artifact_dir))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            skipped.append(relative)
+            continue
+        if redact(text) != text:
+            offences.append(relative)
+    return {"files": files, "offences": offences, "skipped_non_utf8": skipped}
+
+
+def scrub_artifact(artifact_dir: Path, relative: str) -> tuple[str, str]:
+    """Redact one offending artifact in place, keeping its mode."""
+    path = artifact_dir / relative
+    try:
+        text = path.read_text(encoding="utf-8")
+        path.write_text(redact(text), encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as exc:
+        return "", f"{relative}: {type(exc).__name__}: {exc}"
+    return relative, ""
 
 
 def overall_status(results: Iterable[CaseResult]) -> str:
@@ -391,8 +616,14 @@ def overall_status(results: Iterable[CaseResult]) -> str:
         if any(status == INCOMPLETE for status in statuses):
             return INCOMPLETE
         return BLOCKED
+    # A declared case that did not run is not a green result.
     if any(status == SKIP for status in statuses):
         return FAIL
+    # Reaching here means only PASS and NOT_APPLICABLE remain. A run in which
+    # nothing was applicable demonstrated nothing, and calling that green would
+    # reward an empty suite.
+    if not any(status == PASS for status in statuses):
+        return INCOMPLETE
     return PASS
 
 
@@ -414,7 +645,9 @@ def write_junit(artifact_dir: Path, data: Dict[str, Any]) -> Path:
         "tests": str(len(cases)),
         "failures": str(sum(1 for c in cases if c.get("status") == FAIL)),
         "errors": str(sum(1 for c in cases if c.get("status") in (BLOCKED, INCOMPLETE))),
-        "skipped": str(sum(1 for c in cases if c.get("status") == SKIP)),
+        # JUnit has no "not applicable" concept, so both outcomes that did not
+        # judge the product are counted here and told apart by their message.
+        "skipped": str(sum(1 for c in cases if c.get("status") in (SKIP, NOT_APPLICABLE))),
     })
     for case in cases:
         element = ET.SubElement(root, "testcase", attrib={
@@ -427,8 +660,14 @@ def write_junit(artifact_dir: Path, data: Dict[str, Any]) -> Path:
             ET.SubElement(element, "failure", attrib={"message": case.get("message", "failed")})
         elif status in (BLOCKED, INCOMPLETE):
             ET.SubElement(element, "error", attrib={"message": case.get("message", "incomplete")})
-        elif status == SKIP:
-            ET.SubElement(element, "skipped", attrib={"message": case.get("message", "skipped")})
+        elif status in (SKIP, NOT_APPLICABLE):
+            ET.SubElement(element, "skipped", attrib={
+                "message": f"{status}: {case.get('message', '')}".rstrip(),
+            })
+        evidence_files = case.get("evidence_files") or []
+        if evidence_files:
+            # JUnit has no evidence field, so the references travel in system-out.
+            ET.SubElement(element, "system-out").text = "\n".join(evidence_files)
     path = artifact_dir / "junit.xml"
     path.write_text(redact(ET.tostring(root, encoding="unicode")), encoding="utf-8")
     path.chmod(0o600)

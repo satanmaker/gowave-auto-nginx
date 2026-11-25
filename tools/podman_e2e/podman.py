@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .images import ImageLockError, resolve
-from .runner import RunContext
+from .runner import BudgetExhausted, HarnessLimit, RunContext
 
 
 class PodmanUnavailable(RuntimeError):
@@ -47,6 +47,41 @@ def require_rootful() -> None:
 
 STALE_AFTER_SECONDS = 6 * 3600
 DEFAULT_COMMAND_TIMEOUT = 300
+# Short probes keep the 300-second default, because a wedged probe that is given
+# more time is only a more expensive wedge. The two network-bound image steps do
+# not: on ``podman-acceptance.yml`` run 45161440198 the install died at 311.2 s on
+# ``AIO-INSTALL`` and 306.8 s on ``PO-INSTALL``, and the command a probe-sized
+# ceiling killed was the build, so the install was still working.
+#
+# Measured for tasks 4.1/4.2 on the three-topology run of 2026-11-23, cold on this
+# workstation with the local image store pruned first: the digest-pinned pull took
+# 1 s and the Containerfile build 14 s under ``--no-cache`` with no cache hit. A CI
+# runner is far slower than that -- the same build outlasted 300 s there -- so
+# neither floor is the local cost:
+#   pull 300 s: the slowest observation of it is at most 11.2 s, by subtracting
+#        the 311.2 s case that a 300 s build kill ended. That is 27x, and no higher
+#        than the probe default the pull already had: 600 s was charged for a kill
+#        that belonged to the build.
+#   build 1800 s: 6x the 311.2 s the runner had already spent and was still
+#        climbing at, 128x the measured cost. A build that wedges is stopped by the
+#        run's remaining budget, which caps whichever floor is about to fire, so a
+#        tighter number would only move the false red back onto a slow runner.
+PULL_CEILING_SECONDS = 300
+BUILD_CEILING_SECONDS = 1800
+
+
+def operation_timeout(context: RunContext, ceiling: int, command: str) -> int:
+    """One container command's ceiling, capped by the run's remaining budget.
+
+    A ceiling longer than the budget left would outlive the run and be killed
+    from outside, where nothing can name what happened. Capping it keeps the
+    limit inside the run: the command either finishes or fires as a harness
+    limit that the runner publishes as INCOMPLETE.
+    """
+    remaining = context.remaining()
+    if remaining < 1:
+        raise BudgetExhausted(f"{command} refused: {remaining:.1f}s of the run's budget left")
+    return max(1, min(ceiling, int(remaining)))
 
 
 def wait_until(
@@ -103,9 +138,7 @@ class Podman:
                 capture_output=True, text=True, input=input_text, check=False, timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"podman {' '.join(args)} did not finish within {timeout}s"
-            ) from exc
+            raise HarnessLimit(f"podman {' '.join(args)}", timeout) from exc
         if check and proc.returncode != 0:
             raise RuntimeError(f"podman {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
         return proc
@@ -182,6 +215,47 @@ class Podman:
         self._run(["volume", "create", *self._ownership_labels(), name])
         return name
 
+    def volume_mountpoint(self, name: str) -> Path:
+        """Where the run's own volume lives on the host, so its mode can be fixed."""
+        inspected = self._run(["volume", "inspect", "--format", "{{.Mountpoint}}", name])
+        return Path((inspected.stdout or "").strip())
+
+    def labelled_volumes(self) -> List[str]:
+        """The volumes this run owns; the same label the cleanup removes them by."""
+        label = f"gowave.e2e.run={self.context.run_id}"
+        listed = self._run(["volume", "ls", "-q", "--filter", f"label={label}"], check=False)
+        return [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
+
+    def run_containers(self) -> List[Dict[str, str]]:
+        """Every container this run owns, with the state Podman reports for it.
+
+        Diagnostics address the run's containers by name, and the names come from
+        the run label rather than from the products: a case can fail before the
+        object that would have named its roles exists.
+        """
+        label = f"gowave.e2e.run={self.context.run_id}"
+        listed = self._run(["ps", "-a", "--format", "json", "--filter", f"label={label}"], check=False)
+        if listed.returncode != 0:
+            return []
+        try:
+            items = json.loads(listed.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        containers: List[Dict[str, str]] = []
+        for item in items if isinstance(items, list) else []:
+            name = _get(item, "Names", "Name")
+            if isinstance(name, list):
+                name = name[0] if name else None
+            if not name:
+                continue
+            containers.append({
+                "name": str(name),
+                "state": str(_get(item, "State") or ""),
+                "status": str(_get(item, "Status") or ""),
+            })
+        containers.sort(key=lambda entry: entry["name"])
+        return containers
+
     def ensure_image(self, alias: str) -> str:
         """Pull an alias at its locked digest and return the immutable reference."""
         if alias in self._built_images:
@@ -195,7 +269,10 @@ class Podman:
         except ImageLockError as exc:
             raise UnpinnedImageError(str(exc)) from exc
         repository, digest = pinned.rsplit("@", 1)
-        self._run(["pull", pinned])
+        self._run(
+            ["pull", pinned],
+            timeout=operation_timeout(self.context, PULL_CEILING_SECONDS, f"podman pull {pinned}"),
+        )
         inspected = self._run(["image", "inspect", "--format", "{{json .RepoDigests}}", pinned])
         digests = json.loads(inspected.stdout or "[]")
         if not any(str(entry).endswith(f"@{digest}") for entry in digests):
@@ -218,12 +295,15 @@ class Podman:
         arguments = ["--build-arg", f"BASE_IMAGE={base}"]
         for key, value in (build_args or {}).items():
             arguments += ["--build-arg", f"{key}={value}"]
-        self._run([
-            "build", "-t", tag, "-f", str(containerfile),
-            *self._ownership_labels(),
-            *arguments,
-            str(context_dir),
-        ])
+        self._run(
+            [
+                "build", "-t", tag, "-f", str(containerfile),
+                *self._ownership_labels(),
+                *arguments,
+                str(context_dir),
+            ],
+            timeout=operation_timeout(self.context, BUILD_CEILING_SECONDS, f"podman build {tag}"),
+        )
         self.context.add_cleanup(lambda: self._run(["rmi", "-f", tag], check=False))
         self._built_images.add(tag)
         return tag
@@ -315,6 +395,19 @@ class Podman:
             f"{host}:{port} reachability from {name}",
         ):
             raise RuntimeError(f"{host}:{port} was not reachable from {name} within {timeout_seconds}s")
+
+    def stop(self, name: str, timeout_seconds: int = 30) -> int:
+        """Stop one run container, reporting the exit code instead of raising.
+
+        A container that is already stopped or gone is a stop that succeeded;
+        what the caller has to see is a container that refuses to stop, so the
+        code comes back rather than an exception.
+        """
+        return self._run(["stop", "--time", str(timeout_seconds), name], check=False).returncode
+
+    def remove(self, name: str) -> int:
+        """Remove one container the run created, leaving the rest of the run intact."""
+        return self._run(["rm", "-f", name], check=False).returncode
 
     def address(self, name: str, network: Optional[str] = None) -> str:
         fmt = (

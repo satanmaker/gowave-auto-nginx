@@ -3,6 +3,8 @@
 import base64
 import io
 import json
+import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,7 @@ from tools.podman_e2e import (  # noqa: E402
     aio,
     catalog,
     client_image,
+    matrix,
     panel_surface,
     subscription_probe,
     target_image,
@@ -126,6 +129,17 @@ TROJAN_OUTBOUND = {
 }
 
 
+# What a client sees for the four inbounds below: the Host remark is the proxy
+# name in both representations, and a proxy group repeats it. No country is
+# confirmed in a Podman install, so these are the flagless forms.
+SERVED_LABELS = {
+    "reality": "VLESS · REALITY · Vision — local-node",
+    "xhttp": "VLESS · XHTTP · TLS — local-node",
+    "ws": "VLESS · WebSocket · TLS — local-node",
+    "trojan": "Trojan · gRPC · TLS — local-node",
+}
+
+
 def profile(outbound):
     """One served profile: a complete config with the Panel's own outbound first."""
     return {
@@ -138,7 +152,7 @@ def profile(outbound):
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "block", "protocol": "blackhole"},
         ],
-        "remarks": outbound["tag"],
+        "remarks": SERVED_LABELS[outbound["tag"]],
     }
 
 
@@ -151,7 +165,7 @@ dns:
   nameserver:
     - 1.1.1.1
 proxies:
-  - name: REALITY
+  - name: "VLESS · REALITY · Vision — local-node"
     type: vless
     server: panel.testbed.internal
     network: tcp
@@ -161,7 +175,7 @@ proxies:
       public-key: Cb8_gedNWrtQ3bHsW8WBb1NugpsXIw-Tu-mu_Eyevjg
       short-id: 654854cb2af21ceb
     client-fingerprint: firefox
-  - name: XHTTP
+  - name: "VLESS · XHTTP · TLS — local-node"
     type: vless
     server: panel.testbed.internal
     network: xhttp
@@ -172,7 +186,7 @@ proxies:
     xhttp-opts:
       path: /xhttp-down/
       mode: stream-up
-  - name: WS
+  - name: "VLESS · WebSocket · TLS — local-node"
     type: vless
     server: panel.testbed.internal
     network: ws
@@ -182,7 +196,7 @@ proxies:
     ws-opts:
       path: /ws
       headers: {}
-  - name: TROJAN
+  - name: "Trojan · gRPC · TLS — local-node"
     type: trojan
     server: panel.testbed.internal
     alpn:
@@ -193,10 +207,10 @@ proxy-groups:
   - name: GoWave
     type: select
     proxies:
-      - REALITY
-      - XHTTP
-      - WS
-      - TROJAN
+      - "VLESS · REALITY · Vision — local-node"
+      - "VLESS · XHTTP · TLS — local-node"
+      - "VLESS · WebSocket · TLS — local-node"
+      - "Trojan · gRPC · TLS — local-node"
 rules:
   - MATCH,GoWave
 """
@@ -206,6 +220,10 @@ SINGBOX_BODY = json.dumps({"outbounds": [
     {"type": "trojan", "tag": "trojan"},
     {"type": "direct", "tag": "direct"},
 ]})
+# The value the product's own vhost adds on /api/sub/ (modules/nginx.sh); a
+# subscription a cache may keep would outlive the client it describes.
+NO_STORE = "no-store, no-cache, must-revalidate, max-age=0"
+
 BODIES = {
     "base64": (BASE64_BODY, "text/plain; charset=utf-8"),
     "xray-json": (JSON_BODY, "application/json"),
@@ -226,15 +244,75 @@ def merge(base, overrides=None):
     return data
 
 
+def issue_edge_certificate(directory):
+    """A self-signed certificate for the edge stub that doubles as its trust anchor."""
+    key = Path(directory) / "edge.key"
+    certificate = Path(directory) / "edge.crt"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(certificate), "-days", "1",
+        "-subj", "/CN=panel.testbed.internal",
+        "-addext", "subjectAltName=DNS:panel.testbed.internal,IP:127.0.0.1",
+    ], check=True, stderr=subprocess.DEVNULL)
+    return certificate
+
+
 def served_facts(overrides=None):
+    """Facts shaped like the real two vantages: the Panel process answers no header.
+
+    ``cache_control`` is the loopback answer — the Panel itself — and
+    ``edge_cache_control`` is the public vhost a client talks to. The product's
+    Panel sends none of it and its vhost adds it, so a fixture that put the
+    header on both would let a case pass while reading the wrong side.
+
+    ``hosts`` is `GET /api/hosts` as the probe reduces it, and the four records
+    are the ones the install posts for the four inbounds above — address, SNI and
+    path are literals here so a projection edit turns this fixture red instead of
+    moving with it. ``secret_needles`` is 2 because the probe reads the Panel's
+    signing key and the administrator's password, and every ``secret_hits`` is 0
+    because a served subscription carries neither.
+    """
     return merge({
         "short_uuid_length": len(SHORT_UUID),
+        "secret_needles": 2,
+        "hosts": {
+            "status": 200,
+            "records": [
+                {"remark": "VLESS · REALITY · Vision — local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "reality.testbed.internal", "path": "",
+                 "security_layer": "DEFAULT", "alpn": "h2,http/1.1", "disabled": False},
+                {"remark": "VLESS · XHTTP · TLS — local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "panel.testbed.internal", "path": "/xhttp",
+                 "security_layer": "TLS", "alpn": "h2,http/1.1", "disabled": False},
+                {"remark": "VLESS · WebSocket · TLS — local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "panel.testbed.internal", "path": "/ws",
+                 "security_layer": "TLS", "alpn": "http/1.1", "disabled": False},
+                {"remark": "Trojan · gRPC · TLS — local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "panel.testbed.internal", "path": "grpc",
+                 "security_layer": "TLS", "alpn": "h2", "disabled": False},
+            ],
+        },
         "representations": {
-            "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY)},
-            "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY)},
-            "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML)},
-            "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML)},
-            "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY)},
+            "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY),
+                       "cache_control": "", "secret_hits": 0,
+                       "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
+                       "foreign_status": 200, "foreign_identical": True},
+            "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY),
+                          "cache_control": "", "secret_hits": 0,
+                          "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
+                          "foreign_status": 200, "foreign_identical": True},
+            "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
+                       "cache_control": "", "secret_hits": 0,
+                       "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
+                       "foreign_status": 200, "foreign_identical": True},
+            "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
+                      "cache_control": "", "secret_hits": 0,
+                      "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
+                      "foreign_status": 200, "foreign_identical": True},
+            "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY),
+                        "cache_control": "", "secret_hits": 0,
+                        "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
+                        "foreign_status": 200, "foreign_identical": True},
         },
     }, overrides)
 
@@ -242,24 +320,56 @@ def served_facts(overrides=None):
 def engine_representations(overrides=None):
     engine = {
         "base64": {"decoded": True, "decoded_bytes": 812, "link_count": 4,
-                   "schemes": ["trojan", "vless"]},
-        "xray_json": {"shape": "list", "entries": 4, "wrapped": 0, "protocols": ["trojan", "vless"]},
+                   "schemes": ["trojan", "vless"], "private_keys": 0},
+        # The tuples and the fingerprint are what the probe reads back out of the
+        # four served outbounds above, and what the matrix issues each inbound
+        # for; they are literals here so a matrix edit turns this fixture red
+        # instead of moving with it. ``dials`` is the same read with the fields a
+        # Host record states kept, and every document carries no private key.
+        "xray_json": {"shape": "list", "entries": 4, "wrapped": 0, "protocols": ["trojan", "vless"],
+                      "transports": ["trojan/grpc/tls", "vless/tcp/reality",
+                                     "vless/ws/tls", "vless/xhttp/tls"],
+                      "fingerprints": ["firefox"], "sni_missing": 0,
+                      "dials": [
+                          {"tag": "reality", "protocol": "vless",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "reality.testbed.internal", "path": "", "service_name": "",
+                           "network": "tcp"},
+                          {"tag": "xhttp", "protocol": "vless",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "panel.testbed.internal", "path": "/xhttp", "service_name": "",
+                           "network": "xhttp"},
+                          {"tag": "ws", "protocol": "vless",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "panel.testbed.internal", "path": "/ws", "service_name": "",
+                           "network": "ws"},
+                          {"tag": "trojan", "protocol": "trojan",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "panel.testbed.internal", "path": "", "service_name": "grpc",
+                           "network": "grpc"},
+                      ],
+                      "private_keys": 0},
         "mihomo": {"proxies": 4, "proxy_types": ["trojan", "vless"], "groups": 1, "rules": 1,
                    "match_rule": True, "exit": 0,
+                   "rule_names": ["MATCH"], "duplicate_names": 0,
+                   "group_members": 4, "missing_group_references": [],
+                   "client_fingerprints": ["firefox"], "private_keys": 0,
                    "proxy_details": [
-                       {"name": "REALITY", "type": "vless", "server": "panel.testbed.internal",
-                        "network": "tcp", "tls": "true",
+                       {"name": "VLESS · REALITY · Vision — local-node", "type": "vless",
+                        "server": "panel.testbed.internal", "network": "tcp", "tls": "true",
                         "servername": "reality.testbed.internal"},
-                       {"name": "XHTTP", "type": "vless", "server": "panel.testbed.internal",
-                        "network": "xhttp", "tls": "true"},
-                       {"name": "WS", "type": "vless", "server": "panel.testbed.internal",
-                        "network": "ws", "tls": "true"},
-                       {"name": "TROJAN", "type": "trojan", "server": "panel.testbed.internal",
-                        "network": "tcp", "tls": "true"},
+                       {"name": "VLESS · XHTTP · TLS — local-node", "type": "vless",
+                        "server": "panel.testbed.internal", "network": "xhttp", "tls": "true"},
+                       {"name": "VLESS · WebSocket · TLS — local-node", "type": "vless",
+                        "server": "panel.testbed.internal", "network": "ws", "tls": "true"},
+                       {"name": "Trojan · gRPC · TLS — local-node", "type": "trojan",
+                        "server": "panel.testbed.internal", "network": "tcp", "tls": "true"},
                    ]},
         "clash": {"proxies": 1, "proxy_types": ["trojan"], "groups": 1, "rules": 1,
-                  "match_rule": True, "exit": 0},
-        "singbox": {"parsed": True, "outbounds": 4},
+                  "match_rule": True, "exit": 0,
+                  "rule_names": ["MATCH"], "duplicate_names": 0,
+                  "client_fingerprints": ["firefox"], "private_keys": 0},
+        "singbox": {"parsed": True, "outbounds": 4, "private_keys": 0},
     }
     return merge(engine, overrides)
 
@@ -298,25 +408,122 @@ def policy_facts(policy, status=403):
     return {"policy": policy, "representations": {name: status for name in aio.REPRESENTATIONS}}
 
 
-class StubPanel:
-    """A Panel that answers the default-client lookup and every representation."""
+ROBOTS_TAG = "noindex, nofollow, noarchive, nosnippet"
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-    def __init__(self):
+
+def edge_answer(status=200, size=4096, cache_control=NO_STORE, x_robots_tag=ROBOTS_TAG,
+                content_type="text/plain; charset=utf-8"):
+    """One edge answer as `_answer()` reduces it: headers, length, digest."""
+    return {
+        "status": status,
+        "content_type": content_type,
+        "cache_control": cache_control,
+        "x_robots_tag": x_robots_tag,
+        "bytes": size,
+        "sha256": EMPTY_SHA256 if size == 0 else "a" * 64,
+    }
+
+
+def edge_counters(before=7, after=None, control=None):
+    """The Panel's two subscription counters around the crawler sweep.
+
+    ``control`` is the loopback fetch that has to move them; ``after`` defaults
+    to ``before`` because a sweep the edge answered itself moves nothing.
+    """
+    patterns = panel_surface.SUBSCRIPTION_ROUTE_PATTERNS
+    after = before if after is None else after
+    control = after + 1 if control is None else control
+    return {
+        "before": {"status": 200, "counts": {pattern: before for pattern in patterns}},
+        "after": {"status": 200, "counts": {pattern: after for pattern in patterns}},
+        "control": {"status": 200,
+                    "counts": {patterns[0]: control, patterns[1]: after}},
+        "control_status": 200,
+    }
+
+
+def edge_facts(overrides=None):
+    """The edge-contract probe's block, with every family answering as shipped."""
+    facts = {
+        "short_uuid_length": len(SHORT_UUID),
+        "loopback": edge_answer(),
+        "served": edge_answer(),
+        "served_identical_to_loopback": True,
+        "foreign": edge_answer(),
+        "foreign_identical": True,
+        "absent": edge_answer(status=403, size=0, content_type="text/plain"),
+        "previews": {
+            agent: edge_answer(status=204, size=0)
+            for agent in panel_surface.PREVIEW_USER_AGENTS
+        },
+        "refused": {
+            "dot_segment": {"status": 0, "closed": True, "bytes": 0},
+            "encoded_separator": {"status": 0, "closed": True, "bytes": 0},
+        },
+        "counters": edge_counters(),
+    }
+    return merge(facts, overrides)
+
+
+def access_log_facts(overrides=None):
+    """The access-log probe's answer: served lines none, refused lines recorded."""
+    facts = {"present": True, "lines": 41, "served": 0,
+             "refused_dot_segment": 1, "refused_encoded_separator": 1}
+    facts.update(overrides or {})
+    return facts
+
+
+class StubPanel:
+    """A Panel that answers the default-client lookup and every representation.
+
+    ``secure`` makes it answer over HTTPS with a certificate that doubles as its
+    own trust anchor, which is what lets a test read the same paths through a
+    second, TLS-terminating vantage the way the public vhost is read.
+    """
+
+    def __init__(self, secure=False):
         self.password = "pw-do-not-print"
         self.token = "token-do-not-print"
-        self.user = {"username": "default-user", "shortUuid": SHORT_UUID}
+        self.user = {"id": CLIENT_UUID, "username": "default-user", "shortUuid": SHORT_UUID}
+        self.users = [{"id": CLIENT_UUID, "username": "default-user", "shortUuid": SHORT_UUID}]
+        self.bodies = dict(BODIES)
         self.statuses = {}
         self.requests = []
+        # `GET /api/hosts` as the Panel answers it: the document a client's config
+        # is derived from, and the one the subscription has to agree with. The
+        # four records are the install's own projection for the four inbounds.
+        self.hosts = [
+            {"remark": "VLESS · REALITY · Vision — local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "reality.testbed.internal", "path": None,
+             "securityLayer": "DEFAULT", "alpn": "h2,http/1.1", "isDisabled": False},
+            {"remark": "VLESS · XHTTP · TLS — local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "panel.testbed.internal", "path": "/xhttp",
+             "securityLayer": "TLS", "alpn": "h2,http/1.1", "isDisabled": False},
+            {"remark": "VLESS · WebSocket · TLS — local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "panel.testbed.internal", "path": "/ws",
+             "securityLayer": "TLS", "alpn": "http/1.1", "isDisabled": False},
+            {"remark": "Trojan · gRPC · TLS — local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "panel.testbed.internal", "path": "grpc",
+             "securityLayer": "TLS", "alpn": "h2", "isDisabled": False},
+        ]
         self.enforce_user_agent = False
+        self.refuse_foreign_user_agent = False
+        self.no_cache_control = False
+        # `GET /api/system/stats/http` as the router answers it: a payload the
+        # case reads beside the sweep, so a fake that never moved it cannot be
+        # mistaken for a listener that never forwarded anything.
+        self.route_counts = {"response": {"routes": [], "total": 0}}
+        self.certificate = None
         directory = Path(tempfile.mkdtemp(prefix="gowave-subscription-panel-"))
         self.credentials = directory / "credentials"
         self.credentials.write_text(
             f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.password}\n", encoding="utf-8"
         )
         self.credentials.chmod(0o600)
-        self.server = self._start()
+        self.server = self._start(secure, directory)
 
-    def _start(self):
+    def _start(self, secure=False, directory=None):
         panel = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -327,6 +534,9 @@ class StubPanel:
                 raw = body.encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
+                if not panel.no_cache_control:
+                    self.send_header("Cache-Control", NO_STORE)
+                self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -334,18 +544,40 @@ class StubPanel:
             def do_GET(self):
                 agent = self.headers.get("User-Agent")
                 panel.requests.append((self.path, agent))
+                if "/../" in self.path or "%2F" in self.path or "%2f" in self.path:
+                    # What the shipped vhost does to a raw target it refuses: the
+                    # connection closes with no status, which is the answer the
+                    # forgery case has to see.
+                    self.close_connection = True
+                    return
                 if self.path == "/api/users/by-username/default-user":
                     return self._send(200, json.dumps({"response": panel.user}))
+                if self.path == "/api/system/stats/http":
+                    return self._send(200, json.dumps(panel.route_counts))
+                if self.path == "/api/users":
+                    return self._send(200, json.dumps({"response": {"users": panel.users}}))
+                if self.path == "/api/hosts":
+                    return self._send(200, json.dumps({"response": {"hosts": panel.hosts}}))
                 name = panel.representation(self.path)
                 if name is None:
                     return self._send(404, json.dumps({"message": "not found"}))
                 if panel.enforce_user_agent and (agent is None or not agent.strip()):
                     return self._send(403, "forbidden", "text/plain")
+                if panel.refuse_foreign_user_agent and agent == panel_surface.FOREIGN_USER_AGENT:
+                    return self._send(403, "forbidden", "text/plain")
                 status = panel.statuses.get(name, 200)
-                body, content_type = BODIES[name]
+                body, content_type = panel.bodies[name]
                 return self._send(status, body if status == 200 else "", content_type)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if secure:
+            certificate = issue_edge_certificate(directory)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(
+                certfile=str(certificate), keyfile=str(certificate.with_suffix(".key")),
+            )
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            self.certificate = certificate
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server
@@ -368,8 +600,13 @@ class StubPanel:
     def url(self):
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
+    @property
+    def edge_url(self):
+        scheme = "https" if self.certificate else "http"
+        return f"{scheme}://127.0.0.1:{self.server.server_address[1]}"
 
-def probe_output(panel, scope, payload_dir=""):
+
+def probe_output(panel, scope, payload_dir="", step="", edge_base="", ca=""):
     stdout = io.StringIO()
     argv = [
         "--scope", scope,
@@ -378,6 +615,12 @@ def probe_output(panel, scope, payload_dir=""):
     ]
     if payload_dir:
         argv.extend(["--payload-dir", payload_dir])
+    if step:
+        argv.extend(["--step", step])
+    if edge_base:
+        argv.extend(["--edge-base", edge_base])
+    if ca:
+        argv.extend(["--ca", str(ca)])
     with redirect_stdout(stdout):
         code = panel_surface.main(argv)
     if code != 0:
@@ -417,12 +660,134 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
 
     def test_each_representation_is_fetched_with_its_client_user_agent(self):
         probe_output(self.panel, "subscriptions", str(self.payload_dir))
-        agents = {path: agent for path, agent in self.panel.requests if "/api/sub/" in path}
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}"], panel_surface.MOBILE_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/v2ray-json"], panel_surface.XRAY_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/mihomo"], panel_surface.MIHOMO_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/clash"], panel_surface.CLASH_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/singbox"], panel_surface.SINGBOX_USER_AGENT)
+        agents = {}
+        for path, agent in self.panel.requests:
+            if "/api/sub/" in path:
+                agents.setdefault(path, []).append(agent)
+        self.assertIn(panel_surface.MOBILE_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}"])
+        self.assertIn(panel_surface.XRAY_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/v2ray-json"])
+        self.assertIn(panel_surface.MIHOMO_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/mihomo"])
+        self.assertIn(panel_surface.CLASH_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/clash"])
+        self.assertIn(panel_surface.SINGBOX_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/singbox"])
+
+    def test_the_probe_records_the_cache_control_header_it_received(self):
+        facts, _ = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        facts = facts["subscriptions"]
+        for name in ("base64", "xray-json", "mihomo", "clash", "singbox"):
+            with self.subTest(representation=name):
+                self.assertIn("no-store", facts["representations"][name]["cache_control"])
+
+    def test_a_panel_that_lets_the_subscription_be_cached_is_visible_to_the_probe(self):
+        self.panel.no_cache_control = True
+        facts, _ = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        facts = facts["subscriptions"]
+        for name in ("base64", "xray-json", "mihomo", "clash", "singbox"):
+            with self.subTest(representation=name):
+                self.assertEqual(facts["representations"][name]["cache_control"], "")
+
+    def edge_panel(self):
+        edge = StubPanel(secure=True)
+        self.addCleanup(edge.server.shutdown)
+        self.addCleanup(edge.server.server_close)
+        return edge
+
+    def test_the_probe_reads_the_public_edge_beside_the_panel_process(self):
+        """Two vantages, two answers: the Panel sends no header, the edge sends it."""
+        self.panel.no_cache_control = True
+        edge = self.edge_panel()
+        facts, output = probe_output(
+            self.panel, "subscriptions", str(self.payload_dir),
+            edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        served = facts["subscriptions"]["representations"]
+        for name, record in served.items():
+            with self.subTest(representation=name):
+                self.assertEqual(record["cache_control"], "",
+                                 "the Panel process reported a header it does not send")
+                self.assertEqual(record["edge_status"], 200)
+                self.assertIn("no-store", record["edge_cache_control"])
+                self.assertIs(record["edge_identical"], True)
+        self.assertNotIn(SHORT_UUID, output)
+        self.assertNotIn(TROJAN_PASSWORD, output)
+
+    def test_an_edge_that_lets_the_subscription_be_cached_is_visible(self):
+        self.panel.no_cache_control = True
+        edge = self.edge_panel()
+        edge.no_cache_control = True
+        facts, _ = probe_output(
+            self.panel, "subscriptions", str(self.payload_dir),
+            edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        for name, record in facts["subscriptions"]["representations"].items():
+            with self.subTest(representation=name):
+                self.assertEqual(record["edge_cache_control"], "")
+
+    def test_an_edge_that_serves_other_bytes_is_reported_against_the_panel(self):
+        self.panel.no_cache_control = True
+        edge = self.edge_panel()
+        edge.bodies["clash"] = (MIHOMO_YAML + "\n# another body\n", "text/yaml")
+        facts, _ = probe_output(
+            self.panel, "subscriptions", str(self.payload_dir),
+            edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        served = facts["subscriptions"]["representations"]
+        self.assertIs(served["clash"]["edge_identical"], False)
+        self.assertIs(served["mihomo"]["edge_identical"], True)
+
+    def test_the_edge_fetch_trusts_only_the_ca_it_is_given(self):
+        edge = self.edge_panel()
+        path = f"/api/sub/{SHORT_UUID}"
+        with self.assertRaises(ssl.SSLError):
+            panel_surface.fetch(edge.edge_url, path, panel_surface.MOBILE_USER_AGENT)
+        response = panel_surface.fetch(
+            edge.edge_url, path, panel_surface.MOBILE_USER_AGENT, ca_file=str(edge.certificate),
+        )
+        self.assertEqual(response["status"], 200)
+        self.assertIn("no-store", response["cache_control"])
+
+    def test_the_edge_contract_scope_asks_the_edge_for_every_published_family(self):
+        edge = self.edge_panel()
+        facts, output = probe_output(
+            self.panel, "edge-contract", edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        block = facts["edge"]
+        self.assertEqual(block["short_uuid_length"], len(SHORT_UUID))
+        self.assertIs(block["served_identical_to_loopback"], True)
+        self.assertEqual(set(block["previews"]), set(panel_surface.PREVIEW_USER_AGENTS))
+        for agent, answer in block["previews"].items():
+            with self.subTest(agent=agent):
+                self.assertEqual(answer["status"], 200,
+                                 "the stub serves every header; the probe must report what it saw")
+                self.assertIn("no-store", answer["cache_control"])
+                self.assertEqual(answer["x_robots_tag"], ROBOTS_TAG)
+        self.assertNotIn(SHORT_UUID, output)
+        self.assertNotIn(self.panel.password, output)
+        self.assertNotIn(self.panel.token, output)
+
+    def test_a_raw_target_that_closes_is_an_answer_with_no_status(self):
+        edge = self.edge_panel()
+        block = panel_surface.subscription_edge_contract(
+            panel_surface.Panel(self.panel.url), edge.edge_url,
+            ca_file=str(edge.certificate),
+        )
+        for label in ("dot_segment", "encoded_separator"):
+            with self.subTest(target=label):
+                self.assertIs(block["refused"][label]["closed"], True)
+                self.assertEqual(block["refused"][label]["status"], 0)
+                self.assertEqual(block["refused"][label]["bytes"], 0)
+
+    def test_the_route_counter_reads_the_routers_own_route_names(self):
+        self.panel.route_counts = {"response": {"total": 9, "routes": [
+            {"method": "GET", "route": "/api/sub/{shortUuid}", "count": 3},
+            {"method": "GET", "route": "/api/sub/{shortUuid}/{clientType}", "count": 1},
+            {"method": "GET", "route": "/api/users", "count": 5},
+        ]}}
+        facts = panel_surface.http_route_counts(panel_surface.Panel(self.panel.url))
+        self.assertEqual(facts["status"], 200)
+        self.assertEqual(facts["counts"], {
+            "GET /api/sub/{shortUuid}": 3,
+            "GET /api/sub/{shortUuid}/{clientType}": 1,
+        })
 
     def test_an_absent_user_agent_is_a_request_without_the_header(self):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", None)
@@ -433,6 +798,29 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", "")
         self.assertEqual(response["status"], 200)
         self.assertEqual(self.panel.requests[-1][1], "")
+
+    def test_the_accepted_header_names_no_client_family(self):
+        families = {agent for _name, _template, agent in panel_surface.REPRESENTATIONS}
+        self.assertNotIn(panel_surface.FOREIGN_USER_AGENT, families)
+        for agent in families:
+            with self.subTest(agent=agent):
+                self.assertNotIn(agent.split("/")[0].lower(), panel_surface.FOREIGN_USER_AGENT.lower())
+
+    def test_a_foreign_user_agent_is_served_the_same_bytes(self):
+        self.panel.enforce_user_agent = True
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        served = facts["subscriptions"]["representations"]
+        self.assertEqual(sorted(served), sorted(aio.REPRESENTATIONS))
+        for name, record in served.items():
+            with self.subTest(representation=name):
+                self.assertEqual(record["status"], 200)
+                self.assertEqual(record["foreign_status"], 200)
+                self.assertIs(record["foreign_identical"], True)
+        asked = {path: agent for path, agent in self.panel.requests
+                 if "/api/sub/" in path and agent == panel_surface.FOREIGN_USER_AGENT}
+        self.assertEqual(len(asked), len(aio.REPRESENTATIONS),
+                         "the probe did not ask every representation with the foreign header")
+        self.assertNotIn(self.panel.password, output)
 
     def test_the_pinned_policy_refuses_both_kinds_of_missing_header(self):
         self.panel.enforce_user_agent = True
@@ -472,6 +860,156 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         self.assertEqual(panel_surface.media_type("Application/JSON; charset=utf-8"), "application/json")
         self.assertEqual(panel_surface.media_type(""), "")
 
+    def test_the_probe_reports_the_host_records_the_subscription_must_agree_with(self):
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        hosts = facts["subscriptions"]["hosts"]
+        self.assertEqual(hosts["status"], 200)
+        self.assertEqual([record["remark"] for record in hosts["records"]],
+                         ["VLESS · REALITY · Vision — local-node", "VLESS · XHTTP · TLS — local-node",
+                          "VLESS · WebSocket · TLS — local-node", "Trojan · gRPC · TLS — local-node"])
+        self.assertEqual(hosts["records"][0]["sni"], "reality.testbed.internal")
+        self.assertEqual(hosts["records"][0]["path"], "")
+        self.assertEqual(hosts["records"][1]["path"], "/xhttp")
+        self.assertEqual(hosts["records"][3]["path"], "grpc")
+        self.assertEqual(hosts["records"][1]["security_layer"], "TLS")
+        self.assertIs(hosts["records"][1]["disabled"], False)
+        self.assertEqual(hosts["records"][1]["port"], "443")
+
+    def test_the_host_fixture_is_the_projection_the_install_posts(self):
+        """The four literals above are the client's own Host records, not a guess."""
+        from modules.api_client import host_projection
+
+        posted = host_projection("panel.testbed.internal", "reality.testbed.internal", "local-node")
+        keys = ["vless-reality", "vless-xhttp", "vless-ws", "trojan-grpc"]
+        labels = [posted[key]["remark"] for key in keys]
+        self.assertEqual([record["remark"] for record in served_facts()["hosts"]["records"]], labels)
+        self.assertEqual([record["remark"] for record in self.panel.hosts], labels)
+        self.assertEqual([record["address"] for record in self.panel.hosts],
+                         [posted[key]["address"] for key in keys])
+        self.assertEqual([record["port"] for record in self.panel.hosts],
+                         [posted[key]["port"] for key in keys])
+        self.assertEqual([record["sni"] for record in self.panel.hosts],
+                         [posted[key]["sni"] for key in keys])
+        self.assertEqual([record["securityLayer"] for record in self.panel.hosts],
+                         [posted[key]["securityLayer"] for key in keys])
+
+    def test_the_served_bodies_carry_the_same_names_the_hosts_do(self):
+        """A client resolves a group by name, so both representations agree."""
+        facts = subscription_probe.scan_mihomo(MIHOMO_YAML)
+        self.assertEqual(facts["duplicate_names"], 0)
+        self.assertEqual(facts["group_members"], 4)
+        self.assertEqual(facts["missing_group_references"], [])
+        self.assertEqual([entry["name"] for entry in facts["proxy_details"]],
+                         list(SERVED_LABELS.values()))
+        self.assertEqual([entry["remarks"] for entry in json.loads(JSON_BODY)],
+                         list(SERVED_LABELS.values()))
+
+    def test_a_host_record_count_is_reported_and_no_value_is(self):
+        """The hosts read is a fact, and the token that read it stays out of the output."""
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        self.assertEqual(len(facts["subscriptions"]["hosts"]["records"]), 4)
+        self.assertNotIn(self.panel.token, output)
+
+    def test_server_secret_values_reads_both_product_keys_and_drops_short_values(self):
+        """The Panel writes APP_SECRET, the Node SECRET_KEY; both are scanned."""
+        panel_env = Path(self.tmp.name) / "gowave.env"
+        panel_env.write_text(
+            "APP_SECRET=an-example-signing-key-that-is-long\n"
+            "GOWAVE_PROXY=external\n",
+            encoding="utf-8",
+        )
+        node_env = Path(self.tmp.name) / "gowave-node.env"
+        node_env.write_text(
+            "SECRET_KEY=an-example-node-key-that-is-long\n",
+            encoding="utf-8",
+        )
+        short_env = Path(self.tmp.name) / "short.env"
+        short_env.write_text("SECRET_KEY=abc\n", encoding="utf-8")
+        values = panel_surface.server_secret_values(
+            "the-administrator-password",
+            env_files=[str(panel_env), str(node_env), str(short_env)],
+        )
+        self.assertEqual(values, [
+            "the-administrator-password",
+            "an-example-signing-key-that-is-long",
+            "an-example-node-key-that-is-long",
+        ])
+
+    def test_server_secret_values_tolerates_a_missing_environment_file(self):
+        values = panel_surface.server_secret_values(
+            "the-administrator-password",
+            env_files=[str(Path(self.tmp.name) / "absent.env")],
+        )
+        self.assertEqual(values, ["the-administrator-password"])
+
+    def test_the_scan_reads_the_files_and_keys_the_product_itself_writes(self):
+        """A scan of the wrong file, or of a key the product no longer sets, proves nothing.
+
+        The product writes its own environment files: the Panel's module into
+        `/opt/gowave/.env` and the Node's into `/opt/gowave-node/.env`. This reads
+        the two heredocs rather than trusting the probe's constants, so renaming a
+        key in the product — or moving an install directory — fails here instead of
+        silently making the secret scan look for a value that is nowhere on the host.
+        """
+        heredoc = re.compile(r'cat > "\$env_file" <<EOF\n(.*?)\nEOF', re.S)
+        writers = {
+            "modules/panel.sh": "GOWAVE_INSTALL_DIR",
+            "modules/node.sh": "GOWAVE_NODE_INSTALL_DIR",
+        }
+        written_keys = set()
+        for script, directory_variable in writers.items():
+            source = (REPO_ROOT / script).read_text(encoding="utf-8")
+            blocks = heredoc.findall(source)
+            self.assertTrue(blocks, f"{script} no longer writes an environment file this reads")
+            for block in blocks:
+                for line in block.splitlines():
+                    name, separator, _ = line.partition("=")
+                    if separator and re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+                        written_keys.add(name)
+            default = re.search(rf'^{directory_variable}="([^"]+)"', source, re.M)
+            self.assertIsNotNone(
+                default, f"{script} no longer declares {directory_variable}, so the scanned path is unproven",
+            )
+            self.assertIn(
+                f"{default.group(1)}/.env", panel_surface.PRODUCT_ENV_FILES,
+                f"the secret scan does not read {default.group(1)}/.env, which {script} writes",
+            )
+        secret_keys = {name for name in written_keys if "SECRET" in name or "KEY" in name}
+        self.assertTrue(secret_keys, "neither module writes a key this scan is supposed to look for")
+        self.assertEqual(
+            sorted(secret_keys), sorted(panel_surface.SERVER_SECRET_KEYS),
+            "the scanned key names are not the ones the product writes into its environment files",
+        )
+
+    def test_secret_forms_covers_every_encoding_a_leak_could_wear(self):
+        value = "s3cr3t value/with+peculiar"
+        forms = panel_surface.secret_forms(value)
+        self.assertIn(value.encode("utf-8"), forms)
+        self.assertIn(base64.b64encode(value.encode("utf-8")), forms)
+        self.assertIn(base64.urlsafe_b64encode(value.encode("utf-8")).rstrip(b"="), forms)
+        self.assertIn(b"s3cr3t%20value%2Fwith%2Bpeculiar", forms)
+
+    def test_the_probe_scans_a_payload_for_the_administrators_password(self):
+        self.panel.bodies["mihomo"] = (
+            MIHOMO_YAML + f"\n# secret={self.panel.password}\n", "text/yaml",
+        )
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        served = facts["subscriptions"]["representations"]
+        self.assertEqual(facts["subscriptions"]["secret_needles"], 1)
+        self.assertEqual(served["mihomo"]["secret_hits"], 1)
+        self.assertEqual(served["clash"]["secret_hits"], 0)
+        self.assertNotIn(self.panel.password, output)
+
+    def test_the_probe_scans_the_link_list_the_base64_body_stands_for(self):
+        """A secret inside a link is base64 twice, so the body alone would hide it."""
+        link = f"vless://{CLIENT_UUID}@panel.testbed.internal:443?remark={self.panel.password}#leak"
+        body = base64.b64encode(link.encode("utf-8")).decode("ascii")
+        self.assertNotIn(self.panel.password.encode("utf-8"), body.encode("ascii"))
+        self.panel.bodies["base64"] = (body, "text/plain")
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        self.assertEqual(facts["subscriptions"]["representations"]["base64"]["secret_hits"], 1)
+        self.assertNotIn(self.panel.password, output)
+
     def test_the_representation_inventory_matches_the_pinned_matrix(self):
         matrix = yaml.safe_load(
             (REPO_ROOT / "tests" / "cases" / "matrix.yaml").read_text(encoding="utf-8")
@@ -481,6 +1019,84 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
             self.assertEqual(
                 matrix["representations"][name].replace("{shortUuid}", "{short_uuid}"), template
             )
+
+
+class TestChannelClientSurface(unittest.TestCase):
+    """The channel scope states what a switch or a rollback left the client with.
+
+    A channel switch restarts the Panel and a rollback restores its database, and
+    the Panel writes to SQLite while it runs. The scope therefore compares the
+    client list and the bytes each representation serves, and it keeps the
+    captured payload digests in a 0600 state file rather than printing them.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.payload_dir = Path(self.tmp.name) / "payloads"
+        self.payload_dir.mkdir(mode=0o700)
+        self.panel = StubPanel()
+        self.addCleanup(self.panel.server.shutdown)
+        self.addCleanup(self.panel.server.server_close)
+
+    def capture(self):
+        facts, _output = probe_output(
+            self.panel, "channel", str(self.payload_dir), step="capture",
+        )
+        return facts["channel"]
+
+    def verify(self):
+        facts, output = probe_output(
+            self.panel, "channel", str(self.payload_dir), step="verify",
+        )
+        return facts["channel"], output
+
+    def test_an_unchanged_panel_verifies_as_identical(self):
+        captured = self.capture()
+        self.assertEqual(captured["readback_status"], 200)
+        self.assertEqual(captured["short_uuid_length"], len(SHORT_UUID))
+        self.assertEqual(captured["users"], len(self.panel.users))
+
+        state = self.payload_dir / "channel" / "state.json"
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+        verified, output = self.verify()
+        self.assertTrue(verified["inventory_identical"])
+        self.assertTrue(verified["user_present"])
+        self.assertTrue(all(verified["representations_identical"].values()))
+        self.assertEqual(
+            sorted(verified["representations_identical"]),
+            sorted(name for name, _template, _agent in panel_surface.REPRESENTATIONS),
+        )
+        for secret in (SHORT_UUID, CLIENT_UUID, TROJAN_PASSWORD, REALITY_PUBLIC_KEY):
+            self.assertNotIn(secret, output)
+
+    def test_a_client_the_switch_lost_is_not_an_identical_inventory(self):
+        self.capture()
+        self.panel.users = []
+        verified, _output = self.verify()
+        self.assertFalse(verified["inventory_identical"])
+        self.assertFalse(verified["user_present"])
+        self.assertEqual(verified["users"], 0)
+        self.assertEqual(verified["users_captured"], 1)
+
+    def test_a_representation_that_serves_different_bytes_is_reported(self):
+        self.capture()
+        self.panel.bodies["mihomo"] = ("changed: {}\n", "text/yaml")
+        verified, _output = self.verify()
+        self.assertFalse(verified["representations_identical"]["mihomo"])
+        self.assertTrue(verified["representations_identical"]["base64"])
+        self.assertEqual(verified["representations"]["mihomo"]["status"], 200)
+
+    def test_a_scope_call_without_a_capture_asks_for_one(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.verify()
+        self.assertIn("run --step capture first", str(caught.exception))
+
+    def test_the_scope_refuses_to_run_without_a_payload_directory(self):
+        with self.assertRaises(SystemExit) as caught:
+            probe_output(self.panel, "channel", step="capture")
+        self.assertIn("--payload-dir", str(caught.exception))
 
 
 class RecordingEngines:
@@ -690,6 +1306,17 @@ class TestSubscriptionClientProbe(unittest.TestCase):
         self.assertEqual(facts["groups"], 1)
         self.assertEqual(facts["rules"], 1)
 
+    def test_scan_mihomo_reports_a_group_member_no_proxy_defines(self):
+        text = MIHOMO_YAML.replace(
+            '      - "Trojan · gRPC · TLS — local-node"',
+            '      - "Trojan · gRPC · TLS — ams-99"',
+        )
+        facts = subscription_probe.scan_mihomo(text)
+        self.assertEqual(facts["proxies"], 4)
+        self.assertEqual(facts["group_members"], 4)
+        self.assertEqual(facts["missing_group_references"], ["Trojan · gRPC · TLS — ams-99"])
+        self.assertEqual(subscription_probe.scan_mihomo(MIHOMO_YAML)["missing_group_references"], [])
+
     def test_scan_mihomo_does_not_invent_a_match_rule(self):
         text = MIHOMO_YAML.replace("- MATCH,GoWave", "- DOMAIN-SUFFIX,testbed.internal,GoWave")
         facts = subscription_probe.scan_mihomo(text)
@@ -728,16 +1355,60 @@ class TestSubscriptionClientProbe(unittest.TestCase):
         self.assertEqual(facts["base64"]["schemes"], ["trojan", "vless"])
         self.assertEqual(facts["xray_json"],
                          {"shape": "list", "entries": 4, "wrapped": 0,
-                          "protocols": ["trojan", "vless"]})
+                          "protocols": ["trojan", "vless"],
+                          "transports": ["trojan/grpc/tls", "vless/tcp/reality",
+                                         "vless/ws/tls", "vless/xhttp/tls"],
+                          "fingerprints": ["firefox"], "sni_missing": 0,
+                          "dials": [
+                              {"tag": "reality", "protocol": "vless",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "reality.testbed.internal", "path": "",
+                               "service_name": "", "network": "tcp"},
+                              {"tag": "xhttp", "protocol": "vless",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "panel.testbed.internal", "path": "/xhttp",
+                               "service_name": "", "network": "xhttp"},
+                              {"tag": "ws", "protocol": "vless",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "panel.testbed.internal", "path": "/ws",
+                               "service_name": "", "network": "ws"},
+                              {"tag": "trojan", "protocol": "trojan",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "panel.testbed.internal", "path": "",
+                               "service_name": "grpc", "network": "grpc"},
+                          ],
+                          "private_keys": 0})
         for name in ("mihomo", "clash"):
             self.assertEqual(facts[name]["exit"], 0)
             self.assertEqual(facts[name]["proxies"], 4)
             self.assertTrue(facts[name]["match_rule"])
-        self.assertEqual(facts["singbox"], {"parsed": True, "outbounds": 4})
+            self.assertEqual(facts[name]["rule_names"], ["MATCH"])
+            self.assertEqual(facts[name]["duplicate_names"], 0)
+            self.assertEqual(facts[name]["client_fingerprints"], ["firefox"])
+            self.assertEqual(facts[name]["private_keys"], 0)
+        self.assertEqual(facts["singbox"], {"parsed": True, "outbounds": 4, "private_keys": 0})
+        self.assertEqual(facts["base64"]["private_keys"], 0)
         self.assertEqual([path.name for path in self.workdir.iterdir()
                           if path.suffix in (".json", ".yaml")], [])
         self.assertEqual(set(self.engines.modes), {0o600})
         self.assertEqual(len(self.engines.configs), 4)
+
+    def test_the_probe_counts_a_server_side_private_key(self):
+        """A counter that always reported zero would pass a document leaking a key."""
+        leaked = json.loads(JSON_BODY)
+        leaked[0]["outbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "leak"
+        self.write_payloads(xray_json=json.dumps(leaked))
+        facts = subscription_probe.representations(str(self.payloads), str(self.ca), self.workdir)
+        self.assertEqual(facts["xray_json"]["private_keys"], 1)
+
+    def test_the_probe_counts_a_private_key_in_a_yaml_representation(self):
+        self.write_payloads()
+        (self.payloads / "mihomo.payload").write_text(
+            MIHOMO_YAML + "  private-key: leak\n", encoding="utf-8",
+        )
+        facts = subscription_probe.representations(str(self.payloads), str(self.ca), self.workdir)
+        self.assertEqual(facts["mihomo"]["private_keys"], 1)
+        self.assertEqual(facts["clash"]["private_keys"], 0)
 
     def test_json_shapes_accepts_the_served_list_and_the_bare_object(self):
         facts = subscription_probe.json_shapes(str(self.payloads), str(self.ca), self.workdir)
@@ -837,12 +1508,29 @@ class ScriptedPodman:
     def __init__(self, context, scripts):
         self.context = context
         self.scripts = []
+        self.execs = []
         self.results = list(scripts)
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        """The engine container printing the version the matrix pinned for it.
+
+        A data-plane case reads the version of the core that carried the payload,
+        so the stub answers that read from the manifest: a moved client pin would
+        otherwise leave a literal here naming a build the case no longer expects.
+        """
+        self.execs.append((name, list(argv)))
+        binary = list(argv)[0]
+        pinned = next(
+            (item["contains"] for item in client_image.engine_list(matrix.load())
+             if item["binary"] == binary),
+            "",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, f"{binary} {pinned} (fixture)\n", "")
 
 
 class StubEngineHost:
@@ -862,6 +1550,9 @@ class StubEngineHost:
         self.timeouts.append(timeout)
         return self.results.pop(0)
 
+    def install_environment(self):
+        return {"GOWAVE_ACME_TEST_CA_FILE": f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"}
+
     def engine_hosts(self):
         domains = [self.panel_domain, self.reality_domain]
         if self.vision_domain:
@@ -879,6 +1570,10 @@ class StubEngineHost:
             "required_hosts": required_hosts,
             "required_snis": required_snis,
         }
+
+    def engine_client(self):
+        """The engine role's container, which a data-plane case reads a version from."""
+        return "engine-client"
 
 
 def panel_result(payload, returncode=0):
@@ -899,6 +1594,9 @@ def installed_product(context, host_scripts=(), engine_results=()):
     product = aio.AioProduct(podman)
     product.host = StubEngineHost(engine_results)
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+    # What the install read out of `rw-core version`: a data-plane tuple compares
+    # the client core with the core its node deployed, so the fake names that core.
+    product.server_core_version = matrix.product(matrix.load()).get("xray_version", "")
     return product, podman
 
 
@@ -944,7 +1642,9 @@ class TestSubscriptionCases(unittest.TestCase):
         self.assertEqual(evidence["singbox_outbounds"], 4)
         self.assertEqual(podman.scripts[0],
                          f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope subscriptions "
-                         f"--payload-dir {topology.PAYLOAD_MOUNT}")
+                         f"--payload-dir {topology.PAYLOAD_MOUNT} "
+                         f"--edge-base https://{aio.PANEL_DOMAIN} "
+                         f"--ca {topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}")
         self.assertEqual(product.host.scopes, ["representations"])
         for value in evidence.values():
             self.assertIsInstance(
@@ -955,12 +1655,158 @@ class TestSubscriptionCases(unittest.TestCase):
     def test_subscriptions_case_rejects_a_representation_that_is_not_served(self):
         self.reject("instead of 200", served=served_facts({"representations.clash.status": 500}))
 
+    def test_subscriptions_case_rejects_a_cachable_representation(self):
+        self.reject("lets a cache serve a subscription",
+                    served=served_facts(
+                        {"representations.mihomo.edge_cache_control": "public, max-age=600"}))
+
+    def test_subscriptions_case_rejects_a_representation_with_no_cache_control(self):
+        self.reject("lets a cache serve a subscription",
+                    served=served_facts({"representations.base64.edge_cache_control": ""}))
+
+    def test_subscriptions_case_does_not_read_the_header_from_the_panel_process(self):
+        """The loopback answer is never the one the case trusts.
+
+        The Panel sends no Cache-Control; the vhost does. A case that asserted
+        the loopback value would have failed against the real product while the
+        header a client receives was present, which is what the first version of
+        this case did.
+        """
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["base64_backend_cache_control"], "")
+        self.assertEqual(evidence["base64_cache_control"], NO_STORE)
+
+    def test_subscriptions_case_rejects_an_edge_response_from_another_body(self):
+        self.reject("describes a body no engine consumed",
+                    served=served_facts({"representations.clash.edge_identical": False}))
+
+    def test_subscriptions_case_rejects_an_edge_that_refused_the_request(self):
+        self.reject("the public edge answered",
+                    served=served_facts({"representations.singbox.edge_status": 404}))
+
+    def test_subscriptions_case_names_the_cache_control_it_received(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        for name in aio.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(evidence[f"{name}_cache_control"], NO_STORE)
+
     def test_subscriptions_case_rejects_an_empty_representation(self):
         self.reject("is empty", served=served_facts({"representations.singbox.bytes": 0}))
 
     def test_subscriptions_case_rejects_a_missing_media_type(self):
-        self.reject("without a media type",
+        self.reject("as media type '' instead of 'text/yaml'",
                     served=served_facts({"representations.mihomo.content_type": ""}))
+
+    def test_subscriptions_case_rejects_a_wrong_media_type(self):
+        # A media type is a claim about which importer the bytes belong to, so a
+        # well-formed but wrong one is the failure this require exists for.
+        self.reject("as media type 'text/plain' instead of 'application/json'",
+                    served=served_facts({"representations.xray-json.content_type": "text/plain"}))
+
+    def test_subscriptions_case_names_the_media_type_each_representation_is_served_with(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        for name in aio.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(evidence[f"{name}_content_type"],
+                                 aio.REPRESENTATION_MEDIA_TYPES[name])
+
+    def test_subscriptions_case_rejects_a_secret_scan_with_nothing_to_scan(self):
+        self.reject("not evidence", served=served_facts({"secret_needles": 1}))
+
+    def test_subscriptions_case_rejects_a_representation_carrying_a_server_secret(self):
+        self.reject("server-side secret",
+                    served=served_facts({"representations.mihomo.secret_hits": 1}))
+
+    def test_subscriptions_case_rejects_a_host_list_it_could_not_read(self):
+        self.reject("GET /api/hosts answered 500", served=served_facts({"hosts.status": 500}))
+
+    def test_subscriptions_case_rejects_a_subscription_that_agrees_with_no_host(self):
+        self.reject("returned no Host record", served=served_facts({"hosts.records": []}))
+
+    def test_subscriptions_case_rejects_a_dial_address_no_host_record_names(self):
+        # The REALITY record is the one whose address and SNI pair no other record
+        # shares, so moving it leaves the dial with nothing to correspond to.
+        records = [dict(record) for record in served_facts()["hosts"]["records"]]
+        records[0]["address"] = "elsewhere.testbed.internal"
+        self.reject("which no Host record names",
+                    served=served_facts({"hosts.records": records}))
+
+    def test_subscriptions_case_rejects_a_dial_path_no_host_record_names(self):
+        # Three inbounds share ``panel.testbed.internal`` as both address and SNI,
+        # so the path is the only field that tells them apart; a record naming a
+        # different path is a different inbound.
+        records = [dict(record) for record in served_facts()["hosts"]["records"]]
+        records[1]["path"] = "/other"
+        self.reject("which no Host record on that address and SNI names",
+                    served=served_facts({"hosts.records": records}))
+
+    def test_subscriptions_case_rejects_a_dial_set_that_is_not_one_per_inbound(self):
+        dials = engine_representations()["xray_json"]["dials"][:3]
+        self.reject("carry a dial tuple",
+                    engine=engine_representations({"xray_json.dials": dials}))
+
+    def test_subscriptions_case_rejects_a_private_key_in_a_representation(self):
+        for name in ("base64", "xray_json", "mihomo", "clash", "singbox"):
+            with self.subTest(representation=name):
+                self.reject("server-side private key field",
+                            engine=engine_representations({f"{name}.private_keys": 1}))
+
+    def test_subscriptions_case_accepts_a_host_record_the_subscription_does_not_dial(self):
+        """The require is "every dial is recorded", not "the two sets are equal".
+
+        The Panel keeps records no client dials; an equality check would have
+        called such a record a defect and pointed at the wrong document.
+        """
+        records = list(served_facts()["hosts"]["records"]) + [{
+            "remark": "Panel@local-node", "address": "panel.testbed.internal", "port": "443",
+            "sni": "panel.testbed.internal", "path": "/api", "security_layer": "TLS",
+            "alpn": "http/1.1", "disabled": False,
+        }]
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts({"hosts.records": records})})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["host_records"], 5)
+        self.assertEqual(evidence["host_record_mismatches"], 0)
+        self.assertEqual(evidence["xray_json_dials"], 4)
+
+    def test_subscriptions_case_rejects_a_panel_that_refuses_a_foreign_header(self):
+        self.reject("names no client family",
+                    served=served_facts({"representations.mihomo.foreign_status": 403}))
+
+    def test_subscriptions_case_rejects_a_representation_selected_by_the_header(self):
+        self.reject("selecting the representation",
+                    served=served_facts({"representations.base64.foreign_identical": False}))
+
+    def test_subscriptions_case_names_the_header_it_sent(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["ua_foreign"], panel_surface.FOREIGN_USER_AGENT)
+        for name in aio.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(evidence[f"{name}_foreign_status"], 200)
+                self.assertIs(evidence[f"{name}_foreign_identical"], True)
 
     def test_subscriptions_case_rejects_a_default_client_without_a_short_uuid(self):
         self.reject("no shortUuid", served=served_facts({"short_uuid_length": 0}))
@@ -1002,7 +1848,59 @@ class TestSubscriptionCases(unittest.TestCase):
         self.reject("proxy types", engine=engine_representations({"mihomo.proxy_types": ["vless"]}))
 
     def test_subscriptions_case_rejects_a_yaml_without_a_match_rule(self):
-        self.reject("no MATCH rule", engine=engine_representations({"clash.match_rule": False}))
+        self.reject("no MATCH and no GEOIP rule", engine=engine_representations({
+            "clash.match_rule": False, "clash.rule_names": []}))
+
+    def test_subscriptions_case_accepts_a_geoip_rule_family_without_match(self):
+        """The pinned Panel routes by ``GEOIP,LAN,DIRECT`` and the live contract
+        by ``GEOIP,private,DIRECT,no-resolve``; neither family ends in MATCH, so
+        a rule that names GEOIP is enough to prove the client routes at all."""
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations({
+                "mihomo.match_rule": False, "mihomo.rule_names": ["GEOIP"]}))],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["mihomo_rule_names"], "GEOIP")
+
+    def test_subscriptions_case_rejects_a_profile_dialling_a_foreign_transport(self):
+        self.reject("transport", engine=engine_representations({
+            "xray_json.transports": ["trojan/grpc/tls", "vless/tcp/tls",
+                                     "vless/ws/tls", "vless/xhttp/tls"]}))
+
+    def test_subscriptions_case_rejects_a_profile_with_the_wrong_fingerprint(self):
+        self.reject("fingerprints", engine=engine_representations({
+            "xray_json.fingerprints": ["chrome"]}))
+
+    def test_subscriptions_case_rejects_a_profile_without_an_sni(self):
+        self.reject("carry no SNI", engine=engine_representations({
+            "xray_json.sni_missing": 1}))
+
+    def test_subscriptions_case_rejects_a_yaml_with_duplicate_proxy_names(self):
+        self.reject("duplicate proxy name", engine=engine_representations({
+            "mihomo.duplicate_names": 1}))
+
+    def test_subscriptions_case_rejects_a_mihomo_yaml_with_the_wrong_client_fingerprint(self):
+        self.reject("client-fingerprint", engine=engine_representations({
+            "mihomo.client_fingerprints": ["chrome"]}))
+
+    def test_subscriptions_case_names_the_tuple_and_fingerprint_it_read(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["xray_json_transports"],
+                         "trojan/grpc/tls,vless/tcp/reality,vless/ws/tls,vless/xhttp/tls")
+        self.assertEqual(evidence["xray_json_expected_transports"],
+                         "trojan/grpc/tls,vless/tcp/reality,vless/ws/tls,vless/xhttp/tls")
+        self.assertEqual(evidence["xray_json_fingerprints"], "firefox")
+        self.assertEqual(evidence["xray_json_sni_missing"], 0)
+        self.assertEqual(evidence["mihomo_rule_names"], "MATCH")
+        self.assertEqual(evidence["mihomo_duplicate_names"], 0)
+        self.assertEqual(evidence["mihomo_client_fingerprints"], "firefox")
 
     def test_subscriptions_case_rejects_a_singbox_body_without_outbounds(self):
         self.reject("carries no outbounds", engine=engine_representations({"singbox.outbounds": 0}))
@@ -1221,6 +2119,194 @@ class TestSubscriptionCases(unittest.TestCase):
         self.reject_shapes({"alternate_wrapped": 0}, "expected 1")
 
 
+class TestSubscriptionEdgeCases(unittest.TestCase):
+    """SUB-EDGE / SUB-EDGE-BAD: what a pasted link answers through the edge.
+
+    The two cases read one probe block and split the subject: the edge's answers
+    to a client and to a link-preview crawler, and the refusal of a raw target a
+    normalising client would never send. A fake that answered the probe but left
+    either side out is what these tests exist to name.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.context = RunContext(
+            topology="aio",
+            artifact_root=Path(self.tmp.name),
+            budget_seconds=600,
+            run_id="podman-subscription-edge-0000",
+        )
+        self.addCleanup(self.context.run_cleanup)
+
+    def edge_product(self, edge=None):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"edge": edge_facts() if edge is None else edge})],
+        )
+        return product
+
+    def reject_edge(self, expected, overrides=None, edge=None):
+        product = self.edge_product(edge_facts(overrides) if edge is None else edge)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_subscription_edge(product)
+        self.assertIn(expected, str(caught.exception))
+
+    def forgery_product(self, edge=None, log=None):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[
+                panel_result({"edge": edge_facts() if edge is None else edge}),
+                panel_result(access_log_facts(log)),
+            ],
+        )
+        return product
+
+    def reject_forgery(self, expected, edge=None, log=None):
+        product = self.forgery_product(edge, log)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_subscription_edge_forgery(product)
+        self.assertIn(expected, str(caught.exception))
+
+    @staticmethod
+    def mutate_preview(edge, agent, **answer):
+        """One crawler's answer, changed after the fact.
+
+        The preview keys are User-Agent strings and hold dots, so they cannot be
+        addressed through the dotted merge the other fixtures use.
+        """
+        edge["previews"][agent] = {**edge["previews"][agent], **answer}
+        return edge
+
+    # ------------------------------------------------------------ SUB-EDGE
+    def test_edge_case_names_what_the_client_and_the_crawlers_received(self):
+        product, podman = installed_product(
+            self.context, host_scripts=[panel_result({"edge": edge_facts()})]
+        )
+        evidence = aio.case_subscription_edge(product)
+        self.assertEqual(evidence["served_status"], 200)
+        self.assertIn("no-store", evidence["served_cache_control"])
+        self.assertEqual(evidence["served_x_robots_tag"], ROBOTS_TAG)
+        self.assertEqual(evidence["served_bytes"], 4096)
+        self.assertEqual(evidence["foreign_status"], 200)
+        self.assertEqual(evidence["absent_status"], 403)
+        self.assertEqual(evidence["preview_count"], len(panel_surface.PREVIEW_USER_AGENTS))
+        self.assertEqual(evidence["preview_statuses"], "204")
+        self.assertEqual(evidence["preview_bytes"], 0)
+        self.assertEqual(evidence["panel_requests_added_by_previews"], 0)
+        self.assertEqual(evidence["panel_requests_added_by_control"], 1)
+        self.assertEqual(
+            podman.scripts[0],
+            f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope edge-contract "
+            f"--edge-base https://{aio.PANEL_DOMAIN} "
+            f"--ca {topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}",
+        )
+        for value in evidence.values():
+            self.assertIsInstance(
+                value, (str, int, float, bool, type(None)),
+                "evidence is flattened to strings by the runner, so it must hold primitives",
+            )
+        self.assertNotIn(SHORT_UUID, json.dumps(evidence))
+
+    def test_edge_case_rejects_a_cachable_subscription(self):
+        self.reject_edge("would let a pasted link be cached",
+                         {"served.cache_control": "public, max-age=600"})
+
+    def test_edge_case_rejects_a_missing_robots_tag(self):
+        self.reject_edge("instead of 'noindex, nofollow, noarchive, nosnippet'",
+                         {"served.x_robots_tag": ""})
+
+    def test_edge_case_rejects_bytes_the_panel_did_not_issue(self):
+        self.reject_edge("did not hand the client the bytes",
+                         {"served_identical_to_loopback": False})
+
+    def test_edge_case_rejects_a_header_that_selects_a_representation(self):
+        self.reject_edge("selecting a representation from the header",
+                         {"foreign.status": 403})
+
+    def test_edge_case_rejects_a_panel_refusal_that_lost_the_headers(self):
+        self.reject_edge("lost the transport headers", {"absent.cache_control": ""})
+
+    def test_edge_case_rejects_an_absent_header_that_was_served(self):
+        self.reject_edge("instead of the Panel's own 403", {"absent.status": 200})
+
+    def test_edge_case_rejects_a_crawler_that_was_served_the_payload(self):
+        agent = panel_surface.PREVIEW_USER_AGENTS[0]
+        self.reject_edge("instead of 204",
+                         edge=self.mutate_preview(edge_facts(), agent, status=200))
+
+    def test_edge_case_rejects_an_empty_answer_that_carried_a_body(self):
+        agent = panel_surface.PREVIEW_USER_AGENTS[1]
+        self.reject_edge("carried a body",
+                         edge=self.mutate_preview(edge_facts(), agent, bytes=64))
+
+    def test_edge_case_rejects_an_empty_answer_that_lost_the_robots_tag(self):
+        agent = panel_surface.PREVIEW_USER_AGENTS[2]
+        self.reject_edge("lost the transport headers",
+                         edge=self.mutate_preview(edge_facts(), agent, x_robots_tag=""))
+
+    def test_edge_case_rejects_a_sweep_that_reached_the_panel(self):
+        self.reject_edge("the preview sweep reached the Panel", {
+            "counters.after.counts.GET /api/sub/{shortUuid}": 8,
+        })
+
+    def test_edge_case_rejects_a_control_that_did_not_move_the_counter(self):
+        self.reject_edge("moved the Panel's counter by 0", {
+            "counters.control.counts.GET /api/sub/{shortUuid}": 7,
+        })
+
+    def test_edge_case_rejects_a_counter_read_that_was_refused(self):
+        self.reject_edge("route counters answered 500", {"counters.before.status": 500})
+
+    def test_edge_case_rejects_a_panel_without_a_default_client(self):
+        self.reject_edge("served no default client", {"short_uuid_length": 0})
+
+    # -------------------------------------------------------- SUB-EDGE-BAD
+    def test_forgery_case_names_both_refusals_and_the_access_log(self):
+        product, podman = installed_product(
+            self.context,
+            host_scripts=[panel_result({"edge": edge_facts()}),
+                          panel_result(access_log_facts())],
+        )
+        evidence = aio.case_subscription_edge_forgery(product)
+        self.assertEqual(evidence["refused_dot_segment"], "closed")
+        self.assertEqual(evidence["refused_encoded_separator"], "closed")
+        self.assertEqual(evidence["access_log_lines"], 41)
+        self.assertEqual(evidence["access_log_served_lines"], 0)
+        self.assertEqual(evidence["access_log_refused_lines"], 2)
+        self.assertIn("--scope edge-contract", podman.scripts[0])
+        self.assertIn("/var/log/nginx/access.log", podman.scripts[1])
+        for value in evidence.values():
+            self.assertIsInstance(
+                value, (str, int, float, bool, type(None)),
+                "evidence is flattened to strings by the runner, so it must hold primitives",
+            )
+        self.assertNotIn(SHORT_UUID, json.dumps(evidence))
+
+    def test_forgery_case_rejects_a_target_the_listener_answered(self):
+        edge = edge_facts()
+        edge["refused"]["dot_segment"] = {"status": 444, "closed": False, "bytes": 0}
+        self.reject_forgery("instead of a closed connection", edge=edge)
+
+    def test_forgery_case_rejects_a_target_answered_with_bytes(self):
+        edge = edge_facts()
+        edge["refused"]["encoded_separator"] = {"status": 0, "closed": True, "bytes": 12}
+        self.reject_forgery("instead of a closed connection", edge=edge)
+
+    def test_forgery_case_rejects_an_absent_access_log(self):
+        self.reject_forgery("absent or empty", log={"present": False})
+
+    def test_forgery_case_rejects_an_empty_access_log(self):
+        self.reject_forgery("absent or empty", log={"lines": 0})
+
+    def test_forgery_case_rejects_a_log_that_recorded_a_served_line(self):
+        self.reject_forgery("must leave none", log={"served": 1})
+
+    def test_forgery_case_rejects_a_log_that_recorded_no_refusal(self):
+        self.reject_forgery("did not record both refused targets",
+                            log={"refused_encoded_separator": 0})
+
+
 class RecordingPodman:
     """Podman stub for the topology wiring: no container is really created."""
 
@@ -1229,6 +2315,7 @@ class RecordingPodman:
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
         self.connects = []
+        self.volumes = []
         self.runs = []
         self.builds = []
         self.execs = []
@@ -1244,6 +2331,15 @@ class RecordingPodman:
     def network_connect(self, name, network, ip=None):
         self.connects.append((name, network, ip))
         return name
+
+    def volume_create(self, name):
+        self.volumes.append(name)
+        return name
+
+    def volume_mountpoint(self, name):
+        mountpoint = self.context.secret_dir / "volumes" / name
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        return mountpoint
 
     def run(self, **kwargs):
         self.runs.append(kwargs)
@@ -1362,9 +2458,10 @@ class TestSubscriptionWiring(unittest.TestCase):
         )
         self.addCleanup(self.context.run_cleanup)
 
-    def test_suite_declares_the_five_subscription_cases(self):
+    def test_suite_declares_the_subscription_cases(self):
         suite = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
-        expected = {"SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64", "SUB-JSON-SHAPES"}
+        expected = {"SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64", "SUB-JSON-SHAPES",
+                    "SUB-EDGE", "SUB-EDGE-BAD"}
         self.assertTrue(expected.issubset(suite))
         for case_id in expected:
             with self.subTest(case=case_id):
@@ -1375,7 +2472,8 @@ class TestSubscriptionWiring(unittest.TestCase):
 
     def test_every_subscription_case_is_in_the_shared_catalog(self):
         by_id = {case["id"]: case for case in catalog.load_catalog()["cases"]}
-        for case_id in ("SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64", "SUB-JSON-SHAPES"):
+        for case_id in ("SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64",
+                        "SUB-JSON-SHAPES", "SUB-EDGE", "SUB-EDGE-BAD"):
             with self.subTest(case=case_id):
                 case = by_id[case_id]
                 self.assertEqual(case["runs_in"], ["podman"])
