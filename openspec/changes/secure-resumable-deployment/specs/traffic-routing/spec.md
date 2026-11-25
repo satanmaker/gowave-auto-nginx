@@ -57,6 +57,39 @@ The routing subsystem SHALL serve the generated static cover on loopback 9443 fo
 - **WHEN** unknown or absent SNI, mismatched HTTP Host or malformed ClientHello is probed on public 443
 - **THEN** no unintended Panel/API/subscription content is returned; unsupported malformed handshakes may close without an HTTP response and public access to internal fallback listeners remains denied.
 
+### Requirement: 3-Stage Dual-Lineage Let's Encrypt TLS Bootstrap Sequence
+The installer SHALL bootstrap TLS by issuing certificates for the host's primary and REALITY names and optional Vision name via temporary HTTP-01 webroot, activating production Stream/HTTPS, then verifying renewal by dry-run. The REALITY lineage SHALL include cover apex and optional www only when explicitly selected and owned by that Master. Without explicit cover, no apex SHALL be inferred or added. Worker certificates SHALL NOT claim Master cover names.
+
+#### Scenario: Bootstrap certificates on fresh host
+- **GIVEN** a clean host without pre-existing Let's Encrypt certificates
+- **WHEN** the installer initiates TLS provisioning
+- **THEN** it deploys temporary port 80 webroot `/var/www/gowave-acme`, binds IPv6 only when host IPv6 is active, starts NGINX, issues primary and REALITY certificates and optional Vision certificate via `certbot certonly --webroot`, adds only explicitly selected and validated Master cover names to the REALITY lineage, deploys production Stream and HTTPS using the selected live paths, verifies `certbot renew --dry-run` with NGINX online and refuses unmanaged host traffic.
+
+#### Scenario: Port 80 serves ACME for every managed name
+- **GIVEN** an active production port 80 vhost
+- **WHEN** a plain HTTP request arrives for the host's primary, REALITY, enabled Vision or explicitly selected owned cover name
+- **THEN** `/.well-known/acme-challenge/` is served from `/var/www/gowave-acme` without redirection, other paths return `301 https://$host$request_uri`, and unmanaged hosts terminate with `444`.
+
+#### Scenario: Prohibition of self-signed fallback certificates and fail-fast validation
+- **GIVEN** an installer or domain-change process issuing certificates via Certbot ACME
+- **WHEN** certificate issuance fails or produces an error
+- **THEN** the affected provisioning operation halts with nonzero status without activating incomplete virtual hosts, no self-signed production fallback is generated, and certificate existence, validity exceeding 24 hours and private-public key consistency must be verified before production activation.
+
+#### Scenario: Automated Certbot renewal deploy hook
+- **GIVEN** an active installation with deployed Let's Encrypt certificates
+- **WHEN** background ACME renewal succeeds via `certbot.timer`
+- **THEN** `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` executes `nginx -t -q` and reloads NGINX with `nginx -s reload` only after successful validation, without manual intervention.
+
+#### Scenario: Positional installation without explicit cover
+- **GIVEN** a complete positional install invocation with no explicit cover configuration
+- **WHEN** TLS bootstrap runs without interactive prompts
+- **THEN** only the selected primary, REALITY and optional Vision identities receive certificates and routes; no apex/www is inferred, requested as a SAN or activated as a cover alias, and REALITY fallback still serves cover under its configured identity.
+
+#### Scenario: Worker shares the Master's DNS zone
+- **GIVEN** Master owns `example.com` and optional `www.example.com`, and Worker on another IP uses `node-1.example.com`, `reality-node-1.example.com` and optional `xtls-node-1.example.com`
+- **WHEN** Worker bootstrap or renewal runs
+- **THEN** only the Worker identities are issued or renewed, Master apex/www are absent from Worker SANs and ACME routes, and Master DNS, certificates and routes remain unchanged.
+
 ## ADDED Requirements
 
 ### Requirement: Explicit certificate identity and lineage ownership

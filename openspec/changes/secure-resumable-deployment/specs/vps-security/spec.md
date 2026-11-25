@@ -35,7 +35,7 @@ The security subsystem SHALL apply a role-specific deny-by-default inbound polic
 #### Scenario: Atomic UFW activation
 - **GIVEN** a host with SSH access
 - **WHEN** firewall policy is applied
-- **THEN** a restorable baseline is captured before mutation, all discovered SSH ports are preserved before activation, public TCP 80/443 are allowed, effective incoming default is deny and outgoing default is allow, and external access to internal ports 3000, 3001, 7443, 8443, 8444, 9443, 9444 and 10001-10003 is denied for existing listeners.
+- **THEN** a restorable baseline is captured before mutation, all discovered SSH ports are preserved before activation, public TCP 80/443 are allowed, effective incoming default is deny and outgoing default is allow, and external access to internal ports 3000, 3001, 7443, 8443, 8444, 9443, 9444 and 10001-10003 is denied for existing listeners. The configured Node API port (default 3002, including a non-default value) is explicitly denied externally on All-in-One, allowed only from configured Master sources on Worker, and has no listener or managed allow exception on Panel-only; these role-specific rules apply across enabled IPv4 and IPv6 families.
 
 #### Scenario: Node control port whitelisting
 - **GIVEN** a Worker with defined Master IPv4 and optional IPv6 control addresses
