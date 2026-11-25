@@ -3,10 +3,12 @@ Project-owned drop-ins only, transactional file/service rollback.
 """
 import json
 import hashlib
+import ipaddress
 import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -58,6 +60,235 @@ def ssh_ports(effective, socket_listen=''):
     if not ports or any(not 1 <= port <= 65535 for port in ports):
         raise ValueError('Cannot determine effective SSH ports')
     return sorted(ports)
+
+
+def firewall_policy(role, ports, node_port=3002, master_sources=(), ipv6=False):
+    if role not in {'panel-only', 'aio', 'worker'} or type(ipv6) is not bool:
+        raise ValueError('Invalid firewall role or family')
+    if not isinstance(ports, (list, tuple)) or not ports:
+        raise ValueError('Discovered SSH ports are required')
+    if any(type(port) is not int or not 1 <= port <= 65535 for port in ports):
+        raise ValueError('Invalid SSH port')
+    if type(node_port) is not int or not 1 <= node_port <= 65535:
+        raise ValueError('Invalid Node API port')
+    protected = [3000, 3001, 7443, 8443, 8444, 9443, 9444, 10001, 10002, 10003]
+    if set(ports) & set(protected) or (role != 'panel-only' and node_port in set(ports) | {80, 443} | set(protected)):
+        raise ValueError('SSH or Node API port conflicts with managed listeners')
+    sources = []
+    for source in master_sources:
+        address = ipaddress.ip_address(source)
+        if address.is_unspecified or address.is_multicast or address.is_loopback:
+            raise ValueError('Invalid Master source address')
+        if address.version == 6 and not ipv6:
+            raise ValueError('IPv6 Master source requires enabled IPv6')
+        sources.append(str(address))
+    if role == 'worker' and not sources:
+        raise ValueError('Worker requires explicit Master sources')
+    if role != 'worker' and sources:
+        raise ValueError('Master source exceptions are Worker-only')
+    commands = [['default', 'deny', 'incoming'], ['default', 'allow', 'outgoing']]
+    commands.extend(['allow', f'{port}/tcp'] for port in sorted(set(ports) | {80, 443}))
+    commands.extend(['deny', f'{port}/tcp'] for port in protected)
+    if role == 'worker':
+        commands.extend(['allow', 'proto', 'tcp', 'from', source, 'to', 'any', 'port', str(node_port)]
+                        for source in sorted(set(sources)))
+    if role != 'panel-only':
+        commands.append(['deny', f'{node_port}/tcp'])
+    return {'role': role, 'ipv6': ipv6, 'ssh_ports': sorted(set(ports)),
+            'node_port': None if role == 'panel-only' else node_port,
+            'master_sources': sorted(set(sources)), 'internal_ports': protected,
+            'commands': commands}
+
+
+def _input_rules(content, family):
+    """Every rule of the `ufw-user-input` chain in one ruleset dump.
+
+    Preflight, post-apply verification and conflict classification read rules
+    through this parser, so a rule one of them understands cannot be invisible
+    to another. `supported` says whether the rule stayed inside the constructs
+    this module models; an unsupported allow is refused rather than guessed at.
+    """
+    entries = []
+    for number, line in enumerate(content.splitlines(), 1):
+        if not line.startswith('-A ufw-user-input '):
+            continue
+        tokens = shlex.split(line)
+        if '-j' not in tokens:
+            raise ValueError('Unrecognized UFW input rule')
+        target = tokens[tokens.index('-j') + 1]
+        if target not in {'ACCEPT', 'DROP', 'REJECT', 'LOG', 'RETURN'}:
+            raise ValueError('Unsupported UFW input jump')
+        for option in ('-s', '-d', '-p', '-j', '--dport', '--dports', '-i', '--comment'):
+            if option in tokens and tokens.index(option) + 1 >= len(tokens):
+                raise ValueError('Incomplete UFW input rule')
+        # ``comment`` is a construct this module writes itself, so a rule that
+        # carries one is still a rule it understands: refusing them would make
+        # the second run of this installer reject its own firewall.
+        supported_tokens = {'-A', 'ufw-user-input', '-p', 'tcp', 'all', '6', '-m', 'multiport',
+                            'comment', '-s', '-d', '-j', 'ACCEPT', 'DROP', 'REJECT', 'LOG', 'RETURN',
+                            '--dport', '--dports', '-i', '--syn', '--comment'}
+        value_options = {'-s', '-d', '--dport', '--dports', '-i', '--comment'}
+        values = {tokens[index + 1] for index, token in enumerate(tokens[:-1]) if token in value_options}
+        entry = {'family': family, 'line': number, 'target': target, 'protocol': 'tcp',
+                 'ports': None, 'source': None, 'interface': None,
+                 'supported': all(token in supported_tokens | values for token in tokens)}
+        protocol = tokens[tokens.index('-p') + 1] if '-p' in tokens else 'all'
+        if protocol not in {'tcp', 'all', '6'}:
+            entry['protocol'] = protocol
+            entries.append(entry)
+            continue
+        if '-i' in tokens:
+            entry['interface'] = tokens[tokens.index('-i') + 1]
+        option = '--dports' if '--dports' in tokens else '--dport'
+        if option in tokens:
+            ports = set()
+            for item in tokens[tokens.index(option) + 1].split(','):
+                bounds = item.split(':')
+                if len(bounds) not in {1, 2} or any(not value.isdigit() for value in bounds):
+                    raise ValueError('Unsupported UFW destination port expression')
+                low, high = int(bounds[0]), int(bounds[-1])
+                if not 1 <= low <= high <= 65535:
+                    raise ValueError('Invalid UFW destination port range')
+                ports.update(range(low, high + 1))
+            entry['ports'] = ports
+        if '-s' in tokens:
+            network = ipaddress.ip_network(tokens[tokens.index('-s') + 1], strict=False)
+            if network.version != family:
+                raise ValueError('UFW source family mismatch')
+            entry['source'] = network
+        entries.append(entry)
+    return entries
+
+
+def _public_allow(entry):
+    """An allow that reaches every host, not one whitelisted source."""
+    source = entry['source']
+    return (entry['target'] == 'ACCEPT' and entry['protocol'] == 'tcp'
+            and entry['interface'] != 'lo'
+            and (source is None or source.prefixlen < source.max_prefixlen))
+
+
+def firewall_conflicts(policy, rules, active_managers=()):
+    """Classify persisted ufw-user-input ACCEPT rules before mutating UFW."""
+    if active_managers:
+        raise ValueError('Competing firewall manager is active')
+    conflicts, exceptions = [], []
+    protected = set(policy['internal_ports'])
+    if policy['node_port'] is not None:
+        protected.add(policy['node_port'])
+    for family, content in rules.items():
+        if family not in {4, 6}:
+            raise ValueError('Invalid firewall rule family')
+        for entry in _input_rules(content, family):
+            if entry['target'] != 'ACCEPT':
+                continue
+            located = {'family': entry['family'], 'line': entry['line']}
+            if entry['protocol'] != 'tcp':
+                exceptions.append(located)
+                continue
+            if not entry['supported']:
+                raise ValueError('Unsupported UFW allow rule; manual inspection required')
+            if entry['interface'] == 'lo':
+                continue
+            selected = protected if entry['ports'] is None else protected & entry['ports']
+            if not selected:
+                # The rules this policy writes are not somebody else's grant: a
+                # rerun that reported its own SSH and web allows as preserved
+                # exceptions would tell the operator about rules it just wrote.
+                public = set(policy['ssh_ports']) | {80, 443}
+                if entry['ports'] is not None and entry['ports'] <= public:
+                    continue
+                exceptions.append(located)
+                continue
+            source = entry['source']
+            allowed_master = (
+                policy['role'] == 'worker' and selected == {policy['node_port']}
+                and source is not None and source.num_addresses == 1
+                and str(source.network_address) in policy['master_sources']
+            )
+            if not allowed_master:
+                conflicts.append({**located, 'ports': sorted(selected)})
+    return {'conflicts': conflicts, 'preserved_exceptions': exceptions}
+
+
+def inspect_firewall_conflicts(policy, root=Path('/')):
+    managers = [name for name in ('firewalld.service', 'nftables.service')
+                if command('systemctl', 'is-active', name, check=False) == 'active']
+    rules = {}
+    for family, filename in ((4, 'user.rules'), (6, 'user6.rules')):
+        path = root / 'etc' / 'ufw' / filename
+        if path.is_symlink():
+            raise ValueError('Unsafe UFW rules file')
+        if path.exists():
+            rules[family] = path.read_text()
+        elif family == 4 or policy['ipv6']:
+            raise ValueError('Cannot inspect persisted UFW rules')
+    result = firewall_conflicts(policy, rules, managers)
+    if result['conflicts']:
+        raise ValueError('Existing UFW allow conflicts with managed listener isolation: ' + json.dumps(result['conflicts']))
+    return result
+
+
+def firewall_effective(policy, dumps, status_verbose='', declaration=''):
+    """Read the live firewall back against the policy that was applied.
+
+    A successful `ufw allow` says UFW accepted the command; it does not say the
+    kernel filters that port. This compares the ruleset the host is running,
+    including the second family on a dual-stack host, with the policy the
+    preflight approved.
+    """
+    if status_verbose.splitlines()[:1] != ['Status: active']:
+        raise ValueError('UFW did not enter the active state')
+    defaults = {}
+    for line in status_verbose.splitlines():
+        if not line.startswith('Default:'):
+            continue
+        for part in line[len('Default:'):].split(','):
+            words = part.split()
+            if len(words) >= 2:
+                defaults[words[1].strip('()')] = words[0]
+    if defaults.get('incoming') != 'deny' or defaults.get('outgoing') != 'allow':
+        raise ValueError('UFW defaults are not deny incoming and allow outgoing')
+    declared = re.search(r'^IPV6=(\w+)$', declaration, re.M)
+    if declared is not None and (declared.group(1) == 'yes') != policy['ipv6']:
+        raise ValueError('UFW IPv6 declaration does not follow the listener decision')
+    families = [4] + ([6] if policy['ipv6'] else [])
+    missing = []
+    for family in families:
+        if family not in dumps:
+            raise ValueError('IPv' + str(family) + ' ruleset was not read')
+        content = dumps[family]
+        chains = dict(re.findall(r'^:([A-Za-z0-9_-]+) (\S+) ', content, re.M))
+        if chains.get('INPUT') != 'DROP' or chains.get('OUTPUT') != 'ACCEPT':
+            missing.append({'family': family, 'rule': 'default policy'})
+        rules = [entry for entry in _input_rules(content, family) if entry['supported']]
+        for port in sorted(set(policy['ssh_ports']) | {80, 443}):
+            if not any(_public_allow(entry) and (entry['ports'] is None or port in entry['ports'])
+                       for entry in rules):
+                missing.append({'family': family, 'rule': 'allow ' + str(port)})
+        denied = set(policy['internal_ports'])
+        if policy['node_port'] is not None:
+            denied.add(policy['node_port'])
+        for port in sorted(denied):
+            if not any(entry['target'] in {'DROP', 'REJECT'} and entry['protocol'] == 'tcp'
+                       and (entry['ports'] is None or port in entry['ports']) for entry in rules):
+                missing.append({'family': family, 'rule': 'deny ' + str(port)})
+        if policy['role'] == 'worker':
+            for source in policy['master_sources']:
+                network = ipaddress.ip_network(source, strict=False)
+                if network.version != family:
+                    continue
+                if not any(entry['target'] == 'ACCEPT' and entry['source'] == network
+                           and (entry['ports'] is None or policy['node_port'] in entry['ports'])
+                           for entry in rules):
+                    missing.append({'family': family, 'rule': 'allow ' + source})
+    if missing:
+        raise ValueError('Firewall policy is not effective: ' + json.dumps(missing))
+    conflicts = firewall_conflicts(policy, {family: dumps[family] for family in families})
+    if conflicts['conflicts']:
+        raise ValueError('Live firewall still exposes protected ports: ' + json.dumps(conflicts['conflicts']))
+    return {'status': 'success', 'defaults': defaults,
+            'preserved_exceptions': conflicts['preserved_exceptions']}
 
 
 def password_warning(effective):
@@ -440,6 +671,27 @@ if __name__ == '__main__':
         elif sys.argv[1:] == ['--ssh-ports']:
             ports = inspect_ssh_ports()
             result = {'status': 'success', 'ports': ports}
+        elif sys.argv[1:2] == ['--firewall-preflight'] and len(sys.argv) in (2, 3):
+            policy = json.load(sys.stdin)
+            root = Path(sys.argv[2]) if len(sys.argv) == 3 else Path('/')
+            result = {'status': 'success', **inspect_firewall_conflicts(policy, root)}
+        elif sys.argv[1:2] == ['--firewall-verify'] and len(sys.argv) in (2, 3):
+            policy = json.load(sys.stdin)
+            root = Path(sys.argv[2]) if len(sys.argv) == 3 else Path('/')
+            dumps = {4: command('iptables-save')}
+            if policy['ipv6']:
+                dumps[6] = command('ip6tables-save')
+            status_verbose = command('ufw', 'status', 'verbose')
+            declaration_path = root / 'etc' / 'default' / 'ufw'
+            declaration = ''
+            if declaration_path.is_file() and not declaration_path.is_symlink():
+                declaration = declaration_path.read_text()
+            result = firewall_effective(policy, dumps, status_verbose, declaration)
+        elif sys.argv[1:] == ['--firewall-policy']:
+            request = json.load(sys.stdin)
+            if not isinstance(request, dict) or set(request) != {'role', 'node_port', 'master_sources', 'ipv6'}:
+                raise ValueError('Invalid firewall policy request')
+            result = {'status': 'success', 'policy': firewall_policy(ports=inspect_ssh_ports(), **request)}
         elif sys.argv[1:] == ['--configure-fail2ban']:
             result = configure_fail2ban()
         elif sys.argv[1:] == ['--configure-apt']:

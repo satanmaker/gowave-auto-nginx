@@ -40,6 +40,7 @@ source "$SCRIPT_DIR/modules/i18n.sh"
 source "$SCRIPT_DIR/modules/wizard.sh"
 source "$SCRIPT_DIR/modules/ssh_bootstrap.sh"
 source "$SCRIPT_DIR/modules/security.sh"
+source "$SCRIPT_DIR/modules/firewall.sh"
 source "$SCRIPT_DIR/modules/panel.sh"
 source "$SCRIPT_DIR/modules/node.sh"
 source "$SCRIPT_DIR/modules/nginx.sh"
@@ -415,6 +416,14 @@ cmd_install() {
     configure_swap
     configure_bbr_and_mtu "$STATE_FILE"
     configure_log_rotation
+
+    # The baseline and the conflict verdict belong here, before the first step
+    # that can change ingress: the local Node denies its API port before the
+    # policy is applied, and a baseline taken after that would record this
+    # install's own rule as the state to return to.
+    CURRENT_STEP="install: firewall baseline"
+    firewall_prepare_install "$install_mode" 3002 || return 1
+    firewall_begin_transaction || return 1
 
     # Step 4: Webroot ACME TLS Acquisition
     CURRENT_STEP="install: certificates"
@@ -818,6 +827,9 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     if [[ -n "$vision_domain" ]]; then
         cleanup_acme_snapshot "$acme_tx_id" "$vision_domain"
     fi
+    # A verified install keeps no firewall baseline behind; a failed one keeps
+    # the image its compensation restored from.
+    firewall_commit_transaction
 
     # A plan that still has nodes to onboard has not finished installing: the
     # Panel reaches a serving state first, and "Installation Complete" over it

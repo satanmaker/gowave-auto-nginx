@@ -319,6 +319,71 @@ Worker.
 A systemd timer on the Worker removes the temporary entry within two hours, and the entry is also revoked
 at the end of `node add` on success and on failure.
 
+## Deployment persistence and security-report formats / Форматы состояния и отчёта
+
+The persistence modules are available, but are not yet wired into wizard collection, resume or host
+hardening. The paths below describe their contract, not a claim that a current installation already
+creates these files or offers resume. Integration is tracked by `secure-resumable-deployment`.
+
+Модули хранения уже доступны, но пока не подключены к сбору анкеты, продолжению установки и настройке
+защиты. Ниже описан их контракт: текущая установка ещё не создаёт эти файлы автоматически и не
+предлагает продолжение. Подключение предусмотрено change `secure-resumable-deployment`.
+
+| File / Файл | Format / Формат | Access / Доступ |
+| --- | --- | --- |
+| `/var/lib/gowave-auto-nginx/deployment/active.json` | Deployment schema 1 / Схема развёртывания 1 | Root-owned directory 0700, file 0600 / Каталог root 0700, файл 0600 |
+| `/var/lib/gowave-auto-nginx/security-report.json` | Security schema 1 / Схема защиты 1 | File 0600; root-owned parent without group/world-write, existing 0755 preserved / Файл 0600; родитель root без записи для группы и остальных, существующий 0755 сохраняется |
+
+New directories use 0700. The shared report parent is not chmodded: this preserves existing state/recovery
+consumers. Its file names may be visible, but report contents remain root-only. Writable parents, even
+with a sticky bit, are refused; the dedicated draft directory always requires 0700.
+
+Новые каталоги создаются с 0700. Права общего родителя отчёта не меняются, чтобы не затрагивать
+потребителей state/recovery. Имена файлов могут быть видны, но содержимое отчёта доступно только root.
+Каталог с записью для группы или остальных отклоняется даже со sticky bit; отдельный каталог черновика
+всегда требует 0700.
+
+Deployment fields are `schema_version`, `revision`, `installer_revision`, `operation_id`, `kind`,
+`topology`, `language`, `answers`, `nodes`, `reviewed_digest` and `checkpoints`. The digest authorizes
+only the reviewed plan, not changed answers. Each write uses an expected revision and a non-blocking
+writer lock; stale revisions and a different active operation are refused. Files are written to private
+siblings, synced, atomically renamed and followed by a directory sync. Symlinks and non-regular files
+are refused. Passwords, tokens, private keys, temporary access and raw logs have no schema fields.
+
+Поля черновика перечислены выше без перевода, как в JSON. `reviewed_digest` относится только к
+проверенному плану; изменение ответов требует нового подтверждения. Запись проверяет ожидаемую
+ревизию и блокировку: устаревшая ревизия или другая активная операция отклоняется. Запись идёт через
+временный файл с синхронизацией, атомарным переименованием и синхронизацией каталога. Символические
+ссылки и специальные файлы отклоняются. Полей для паролей, токенов, приватных ключей, временного
+доступа и сырых логов в схеме нет.
+
+Security fields are `schema_version`, `host_id`, `role`, `installer_revision`, `observed_at` and
+`controls`. Required control names are `firewall`, `ssh_protection`, `security_updates` and `dot`.
+Each control has `policy`, `status`, `reason_code`, `recovery` and `evidence_codes`. Reasons/evidence
+are codes, not captured command output. Default freshness is 300 seconds; future or older reports
+are rejected for readiness. Stale reports may remain historical files but are not current evidence.
+A failed required control blocks readiness; best-effort DoT failure permits warnings only after
+verified DNS recovery. Registration, readiness, cleanup and recovery remain separate final outcomes.
+
+Отчёт защиты содержит указанные поля и четыре контроля. Причины и доказательства записываются кодами,
+не выводом команд. По умолчанию отчёт пригоден для проверки готовности в течение 300 секунд; будущая
+дата и более старый отчёт отклоняются. Старый файл может остаться историей, но не доказывает текущее
+состояние. Ошибка обязательного контроля блокирует готовность. Ошибка необязательного DoT допускает
+продолжение с предупреждением только после проверенного восстановления DNS. Регистрация, готовность,
+очистка доступа и восстановление учитываются отдельно.
+
+Files have no automatic expiry or deletion in the storage layer. Retain a failed operation until its
+actual state is reconciled; a stored success is not permission to skip readback. Abandoning a draft
+must never uninstall components or compensate completed nodes. The storage layer intentionally does
+not implement abandonment, resource rollback or automatic switching to a new operation; those are
+orchestration responsibilities. Do not delete an active file to bypass a writer conflict.
+
+Слой хранения сам не удаляет и не просрочивает файлы. Сохраняйте неуспешную операцию до сверки с
+реальным состоянием; сохранённый успех не заменяет повторную проверку. Отказ от черновика не должен
+удалять компоненты или откатывать готовые узлы. Отказ, rollback ресурсов и переход к новой операции
+пока не реализованы в слое хранения: это задачи оркестратора. Не удаляйте активный файл ради обхода
+конфликта записи.
+
 ## Non-interactive answers
 
 `GOWAVE_WIZARD_LANG=ru` or `en` selects the wizard's message catalog. It is read per invocation and is

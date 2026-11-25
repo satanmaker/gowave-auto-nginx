@@ -9,7 +9,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANAGED_PY = REPO_ROOT / "assets" / "security" / "managed.py"
 SECURITY_SH = REPO_ROOT / "modules" / "security.sh"
-OS_SH = REPO_ROOT / "modules" / "os.sh"
 
 
 class TestSecurityModule(unittest.TestCase):
@@ -35,6 +34,145 @@ class TestSecurityModule(unittest.TestCase):
         # Invalid port
         with self.assertRaises(ValueError):
             managed.ssh_ports("port 70000\n")
+
+    def test_firewall_policy_role_matrix(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('managed_policy', str(MANAGED_PY))
+        managed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(managed)
+        for ipv6 in (False, True):
+            for role in ('panel-only', 'aio', 'worker'):
+                for node_port in (3002, 3333):
+                    with self.subTest(ipv6=ipv6, role=role, node_port=node_port):
+                        sources = ['192.0.2.10'] if role == 'worker' else []
+                        if role == 'worker' and ipv6:
+                            sources.append('2001:db8::10')
+                        policy = managed.firewall_policy(role, [2222, 2200], node_port, sources, ipv6)
+                        commands = policy['commands']
+                        self.assertEqual(commands[:2], [['default', 'deny', 'incoming'], ['default', 'allow', 'outgoing']])
+                        for port in (2200, 2222, 80, 443):
+                            self.assertIn(['allow', f'{port}/tcp'], commands)
+                        for port in (3000, 3001, 7443, 8443, 8444, 9443, 9444, 10001, 10002, 10003):
+                            self.assertIn(['deny', f'{port}/tcp'], commands)
+                        if role == 'panel-only':
+                            self.assertIsNone(policy['node_port'])
+                            self.assertNotIn(['deny', f'{node_port}/tcp'], commands)
+                        else:
+                            self.assertIn(['deny', f'{node_port}/tcp'], commands)
+                        for source in sources:
+                            allow = ['allow', 'proto', 'tcp', 'from', source, 'to', 'any', 'port', str(node_port)]
+                            self.assertIn(allow, commands)
+                            self.assertLess(commands.index(allow), commands.index(['deny', f'{node_port}/tcp']))
+
+    def test_master_and_streamed_worker_policy_use_same_ssh_discovery(self):
+        import base64
+        helper = MANAGED_PY.read_text().replace(
+            "if __name__ == '__main__':",
+            "inspect_ssh_ports = lambda: ssh_ports('port 22\\n', '[::]:2200 (Stream) 0.0.0.0:2222 (Stream)')\nif __name__ == '__main__':",
+        )
+        worker_source = (REPO_ROOT / 'gowave-node-auto.sh').read_text()
+        start = worker_source.index('worker_firewall_policy_json() {')
+        end = worker_source.index('\nconfigure_firewall() {', start)
+        with tempfile.TemporaryDirectory() as temporary:
+            helper_path = Path(temporary) / 'managed.py'
+            helper_path.write_text(helper)
+            master = subprocess.run(
+                ['bash', '-c', f'source "{SECURITY_SH}"; MANAGED_SECURITY_PY="{helper_path}"; firewall_policy_json worker 3333 192.0.2.10 "" false'],
+                capture_output=True, text=True, timeout=10,
+            )
+            worker = subprocess.run(
+                ['bash', '-c', 'set -Eeuo pipefail\nkernel_has_ipv6() { return 1; }\n' + worker_source[start:end] + '\nworker_firewall_policy_json'],
+                env={**os.environ, 'NODE_PORT': '3333', 'PANEL_IP': '192.0.2.10',
+                     'SECURITY_HELPER_B64': base64.b64encode(helper.encode()).decode()},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(master.returncode, 0, master.stderr)
+            self.assertEqual(worker.returncode, 0, worker.stderr)
+            self.assertEqual(json.loads(master.stdout), json.loads(worker.stdout))
+            self.assertEqual(json.loads(worker.stdout)['policy']['ssh_ports'], [2200, 2222])
+
+    def test_firewall_policy_refuses_invalid_sources_and_port_collisions(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('managed_invalid_policy', str(MANAGED_PY))
+        managed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(managed)
+        cases = (
+            ('worker', [22], 3002, [], False),
+            ('worker', [22], 3002, ['0.0.0.0'], False),
+            ('worker', [22], 3002, ['2001:db8::1'], False),
+            ('aio', [22], 443, [], False),
+            ('aio', [3002], 3002, [], False),
+            ('aio', [7443], 3002, [], False),
+            ('aio', [True], 3002, [], False),
+        )
+        for args in cases:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                managed.firewall_policy(*args)
+
+    def test_firewall_preflight_classifies_existing_rules_without_mutation(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('managed_conflicts', str(MANAGED_PY))
+        managed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(managed)
+        policy = managed.firewall_policy('worker', [22], 3333, ['192.0.2.10'], True)
+        for expression in ('', '--dport 3333', '--dport 3000:4000', '-m multiport --dports 22,3333'):
+            with self.subTest(expression=expression):
+                rule = f'-A ufw-user-input -p tcp {expression} -j ACCEPT'
+                result = managed.firewall_conflicts(policy, {4: rule})
+                self.assertEqual(len(result['conflicts']), 1)
+                self.assertIn(3333, result['conflicts'][0]['ports'])
+        rules = '\n'.join((
+            '-A ufw-user-input -p tcp --dport 22 -j ACCEPT',
+            '-A ufw-user-input -p tcp --dport 8080 -j ACCEPT',
+            '-A ufw-user-input -p tcp -m tcp -s 192.0.2.10/32 --dport 3333 -j ACCEPT',
+            '-A ufw-user-input -i lo -j ACCEPT',
+        ))
+        result = managed.firewall_conflicts(policy, {4: rules})
+        self.assertEqual(result['conflicts'], [])
+        # The 22 allow is the policy's own rule, so only the 8080 grant is an
+        # administrator exception the operator has to be told about.
+        self.assertEqual(len(result['preserved_exceptions']), 1)
+        self.assertEqual(managed.firewall_conflicts(policy, {6: '-A ufw-user-input -p tcp --dport 3333 -j ACCEPT'})['conflicts'][0]['family'], 6)
+        with self.assertRaises(ValueError):
+            managed.firewall_conflicts(policy, {4: rules}, ['firewalld.service'])
+        with self.assertRaises(ValueError):
+            managed.firewall_conflicts(policy, {4: '-A ufw-user-input -p tcp -m mystery -j ACCEPT'})
+
+    def test_firewall_inspection_reads_files_and_never_calls_mutators(self):
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location('managed_inspection', str(MANAGED_PY))
+        managed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(managed)
+        policy = managed.firewall_policy('aio', [22])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'etc' / 'ufw'
+            directory.mkdir(parents=True)
+            rules = directory / 'user.rules'
+            rules.write_text('-A ufw-user-input -p tcp --dport 8080 -j ACCEPT\n')
+            before = rules.read_bytes()
+            with mock.patch.object(managed, 'command', return_value='inactive') as command:
+                result = managed.inspect_firewall_conflicts(policy, root)
+                self.assertEqual(result['conflicts'], [])
+                self.assertEqual(len(result['preserved_exceptions']), 1)
+                self.assertEqual(rules.read_bytes(), before)
+                for args in command.call_args_list:
+                    self.assertEqual(args.args[:2], ('systemctl', 'is-active'))
+                rules.write_text('-A ufw-user-input -p tcp --dport 3002 -j ACCEPT\n')
+                with self.assertRaisesRegex(ValueError, 'conflicts'):
+                    managed.inspect_firewall_conflicts(policy, root)
+                rules.unlink()
+                rules.symlink_to('/dev/null')
+                with self.assertRaisesRegex(ValueError, 'Unsafe'):
+                    managed.inspect_firewall_conflicts(policy, root)
+                rules.unlink()
+                with self.assertRaisesRegex(ValueError, 'Cannot inspect'):
+                    managed.inspect_firewall_conflicts(policy, root)
+                rules.write_text('')
+                command.return_value = 'active'
+                with self.assertRaisesRegex(ValueError, 'Competing'):
+                    managed.inspect_firewall_conflicts(policy, root)
 
     def test_password_warning(self):
         import importlib.util
@@ -184,45 +322,9 @@ class TestSecurityModule(unittest.TestCase):
             journal_content = journal_file.read_text()
             self.assertIn("SystemMaxUse=100M", journal_content)
 
-    def test_ufw_declares_the_same_ipv6_branch_the_listeners_render(self):
-        # A host with an address table gets ``IPV6=yes``, so the v6 rules that
-        # publish the same ports exist; an empty table keeps it ``IPV6=no``.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result, declaration, calls = self.run_configure_ufw(
-                tmpdir, "00000000000000000000000000000001 01 80 10 80       lo\n"
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("IPV6=yes", declaration)
-            self.assertNotIn("IPV6=no", declaration)
-            self.assertIn("IPv6 active in kernel", result.stdout)
-            self.assertIn("deny 3002/tcp", calls)
-
-            result, declaration, _ = self.run_configure_ufw(tmpdir, "")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("IPV6=no", declaration)
-            self.assertIn("IPv6 disabled in kernel", result.stdout)
-
-    def run_configure_ufw(self, tmpdir, address_table):
-        root = Path(tmpdir)
-        fake_bin = root / "bin"
-        fake_bin.mkdir(exist_ok=True)
-        calls = root / "ufw.log"
-        calls.write_text("")
-        ufw = fake_bin / "ufw"
-        ufw.write_text(f'#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "{calls}"\n')
-        ufw.chmod(0o755)
-        table = root / "if_inet6"
-        table.write_text(address_table)
-        ufw_default = root / "ufw-default"
-        ufw_default.write_text("IPV6=yes\n")
-        env = os.environ.copy()
-        env["PATH"] = f"{fake_bin}:{env['PATH']}"
-        command = (
-            f'source "{OS_SH}" && source "{SECURITY_SH}" && '
-            f'configure_ufw false "" 3002 "{table}" "{ufw_default}"'
-        )
-        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, env=env)
-        return result, ufw_default.read_text(), calls.read_text()
+    # `configure_ufw` itself is exercised by tests/test_firewall.py against a
+    # disposable host, including the declaration-before-rules ordering and the
+    # rollback of every failed mutation.
 
 
 if __name__ == "__main__":

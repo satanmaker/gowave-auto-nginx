@@ -620,8 +620,16 @@ class TestNodeIntegration(unittest.TestCase):
     def test_the_worker_firewall_declares_the_same_ipv6_branch_it_renders(self):
         """The distro default must not outvote the host decision the listeners use."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
-        self.assertEqual(worker_script.count("kernel_has_ipv6"), 3,
-                         "the host decision must be defined once and used by both sites")
+        self.assertEqual(worker_script.count("kernel_has_ipv6() {"), 1,
+                         "the host decision must be defined once")
+        for function, next_function in (
+            ('worker_firewall_policy_json', 'configure_firewall'),
+            ('configure_firewall', 'unpack_cover_reality'),
+        ):
+            start = worker_script.index(f'{function}() {{')
+            end = worker_script.index(f'\n{next_function}() {{', start)
+            self.assertIn('kernel_has_ipv6', worker_script[start:end],
+                          f'{function} must use the shared host decision')
         listen_at = worker_script.index('local listen_v6=""')
         listen = worker_script[listen_at:worker_script.index("\n    fi", listen_at)]
         self.assertIn("kernel_has_ipv6", listen)

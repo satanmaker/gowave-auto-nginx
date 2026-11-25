@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANAGED_SECURITY_PY="${SCRIPT_DIR}/assets/security/managed.py"
+source "${SCRIPT_DIR}/modules/firewall.sh"
 
 configure_ssh_and_fail2ban() {
     echo "Configuring non-destructive SSH inspection and Fail2ban..."
@@ -23,65 +24,67 @@ configure_unattended_upgrades() {
 configure_ufw() {
     local is_worker="${1:-false}"
     local panel_ip="${2:-}"
-    local node_port="${3:-3002}"
+    # `-` not `:-`: an absent port means the caller has no Node listener to
+    # isolate, while an explicit 3002 names the one this host does have.
+    local node_port="${3-3002}"
     local if_inet6="${4:-/proc/net/if_inet6}"
     local ufw_default="${5:-/etc/default/ufw}"
+    local root="${6:-/}"
 
     echo "Configuring UFW firewall rules..."
 
-    # Extract detected SSH ports
-    local ports_json
-    ports_json=$(python3 "$MANAGED_SECURITY_PY" --ssh-ports 2>/dev/null || echo '{"ports": [22]}')
-    local ports
-    mapfile -t ports < <(echo "$ports_json" | python3 -c 'import sys, json; print("\n".join(str(p) for p in json.load(sys.stdin).get("ports", [22])))')
-
-    if [[ ${#ports[@]} -eq 0 ]]; then
-        ports=(22)
+    # A Panel-only host has no Node listener, so its policy carries no Node
+    # exception; the role decides which ports are internal, not the caller.
+    local role=aio
+    local policy_port="${node_port:-3002}"
+    if [[ "$is_worker" == "true" ]]; then
+        role=worker
+    elif [[ -z "$node_port" ]]; then
+        role=panel-only
+    fi
+    if [[ "$role" == "worker" && -z "$panel_ip" ]]; then
+        echo "Warning: Panel IP not provided for worker UFW configuration." >&2
     fi
 
-    # 1. Whitelist detected SSH ports
-    for port in "${ports[@]}"; do
-        echo "UFW: Allowing SSH port $port/tcp..."
-        ufw allow "${port}/tcp" comment "SSH port" || true
-    done
-
-    # 2. Allow public web ports 80/443
-    echo "UFW: Allowing public ports 80/tcp and 443/tcp..."
-    ufw allow 80/tcp comment "HTTP ACME challenge" || true
-    ufw allow 443/tcp comment "HTTPS and Xray Stream" || true
-
-    # 3. Handle Node port (a Panel-only host has none)
-    if [[ -z "$node_port" ]]; then
-        echo "UFW: No local Node port to isolate (Panel-only installation)."
-    elif [[ "$is_worker" == "true" ]]; then
-        if [[ -n "$panel_ip" ]]; then
-            echo "UFW: Whitelisting Central Panel IP $panel_ip for Node port $node_port/tcp..."
-            ufw allow from "$panel_ip" to any port "$node_port" proto tcp comment "GoWave Panel control plane" || true
-        else
-            echo "Warning: Panel IP not provided for worker UFW configuration." >&2
-        fi
-    else
-        # All-in-One: strictly deny external access to local Node port 3002
-        echo "UFW: Blocking external access to local Node port $node_port/tcp..."
-        ufw deny "$node_port/tcp" comment "Isolate local GoWave Node from external access" || true
+    # One policy document serves the run: the rules the preflight approved are
+    # the rules applied below. A different role or port rebuilds and rechecks it
+    # rather than applying a verdict about a policy this step no longer uses.
+    if [[ -z "${_FIREWALL_POLICY_JSON:-}" ||
+          "${_FIREWALL_POLICY_ROLE:-}" != "$role" ||
+          "${_FIREWALL_POLICY_PORT:-}" != "$policy_port" ]]; then
+        firewall_prepare "$role" "$policy_port" "$panel_ip" "${PANEL_IPV6:-}" "$if_inet6" "$root" || return 1
     fi
+    firewall_begin_transaction "$root" || return 1
 
-    # 4. Handle IPv6 configuration in /etc/default/ufw
+    # The family declaration comes first: `ufw allow` only maintains
+    # user6.rules while the declaration says yes, so a host told yes after its
+    # rules were written keeps the package's v6 table instead of this policy's.
     if [[ -f "$ufw_default" ]]; then
-        # Same decision the listener generator makes, taken through the same
-        # helper: one host must never get ``[::]`` listeners without the v6
-        # rules that filter them, or the reverse.
-        if check_kernel_ipv6 "$if_inet6" 2>/dev/null; then
+        if [[ "${_FIREWALL_POLICY_IPV6:-false}" == "true" ]]; then
             echo "UFW: IPv6 active in kernel; setting IPV6=yes in $ufw_default..."
-            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
+            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || {
+                firewall_failed "writing IPV6=yes to $ufw_default failed"
+                return 1
+            }
         else
             echo "UFW: IPv6 disabled in kernel; setting IPV6=no in $ufw_default..."
-            sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || true
+            sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || {
+                firewall_failed "writing IPV6=no to $ufw_default failed"
+                return 1
+            }
         fi
     fi
 
-    # 5. Enable UFW
-    ufw --force enable || true
+    firewall_apply_policy || return 1
+
+    ufw --force enable </dev/null || {
+        firewall_failed "ufw --force enable failed"
+        return 1
+    }
+    firewall_verify "$root" || {
+        firewall_failed "the applied firewall policy does not read back from the running ruleset"
+        return 1
+    }
     echo "UFW configuration complete."
 }
 

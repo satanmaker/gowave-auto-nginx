@@ -1143,6 +1143,12 @@ def restore():
     code, saved, _ = run(["iptables-save"])
     if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
         fail("The restored IPv4 ruleset does not match the before-image.")
+    # A dual-stack host filters on two tables, and a restored v4 ruleset proves
+    # nothing about the v6 one the failed install opened.
+    if "ip6tables" in restored:
+        code, saved, _ = run(["ip6tables-save"])
+        if code != 0 or normalized(saved) != normalized(restored["ip6tables"]):
+            fail("The restored IPv6 ruleset does not match the before-image.")
 
 
 if action == "capture":
@@ -3316,6 +3322,12 @@ def restore():
     code, saved, _ = run(["iptables-save"])
     if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
         fail("The restored IPv4 ruleset does not match the before-image.")
+    # A dual-stack host filters on two tables, and a restored v4 ruleset proves
+    # nothing about the v6 one the failed install opened.
+    if "ip6tables" in restored:
+        code, saved, _ = run(["ip6tables-save"])
+        if code != 0 or normalized(saved) != normalized(restored["ip6tables"]):
+            fail("The restored IPv6 ruleset does not match the before-image.")
 
 
 if action == "capture":
@@ -4408,6 +4420,16 @@ configure_host_security() {
 kernel_has_ipv6() {
     local if_inet6="${1:-/proc/net/if_inet6}"
     [[ -f "$if_inet6" ]] && grep -q '[^[:space:]]' "$if_inet6" 2>/dev/null
+}
+
+worker_firewall_policy_json() {
+    local ipv6=false
+    if kernel_has_ipv6; then ipv6=true; fi
+    python3 - "${NODE_PORT:?}" "${PANEL_IP:-}" "${PANEL_IPV6:-}" "$ipv6" <<'PY' | python3 -c 'import base64, os; exec(compile(base64.b64decode(os.environ["SECURITY_HELPER_B64"], validate=True), "managed.py", "exec"))' --firewall-policy
+import json, sys
+port, v4, v6, ipv6 = sys.argv[1:]
+json.dump({'role': 'worker', 'node_port': int(port), 'master_sources': [value for value in (v4, v6) if value], 'ipv6': ipv6 == 'true'}, sys.stdout)
+PY
 }
 
 configure_firewall() {
@@ -6934,6 +6956,12 @@ def restore():
     code, saved, _ = run(["iptables-save"])
     if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
         fail("The restored IPv4 ruleset does not match the before-image.")
+    # A dual-stack host filters on two tables, and a restored v4 ruleset proves
+    # nothing about the v6 one the failed install opened.
+    if "ip6tables" in restored:
+        code, saved, _ = run(["ip6tables-save"])
+        if code != 0 or normalized(saved) != normalized(restored["ip6tables"]):
+            fail("The restored IPv6 ruleset does not match the before-image.")
 
 
 if action == "capture":

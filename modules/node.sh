@@ -329,10 +329,18 @@ install_local_node() {
     # Install pinned Xray core version if explicitly configured and mismatched
     ensure_pinned_xray_core "$GOWAVE_NODE_INSTALL_DIR/gowave-node" "$GOWAVE_NODE_INSTALL_DIR/rw-core" || return 1
 
-    # Isolate local node from external network access
+    # Isolate local node from external network access. The Node starts serving
+    # before the role policy is applied and before the country prompt, so this
+    # rule cannot wait for that step; it is the same deny the policy carries,
+    # and a host that cannot write it stops here instead of serving the API.
     if command -v ufw >/dev/null 2>&1; then
         echo "UFW: Enforcing external isolation on port $node_port/tcp..."
-        ufw deny "${node_port}/tcp" comment "Isolate local GoWave Node from external access" || true
+        if ! ufw deny "${node_port}/tcp" comment "GoWave Auto NGINX" </dev/null; then
+            if declare -F firewall_restore_once >/dev/null 2>&1; then
+                firewall_restore_once "denying the local Node API port failed" || true
+            fi
+            return 1
+        fi
     fi
 
     if (( node_restart_required == 1 )) && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
