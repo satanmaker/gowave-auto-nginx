@@ -840,6 +840,7 @@ more, what it must not be quoted as proving.
 | `.github/workflows/lint-and-nonroot.yml` | `--check-completeness` then `--suite nonroot` on a runner that installs nothing | acceptance: no container is started |
 | `.github/workflows/root-integration.yml` | `--suite root` with sudo, then `--suite integration` without | acceptance, for the same reason |
 | `.github/workflows/live-vps-unit.yml` | the live runner's unit tests | the live suite: nothing in this job reaches a VPS |
+| `.github/workflows/main-release-guard.yml` | a pull request into `main` comes from this repository's `develop` branch | product acceptance: the job checks the PR source, not an installation or a deployment |
 
 The fixtures are pinned so that a case can never report "the resolver answered
 wrongly" about a resolver that was swapped underneath it:

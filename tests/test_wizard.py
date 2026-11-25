@@ -1620,6 +1620,11 @@ class TestWizardDocumentation(unittest.TestCase):
         self.assertIn("wildcard is not a remedy", readme)
         self.assertIn("gowave_ssh_fingerprint", readme)
         self.assertIn("gowave_ssh_password_file", readme)
+        russian = (REPO_ROOT / "README.ru.md").read_text(encoding="utf-8").lower()
+        for warning in ("остаток лимита", "одному серверу", "wildcard"):
+            self.assertIn(warning, russian)
+        for variable in ("gowave_ssh_fingerprint", "gowave_ssh_password_file"):
+            self.assertIn(variable, russian)
 
     def test_the_design_names_the_three_limits(self):
         design = change_document("interactive-setup-wizard", "design.md").read_text(

@@ -19,6 +19,7 @@ SUITES = {
         "test_preflight.TestWorkerPayloadContract",
         "test_preflight.TestPreflightProxyRefusal",
         "test_preflight.TestPreflightDocumentation",
+        "test_readme.TestReadme",
         "test_failure_report.TestFailureReport",
         "test_security.TestSecurityModule",
         "test_panel_deployment.TestPanelDeployment",

@@ -1658,7 +1658,7 @@ class TestReusableFixtureInventory(unittest.TestCase):
 
     def test_every_workflow_has_a_row_and_every_row_is_a_workflow(self):
         existing = {path.name for path in WORKFLOW_DIR.glob("*.yml")}
-        self.assertEqual(len(existing), 5, "a workflow was added or removed; the page lists five")
+        self.assertEqual(len(existing), 6, "a workflow was added or removed; the page lists six")
         cited = set(WORKFLOW_REFERENCE.findall(reusable_section()))
         self.assertEqual(sorted(cited), sorted(existing),
                          "a workflow runs without a row saying what it proves, "
@@ -1993,22 +1993,27 @@ class TestPodmanE2EDocumentation(unittest.TestCase):
         self.assertIn("reclaimed from stale runs", documented())
 
     def test_the_readme_points_at_the_guide(self):
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("docs/PODMAN_E2E.md", readme)
+        for name in ("README.md", "README.ru.md"):
+            with self.subTest(page=name):
+                readme = (REPO_ROOT / name).read_text(encoding="utf-8")
+                self.assertIn("docs/PODMAN_E2E.md", readme)
+                self.assertIn("openspec/specs", readme)
 
     def test_the_readme_cites_the_requirements_and_scenarios_the_specs_hold(self):
-        # The quoted total is a copy of openspec/specs/, so it is read back from the
-        # specs rather than trusted: an added requirement or scenario moves the count
-        # and this test is where the README is told.
-        readme = " ".join((REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
         requirements = scenarios = 0
         for spec in sorted((REPO_ROOT / "openspec" / "specs").glob("*/spec.md")):
             text = spec.read_text(encoding="utf-8")
             requirements += len(REQUIREMENT.findall(text))
             scenarios += len(SCENARIO.findall(text))
-        self.assertIn(
-            f"**{requirements} requirements / {scenarios} GIVEN-WHEN-THEN acceptance scenarios**", readme
-        )
+        for name in ("README.md", "README.ru.md"):
+            readme = " ".join((REPO_ROOT / name).read_text(encoding="utf-8").split())
+            for pattern, expected in (
+                (r"(\d+)\s+(?:requirements|требовани[йя])", requirements),
+                (r"(\d+)\s+(?:GIVEN-WHEN-THEN acceptance scenarios|сценари(?:ев|я))", scenarios),
+            ):
+                for value in re.findall(pattern, readme):
+                    with self.subTest(page=name, pattern=pattern):
+                        self.assertEqual(int(value), expected)
 
 
 if __name__ == "__main__":
