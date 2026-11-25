@@ -63,11 +63,19 @@ class TestIndependentAcceptanceWorkflows(unittest.TestCase):
             "the cold-boot matrix must keep covering all four supported systems",
         )
 
-    def test_the_transport_gate_still_runs_on_push_and_pull_request(self):
+    def test_the_transport_gate_reports_on_the_develop_pull_request(self):
+        # Acceptance is spent on the merge that matters: a pull request whose base
+        # is develop, plus a manual run. A push to any branch must not start it.
         workflow = load("systemd-acceptance.yml")
         triggers = workflow[True] if True in workflow else workflow["on"]
-        for event in ("push", "pull_request", "workflow_dispatch"):
-            self.assertIn(event, triggers, f"the independent gates must still run on {event}")
+        self.assertEqual(
+            set(triggers), {"pull_request", "workflow_dispatch"},
+            "the independent gates must not run on a feature push",
+        )
+        self.assertEqual(
+            triggers["pull_request"]["branches"], ["develop"],
+            "the gate belongs to the pull request into the integration line",
+        )
 
     def test_the_podman_workflow_does_not_copy_or_replace_the_old_gates(self):
         new = load("podman-acceptance.yml")
