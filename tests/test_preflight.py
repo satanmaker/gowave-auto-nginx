@@ -440,7 +440,10 @@ class TestPreflightProxyRefusal(unittest.TestCase):
 
 class TestPreflightDocumentation(unittest.TestCase):
     def test_every_documented_variable_is_read_by_the_contract(self):
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        readmes = {
+            name: (REPO_ROOT / name).read_text(encoding="utf-8")
+            for name in ("README.md", "README.ru.md")
+        }
         body = function_text("resolve_node_inputs")
         variables = (
             "GOWAVE_NODE_NAME",
@@ -452,7 +455,9 @@ class TestPreflightDocumentation(unittest.TestCase):
             "GOWAVE_VISION_DOMAIN",
         )
         for variable in variables:
-            self.assertIn(variable, readme, f"README does not document {variable}")
+            for name, readme in readmes.items():
+                with self.subTest(page=name, variable=variable):
+                    self.assertIn(variable, readme, f"{name} does not document {variable}")
             self.assertIn(variable, body, f"resolve_node_inputs does not read {variable}")
 
     def test_the_usage_text_names_the_environment_contract(self):
