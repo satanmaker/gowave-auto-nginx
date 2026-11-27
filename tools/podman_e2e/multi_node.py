@@ -8761,16 +8761,40 @@ def verify_worker_security_readback_via_ssh(
         f"'python3 - --worker-security-readback 3002 10.89.0.10 \"\" best-effort' "
         f"< {topology.REPO_IN_CONTAINER}/assets/security/managed.py"
     )
-    result = product.podman.exec_bash(product.require_installed().target_name, cmd, check=False, timeout=60)
-    if result.returncode != 0:
-        return {"ready": "ssh_failed", "error": result.stderr}
-    try:
-        report = json.loads(result.stdout)
-        from modules.security_report import readiness
-        ready_status = readiness(report)
-        return {"ready": ready_status, "report": report}
-    except Exception as exc:
-        return {"ready": "parse_failed", "error": str(exc)}
+    # A re-apply next door rewrites the Worker's report, so the readback can
+    # catch it mid-write and judge a moment instead of a host: this run read
+    # `firewall=failed` while the same file said `verified` a minute later. The
+    # readback therefore waits, bounded, for a report observed after the case
+    # started, and says when it could not get one.
+    from datetime import datetime, timezone
+    from modules.security_report import observed_at, readiness
+
+    started = datetime.now(timezone.utc)
+    attempts = max(1, WORKER_REPORT_FRESH_SECONDS // WORKER_REPORT_POLL_SECONDS)
+    last: Dict[str, Any] = {}
+    for attempt in range(attempts + 1):
+        result = product.podman.exec_bash(
+            product.require_installed().target_name, cmd, check=False, timeout=60)
+        if result.returncode != 0:
+            return {"ready": "ssh_failed", "error": result.stderr}
+        try:
+            report = json.loads(result.stdout)
+        except Exception as exc:
+            return {"ready": "parse_failed", "error": str(exc)}
+        try:
+            fresh = observed_at(report) >= started
+        except Exception:
+            fresh = False
+        last = {"ready": readiness(report), "report": report}
+        if fresh or last["ready"] != "failed":
+            return last
+        if attempt == attempts:
+            # The bound ran out with a report that predates the case: that is a
+            # stale reading, not a failed control, and it says so.
+            last["stale"] = True
+            return last
+        wait_for_fresh_report(WORKER_REPORT_POLL_SECONDS)
+    return last
 
 
 # ------------------------------------------------- NGX-PIN: the pinned NGINX on both roles
@@ -8783,6 +8807,13 @@ def verify_worker_security_readback_via_ssh(
 # distribution archive. The distribution revisions differ from the vendor's
 # (`1.26.3-3+deb13u11` against `1.30.8-1~trixie`), so a suite-suffixed revision
 # cannot be produced by the archive at all.
+# How long a readback waits for a report the product has written since the case
+# began, and how often it re-reads while waiting. A re-apply next door rewrites
+# the Worker's report, so a verdict taken mid-write describes a moment rather
+# than a host; the wait is bounded so a genuinely failed control still fails.
+WORKER_REPORT_FRESH_SECONDS = 180
+WORKER_REPORT_POLL_SECONDS = 10
+
 NGINX_PIN_CASE_ID = "NGX-PIN"
 NGINX_PIN_VERSION = "1.30.8"
 NGINX_PIN_TIMEOUT_SECONDS = 420
@@ -8906,6 +8937,11 @@ def wait_for_worker_transport(product: MultiNodeProduct, host: Any,
             return True
         time.sleep(1)
     return False
+
+
+def wait_for_fresh_report(seconds: float) -> None:
+    """Pause between two reads of a report the product is still rewriting."""
+    time.sleep(seconds)
 
 
 def wait_before_interrupt(seconds: float) -> None:
