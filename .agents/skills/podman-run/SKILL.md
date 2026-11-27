@@ -117,7 +117,21 @@ printf '%s\n' "$PW" | sudo -S -p '' env PYTHONPATH=. python3 -u -m tools.run_pod
 # the same suite on all four, concurrently, one exit status
 printf '%s\n' "$PW" | sudo -S -p '' env PYTHONPATH=. python3 -u -m tools.run_podman_e2e \
   --topology multi-node --all-distributions --artifact-root "$PWD/artifacts/podman-e2e"
+
+# what is running now: one line per cell, no root, no podman
+PYTHONPATH=. python3 -m tools.podman_e2e.live_status [--json]
+
+# a named subset on one cell, and keeping the hosts for inspection
+printf '%s\n' "$PW" | sudo -S -p '' env PYTHONPATH=. python3 -m tools.run_podman_e2e \
+  --topology multi-node --distribution debian-13 \
+  --only MN-DP-master-XHTTP-xray,MN-DP-worker-XHTTP-xray --keep
 ```
+
+`live_status` is the cheapest look: it prints `topology distribution up=…
+step=… diag=… verdict=…` and answers `diag=?` when a rootful cell's evidence
+directory cannot be read. A finished run also leaves `summary.json` (0644) beside
+`result.json` — counts, executed cases and one bounded entry per non-PASS case —
+which is what to read instead of parsing the full result.
 
 `--budget-seconds` may only tighten the deadline the matrix declares
 (`tests/cases/matrix.yaml`); a larger value is refused before anything runs.

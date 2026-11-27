@@ -189,28 +189,38 @@ class TestPodmanGateContract(unittest.TestCase):
         )
 
     def test_a_raised_timeout_is_refused(self):
+        name = "Multi-Node Podman Acceptance"
+        declared = next(
+            check["timeout_minutes"] for check in self.contract["checks"]
+            if check["name"] == name
+        )
         document = copy.deepcopy(self.document)
-        self.job(document, "Multi-Node Podman Acceptance")["timeout-minutes"] = 150
+        self.job(document, name)["timeout-minutes"] = declared + 30
         problems = self.problems(document=document)
         self.assertTrue(
-            any("declares 120 minutes, the job allows 150" in problem for problem in problems),
+            any(f"declares {declared} minutes, the job allows {declared + 30}" in problem
+                for problem in problems),
             problems,
         )
 
     def test_a_timeout_that_does_not_outlive_the_declared_budget_is_refused(self):
-        # Both copies at 45 minutes agree with each other, so only the budget
-        # rule can catch it: the suite would be allowed 2700 s inside a 2700 s
-        # job, which leaves the setup and the artifact upload outside the ceiling.
+        # Both copies at the same minute count agree with each other, so only the
+        # budget rule can catch it: a job allowed exactly the suite's own deadline
+        # leaves the setup and the artifact upload outside the ceiling.
+        declared = matrix.runtime_budget_seconds(gate.matrix.load(), "aio")
+        minutes = declared // 60
+        self.assertEqual(minutes * 60, declared, "the doctor needs whole minutes")
         contract = copy.deepcopy(self.contract)
         document = copy.deepcopy(self.document)
         name = "All-in-One Podman Acceptance"
         for check in contract["checks"]:
             if check["name"] == name:
-                check["timeout_minutes"] = 45
-        self.job(document, name)["timeout-minutes"] = 45
+                check["timeout_minutes"] = minutes
+        self.job(document, name)["timeout-minutes"] = minutes
         problems = self.problems(contract=contract, document=document)
         self.assertTrue(
-            any(f"{name!r} allows 45 minutes" in problem and "declared budget is 2700s" in problem
+            any(f"{name!r} allows {minutes} minutes" in problem
+                and f"declared budget is {declared}s" in problem
                 for problem in problems),
             problems,
         )
@@ -222,24 +232,54 @@ class TestPodmanGateContract(unittest.TestCase):
             return gate._budget_problems(self.contract)
 
     def test_a_topology_budget_that_breaks_the_pre_push_total_is_refused(self):
+        manifest = gate.matrix.load()
+        total = matrix.tier_budget_seconds(manifest, "pre_push")
+        gated = [
+            name for name, entry in manifest["topologies"].items()
+            if "pre-push" in (entry.get("gate") or [])
+        ]
+        others = sum(matrix.runtime_budget_seconds(manifest, name)
+                     for name in gated if name != "aio")
+        raised = total - others + 1
+        self.assertGreater(
+            raised, matrix.runtime_budget_seconds(manifest, "aio"),
+            "the doctored value has to raise the topology, not cut it",
+        )
         problems = self.budget_problems(
-            lambda manifest: manifest["topologies"]["aio"].__setitem__("runtime_budget_seconds", 4000)
+            lambda doctored: doctored["topologies"]["aio"].__setitem__(
+                "runtime_budget_seconds", raised
+            )
         )
         self.assertTrue(
-            any("declares 10300s of budget, past runtime_budget.pre_push_total_seconds = 9600s"
-                in problem for problem in problems),
+            any(f"declares {others + raised}s of budget, past "
+                f"runtime_budget.pre_push_total_seconds = {total}s" in problem
+                for problem in problems),
             problems,
         )
 
     def test_a_topology_budget_that_breaks_the_pull_request_wave_is_refused(self):
+        manifest = gate.matrix.load()
+        total = matrix.tier_budget_seconds(manifest, "pr")
+        raised = total // 2 + 1
+        self.assertGreater(
+            raised, matrix.runtime_budget_seconds(manifest, "multi-node"),
+            "the doctored value has to raise the topology, not cut it",
+        )
+        self.assertGreater(
+            raised,
+            max(matrix.runtime_budget_seconds(manifest, name)
+                for name in manifest["topologies"] if name != "multi-node"),
+            "the wave is the larger of the two overlapping budgets, so the doctored one "
+            "has to be the larger",
+        )
         problems = self.budget_problems(
-            lambda manifest: manifest["topologies"]["multi-node"].__setitem__(
-                "runtime_budget_seconds", 6400
+            lambda doctored: doctored["topologies"]["multi-node"].__setitem__(
+                "runtime_budget_seconds", raised
             )
         )
         self.assertTrue(
-            any("one full wave plus one recovery wave declares 12800s" in problem
-                and "pr_total_seconds = 12600s" in problem
+            any(f"one full wave plus one recovery wave declares {2 * raised}s" in problem
+                and f"pr_total_seconds = {total}s" in problem
                 for problem in problems),
             problems,
         )
@@ -248,15 +288,24 @@ class TestPodmanGateContract(unittest.TestCase):
         # The nightly tier is the one that runs every topology at its own
         # budget, so a topology raised without raising the total would make the
         # third tier a bound the manifest cannot keep. Every topology counts,
-        # including the one no `--artifacts` aggregate judges: 2700 + 12000 + 4500.
+        # including the one no `--artifacts` aggregate judges.
+        manifest = gate.matrix.load()
+        total = matrix.tier_budget_seconds(manifest, "nightly")
+        others = sum(matrix.runtime_budget_seconds(manifest, name)
+                     for name in manifest["topologies"] if name != "multi-node")
+        raised = total + 1 - others
+        self.assertGreater(
+            raised, matrix.runtime_budget_seconds(manifest, "multi-node"),
+            "the doctored value has to raise the topology, not cut it",
+        )
         problems = self.budget_problems(
-            lambda manifest: manifest["topologies"]["multi-node"].__setitem__(
-                "runtime_budget_seconds", 12000
+            lambda doctored: doctored["topologies"]["multi-node"].__setitem__(
+                "runtime_budget_seconds", raised
             )
         )
         self.assertTrue(
-            any("every topology at its own budget declares 19200s" in problem
-                and "nightly_total_seconds = 14400s" in problem
+            any(f"every topology at its own budget declares {others + raised}s" in problem
+                and f"nightly_total_seconds = {total}s" in problem
                 for problem in problems),
             problems,
         )

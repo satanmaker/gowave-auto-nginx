@@ -53,3 +53,31 @@ The acceptance harness SHALL cover Debian 12, Debian 13, Ubuntu 24.04 and Ubuntu
 - **THEN** it reads the new lines of that host's stream access log and requires a line naming the request's SNI and client address.
 - **AND** a missing line fails the case, while a request that the edge never logged is never reported as a pass.
 - **AND** the raw packet capture is not the witness: it is a laboratory instrument that observes nothing in an unprivileged container namespace, so an empty capture can no longer decide a verdict.
+
+### Requirement: Operable harness evidence and selected runs
+Every finished run SHALL leave a compact, world-readable summary beside its full
+result, and the suite SHALL be runnable for a named subset of cases against an
+already provisioned cell. A status command SHALL report each running cell's
+topology, distribution, elapsed time and current step without requiring root,
+and no declared number SHALL have a second source.
+
+#### Scenario: A finished run leaves a compact summary
+- **WHEN** a run finishes, green or not
+- **THEN** `summary.json` sits beside `result.json` in mode 0644 with the run id, topology, distribution, overall status, per-status counts and one bounded entry per non-PASS case.
+- **AND** reading the verdict needs neither root nor the full result.
+
+#### Scenario: The phase of a running cell is one command away
+- **WHEN** the operator asks what is running
+- **THEN** the status command prints one line per cell with its topology, distribution, elapsed time, the step its child command names, the diagnostic-bundle count and whether a verdict exists.
+- **AND** it reads the process tree and the artifact directory rather than an unprivileged container list, because a rootful run is invisible there.
+
+#### Scenario: Selected cases run without reinstalling the cell
+- **WHEN** a fix has to be checked by a named subset of cases
+- **THEN** `--only` runs exactly those cases in the suite's declared order, an unknown id exits 2 before a container exists, and `--keep` leaves the run's hosts and its run directory in place and prints how to reuse them.
+- **AND** `--reuse <run_id>` adopts a kept run only when the setup that run needs still exists; a kept cell it cannot adopt is refused with the missing part named, never reinstalled under the name of reuse.
+- **AND** a run records the cases it executed and its own run directory, so a selected run is never presented as a full suite.
+
+#### Scenario: A re-provisioning step cannot run on the default timeout
+- **WHEN** a harness step re-provisions a host
+- **THEN** it passes an explicit budget, and a test refuses such a step that would fall back to the default exec timeout.
+- **AND** declared deadlines, budgets and tier totals are read from the matrix manifest by the tests and the documentation rather than repeated as literals.

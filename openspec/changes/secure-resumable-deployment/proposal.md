@@ -16,6 +16,7 @@ Issue #2 exposes inconsistent host-security integration across Panel, All-in-One
 
 - Pin NGINX stable 1.30.8 from the signed official NGINX APT repository as the primary source on every supported OS. Fall back only to a distribution package with explicitly verified equivalent security fixes; refuse if neither source qualifies.
 - Run all four supported distributions concurrently in GitHub Actions and local Podman acceptance, keeping independent results and stable required check names.
+- Make the acceptance harness operable at the cost of the work it guards: a machine-readable summary beside every result, a status command that names each cell's phase, selected-case and reuse runs over an existing cell, a manifest single source for every declared number, and a lint that refuses a re-provisioning step on a default exec timeout.
 
 ## Capabilities
 

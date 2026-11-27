@@ -8934,7 +8934,13 @@ def case_composed_mixed_topology(product: MultiNodeProduct) -> Dict[str, Any]:
     interrupted: Dict[str, Any] = {}
 
     def run_retry() -> None:
-        interrupted["result"] = product.podman.exec_bash(host.target_name, retry_script, check=False)
+        # The interruption is what ends this call, but the budget still has to be
+        # the migration one: the default probe timeout would cut the payload at
+        # 300 s and the case would report its own deadline as a resume failure.
+        interrupted["result"] = product.podman.exec_bash(
+            host.target_name, retry_script, check=False,
+            timeout=WORKER_MIGRATION_TIMEOUT_ONE_RUN_SECONDS,
+        )
 
     thread = threading.Thread(target=run_retry, daemon=True)
     thread.start()

@@ -74,6 +74,9 @@ sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
 | `--artifact-root` | `artifacts/podman-e2e` | Directory the run's own run directory is created under. |
 | `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `6300` (Multi-Node), `4500` (Panel-only) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
 | `--all-distributions` | off | Run the selected suite concurrently on all four pinned distributions, each in its own run directory; the exit status is `0` only if every cell passes and left a `PASS` result. |
+| `--only CASE[,CASE...]` | every declared case | Run only the named cases, in the suite's declared order. An id the suite does not declare exits `2` before any container is created (also honoured by each cell of `--all-distributions`). |
+| `--keep` | off | Leave the run's hosts, network, volumes and run directory in place and print the run id and how to reuse it. Nothing else about the verdict changes. |
+| `--reuse RUN_ID` | — | Adopt a kept run instead of installing again. The per-run plan, fixture resolver and secrets live only in the memory of the process that made them, so a kept cell that no longer carries them is refused with the missing part named — never reinstalled under the name of reuse. A build that carries them records `reused: true` and the source run id in its own artifacts. |
 | `--require-group` | — | Fail the run unless every case id of a declared group was present and passed. Today the only group is `recovery`. |
 
 Exit status is `0` only when `result.json` says `overall: PASS`; every other

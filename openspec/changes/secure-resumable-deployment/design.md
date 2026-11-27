@@ -154,6 +154,44 @@ In GitHub Actions, use a four-distribution matrix for each of the five existing 
 
 Locally, provide one entry point to start the four distributions concurrently for a selected suite and report each result and the aggregate exit status. Serialize only the Podman subnet discovery and reservation (through creation of both networks), not the suites; make the pool accommodate four isolated runs and release only resources owned by that run. Keep independent run directories and prove non-overlapping assigned subnets and separate cleanup. Exercise the real package selection in disposable hosts, plus targeted deterministic tests for fallback and refusal.
 
+### 11. Harness operability
+
+A suite that costs an hour per hypothesis spends its own budget on the harness.
+Five properties keep that cost visible and small.
+
+**A compact summary beside the verdict.** `result.json` carries every case's
+metadata and is large; a person and an agent read counts, non-PASS ids and the
+first line of each message. Write `summary.json` (mode 0644) next to it with the
+run id, topology, distribution, `overall`, the status counts, and one entry per
+non-PASS case with its status and a bounded message. The diagnostic bundle stays
+root-owned: it holds host state, not a verdict.
+
+**A status command instead of a poll.** `tools/podman_e2e/status.py` answers "what
+is running and where is it" in one line per cell: topology, distribution,
+elapsed, the step the child command names, the count of diagnostic bundles and
+whether a verdict exists. It reads the process tree and the artifact directory,
+because a rootful run is invisible to an unprivileged `podman ps`.
+
+**Selection and reuse.** `--only CASE[,CASE...]` runs a subset of the suite in
+the order the suite declares, and `--keep` leaves the run's hosts, network,
+volumes and run directory in place. `--reuse RUN_ID` adopts a kept cell only if
+everything that run needs is still there; the per-run plan, fixture resolver and
+secrets live in the memory of the process that made them, so a cell whose setup
+is gone is refused with the missing part named rather than reinstalled under the
+name of reuse. The artifact contract for an adopted run is already written and
+tested (`reused: true` plus the source run id), so closing that gap later changes
+no format. A run records the cases it executed, so a selected run is never
+mistaken for a full suite.
+
+**Timeouts are declared, not defaulted.** A step that re-provisions a host needs
+the migration budget; the default exec timeout silently truncates it and the
+case reports its own timeout. A test requires every re-provisioning step to pass
+an explicit budget.
+
+**Declared numbers have one home.** Budgets, deadlines and tier totals live in
+the matrix manifest; tests and documentation read them from there instead of
+repeating literals, so raising a budget is one edit and not a hunt.
+
 ## Risks / Trade-offs
 
 - Existing permissive firewall environments can now fail preflight -> show exact conflict and preserve their rules; never reset them automatically.

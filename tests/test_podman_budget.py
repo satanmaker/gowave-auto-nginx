@@ -12,6 +12,7 @@ runs, and the probe's report is refused when any of the facts it demonstrates
 goes missing.
 """
 import contextlib
+import copy
 import inspect
 import io
 import json
@@ -31,6 +32,17 @@ from tools.podman_e2e import budget, matrix, podman as podman_module  # noqa: E4
 from tools.podman_e2e.runner import BudgetExhausted, RunContext  # noqa: E402
 
 
+def declared_aio():
+    """The AIO deadline the manifest declares, for a test that needs a number.
+
+    The numbers are the manifest's, not this file's: restating one here would
+    make a manifest edit pass while the copy stayed behind. The published copies
+    in ``docs/PODMAN_E2E.md`` are checked against the same declaration in
+    ``test_podman_docs``.
+    """
+    return matrix.runtime_budget_seconds(matrix.load(), "aio")
+
+
 class TestDeclaredBudget(unittest.TestCase):
     """The manifest's numbers, read out of it rather than restated."""
 
@@ -38,8 +50,22 @@ class TestDeclaredBudget(unittest.TestCase):
         self.data = matrix.load()
 
     def test_each_topology_declares_its_own_deadline(self):
-        self.assertEqual(matrix.runtime_budget_seconds(self.data, "aio"), 2700)
-        self.assertEqual(matrix.runtime_budget_seconds(self.data, "multi-node"), 6300)
+        declared = {
+            name: matrix.runtime_budget_seconds(self.data, name)
+            for name in run_podman_e2e.TOPOLOGIES
+        }
+        for name, seconds in declared.items():
+            with self.subTest(topology=name):
+                self.assertIs(type(seconds), int)
+                self.assertGreater(seconds, 0)
+        # One topology's declaration is its own: raising it must not move the
+        # deadline any other topology runs under.
+        raised = copy.deepcopy(self.data)
+        raised["topologies"]["aio"]["runtime_budget_seconds"] = declared["aio"] + 1
+        self.assertEqual(matrix.runtime_budget_seconds(raised, "aio"), declared["aio"] + 1)
+        for name in run_podman_e2e.TOPOLOGIES:
+            if name != "aio":
+                self.assertEqual(matrix.runtime_budget_seconds(raised, name), declared[name])
 
     def test_the_case_reads_the_same_declaration(self):
         for topology in run_podman_e2e.TOPOLOGIES:
@@ -55,8 +81,13 @@ class TestDeclaredBudget(unittest.TestCase):
             matrix.runtime_budget_seconds(doctored, "aio")
 
     def test_the_tier_totals_are_read_from_the_same_block(self):
-        self.assertEqual(matrix.tier_budget_seconds(self.data, "pre_push"), 9600)
-        self.assertEqual(matrix.tier_budget_seconds(self.data, "pr"), 12600)
+        for tier in ("pre_push", "pr", "nightly"):
+            with self.subTest(tier=tier):
+                self.assertEqual(
+                    matrix.tier_budget_seconds(self.data, tier),
+                    self.data["runtime_budget"][f"{tier}_total_seconds"],
+                    "the tier is read from the block that declares it",
+                )
         self.assertEqual(self.data["runtime_budget"]["on_exhaustion"], "INCOMPLETE")
 
     def test_the_pre_push_total_covers_every_gated_topology(self):
@@ -90,10 +121,11 @@ class TestBudgetCase(unittest.TestCase):
         )
 
     def test_the_case_passes_inside_the_declared_envelope(self):
-        context = self.context(budget.declared("aio"))
+        declared = declared_aio()
+        context = self.context(declared)
         evidence = budget.case_budget(context)
-        self.assertEqual(evidence["declared_budget_seconds"], 2700)
-        self.assertEqual(evidence["enforced_budget_seconds"], 2700)
+        self.assertEqual(evidence["declared_budget_seconds"], declared)
+        self.assertEqual(evidence["enforced_budget_seconds"], declared)
         self.assertLessEqual(evidence["elapsed_seconds"], evidence["enforced_budget_seconds"])
         self.assertEqual(evidence["probe_overall"], "INCOMPLETE")
         self.assertNotEqual(evidence["probe_exit_status"], 0)
@@ -119,9 +151,10 @@ class TestBudgetCase(unittest.TestCase):
         )
 
     def test_a_widened_deadline_fails_the_case(self):
+        declared = declared_aio()
         with self.assertRaises(AssertionError) as caught:
-            budget.case_budget(self.context(2701))
-        self.assertIn("outside the 2700s", str(caught.exception))
+            budget.case_budget(self.context(declared + 1))
+        self.assertIn(f"outside the {declared}s", str(caught.exception))
         self.assertIn("cannot claim", str(caught.exception))
 
     def test_a_run_with_no_budget_cannot_pass_the_case(self):
@@ -139,25 +172,25 @@ class TestBudgetCase(unittest.TestCase):
     def test_the_case_refuses_a_probe_that_exited_zero(self):
         with mock.patch.object(budget, "probe", return_value=self.probe_with(exit_status=0)):
             with self.assertRaises(AssertionError) as caught:
-                budget.case_budget(self.context(2700))
+                budget.case_budget(self.context(declared_aio()))
         self.assertIn("must not exit 0", str(caught.exception))
 
     def test_the_case_refuses_a_probe_that_reported_pass(self):
         with mock.patch.object(budget, "probe", return_value=self.probe_with(overall="PASS")):
             with self.assertRaises(AssertionError) as caught:
-                budget.case_budget(self.context(2700))
+                budget.case_budget(self.context(declared_aio()))
         self.assertIn("not 'INCOMPLETE'", str(caught.exception))
 
     def test_the_case_refuses_a_dropped_case(self):
         with mock.patch.object(budget, "probe", return_value=self.probe_with(case_count=0)):
             with self.assertRaises(AssertionError) as caught:
-                budget.case_budget(self.context(2700))
+                budget.case_budget(self.context(declared_aio()))
         self.assertIn("truncated pass", str(caught.exception))
 
     def test_the_case_refuses_a_case_that_does_not_say_why_it_did_not_run(self):
         with mock.patch.object(budget, "probe", return_value=self.probe_with(case_message="")):
             with self.assertRaises(AssertionError) as caught:
-                budget.case_budget(self.context(2700))
+                budget.case_budget(self.context(declared_aio()))
         self.assertIn("does not name why it did not run", str(caught.exception))
 
 
@@ -202,20 +235,22 @@ class TestEntrypointBudget(unittest.TestCase):
         return status, stdout.getvalue(), stderr.getvalue(), seen
 
     def test_the_deadline_is_the_one_the_manifest_declares(self):
-        for topology, declared in (("aio", 2700), ("multi-node", 6300)):
+        for topology in ("aio", "multi-node"):
             with self.subTest(topology=topology):
+                declared = matrix.runtime_budget_seconds(matrix.load(), topology)
                 status, _out, _err, seen = self.main(["--topology", topology])
                 self.assertEqual(status, 0)
                 self.assertEqual(seen["budget_seconds"], declared)
 
     def test_a_widened_override_is_refused_before_anything_runs(self):
         with self.assertRaises(SystemExit) as caught:
-            self.main(["--topology", "aio", "--budget-seconds", "7200"])
+            self.main(["--topology", "aio", "--budget-seconds", str(declared_aio() + 1)])
         self.assertEqual(caught.exception.code, 2)
 
     def test_a_tightened_override_reaches_the_run(self):
         status, _out, _err, seen = self.main(["--topology", "aio", "--budget-seconds", "60"])
         self.assertEqual(status, 0)
+        self.assertLess(60, declared_aio(), "the tightened value has to be a tightening")
         self.assertEqual(seen["budget_seconds"], 60)
 
 
