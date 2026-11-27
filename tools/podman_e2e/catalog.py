@@ -980,7 +980,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     {
         "id": "FW-07",
         "requirement": "Security and network isolation verification",
-        "assertion": "Re-applying the Worker's firewall policy does not cut the control path it runs over: an established multiplexed SSH session from the Master answers `-O check` after the Worker's policy is re-applied over that same session, and the Worker's SSH unit is still active. A refusal that tears the session down, or a session that survives while the transport underneath is dead, fails the case — a fresh login is not evidence, because the policy allows the Master.",
+        "assertion": "Reloading the Worker's firewall ruleset does not cut the control path it runs over: an established multiplexed SSH session from the Master answers `-O check` after the Worker's own ruleset is reloaded from that same session, and the Worker's SSH unit is still active. A refusal that tears the session down, or a session that survives while the transport underneath is dead, fails the case — a fresh login is not evidence, because the policy allows the Master.",
         "topology": ["multi-node"],
         "promotion_target": "Security and network isolation verification",
     },

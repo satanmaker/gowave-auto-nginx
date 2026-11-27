@@ -515,7 +515,7 @@ behaviors:
       readings unchanged after the unit a boot runs re-applies the files. Two
       events that would silently undo the policy are measured too: a firewall
       reload and a web-server reload/restart leave the rule sets and listeners
-      byte-identical, and re-applying the Worker's policy over an established
+      byte-identical, and reloading the Worker's own ruleset from an established
       control session leaves that session alive instead of cutting it.
     topology: [aio, multi-node]
     gate: pre-push

@@ -9537,12 +9537,12 @@ cases:
 - id: FW-07
   requirement: Security and network isolation verification
   live_scenario: null
-  assertion: 'Re-applying the Worker''s firewall policy does not cut the control path it runs over: an
-    established multiplexed SSH session from the Master answers `-O check` after the Worker''s policy
-    is re-applied over that same session, and the Worker''s SSH unit is still active. A refusal that tears
+  assertion: 'Reloading the Worker''s firewall ruleset does not cut the control path it runs over: an
+    established multiplexed SSH session from the Master answers `-O check` after the Worker''s own ruleset
+    is reloaded from that same session, and the Worker''s SSH unit is still active. A refusal that tears
     the session down, or a session that survives while the transport underneath is dead, fails the case
     — a fresh login is not evidence, because the policy allows the Master.'
-  assertion_sha256: 09005449fdf2ba67988ea3a548af52320fd3d6702ff394516ef4ec49d1413461
+  assertion_sha256: 35d465f834a453cbd0ff0c0673219012f3ce478c0004458c3fc257941c856ac1
   runs_in:
   - podman
   state: incubating

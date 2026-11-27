@@ -8726,6 +8726,7 @@ def describe_security(security: Dict[str, Any]) -> str:
     controls = report.get("controls") or {}
     broken = [
         f"{name}={control.get('status')}"
+        + (f"/{control.get('reason_code')}" if control.get("reason_code") else "")
         + (f"/recovery={control.get('recovery')}" if control.get("recovery") not in (None, "verified") else "")
         for name, control in sorted(controls.items())
         if control.get("policy") == "required" and control.get("status") != "verified"
@@ -8735,7 +8736,12 @@ def describe_security(security: Dict[str, Any]) -> str:
             and control.get("recovery") != "verified")
     ]
     detail = ", ".join(broken) if broken else "no control reported a failure"
-    return f"{security.get('ready')!r} ({detail}) {(security.get('error') or '')[:300]}".strip()
+    # The age of the report is part of the answer: a verdict read while the
+    # product is rewriting the report describes a moment, not a host, so the
+    # message says when the report it judged was written.
+    generated = report.get("generated_at") or report.get("generatedAt")
+    age = f", report written {generated}" if generated else ""
+    return f"{security.get('ready')!r} ({detail}{age}) {(security.get('error') or '')[:300]}".strip()
 
 
 def verify_worker_security_readback_via_ssh(

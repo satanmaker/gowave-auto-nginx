@@ -103,11 +103,15 @@ def case_ssh_survives_firewall(product: Any) -> Dict[str, Any]:
         # The same policy the installer applies, run over the transport the
         # session uses: if the mutation closed it, this call dies with the
         # connection rather than returning a refusal.
+        # The mutation is `ufw reload`: it re-reads the host's own ruleset and
+        # reinstalls the chains, which is what every production change to the
+        # policy ends in. It deliberately adds no rule — a case that injected an
+        # unmanaged allow would leave the host's own security report calling the
+        # firewall failed afterwards, which is a defect in the case, not in the
+        # product.
         reapplied = product.podman.exec_bash(
             master,
-            f"ssh -o ControlPath={control} root@{worker} "
-            "'ufw allow from 10.0.0.0/8 to any port 22 proto tcp >/dev/null 2>&1; "
-            "ufw reload'",
+            f"ssh -o ControlPath={control} root@{worker} 'ufw reload'",
             check=False, timeout=180,
         )
         require(case_id, reapplied.returncode == 0,
@@ -134,4 +138,4 @@ def case_ssh_survives_firewall(product: Any) -> Dict[str, Any]:
             master, f"ssh -o ControlPath={control} -O exit root@{worker} 2>/dev/null; true",
             check=False, timeout=30,
         )
-    return {"session": "survived", "mutation": "firewall reload over the session"}
+    return {"session": "survived", "mutation": "ruleset reload over the session"}
