@@ -38,6 +38,7 @@ SUITES = {
         "test_dot_policy.TestDotPolicyWrapper",
         "test_dot_policy.TestDotPolicyDocumentation",
         "test_podman_ingress_matrix.TestNodeApiGaps",
+        "test_podman_firewall_runtime.TestFirewallRuntimeCases",
         "test_podman_ingress_matrix.TestIpv6Mirror",
         "test_podman_ingress_matrix.TestDeclaredPolicy",
         "test_podman_ingress_matrix.TestReload",

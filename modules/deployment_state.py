@@ -10,6 +10,7 @@ standard output, so no secret and no answer travels through `argv`:
     --save --expected-revision print the draft that replaced revision N
     --plan [--reviewed]        write an accepted plan, keeping checkpoints
     --checkpoint IDENTITY      merge one checkpoint and print it
+    --expectation IDENTITY     print what one checkpoint recorded, for a resume
     --discard                  forget the draft; absent draft is still success
 
 Exit codes are the same in every mode: 0 success, 1 rejected input, 3 no
@@ -317,6 +318,39 @@ def _plan_fields(document, stored):
     }
 
 
+def checkpoint_expectation(document, identity):
+    """What one checkpoint recorded, as a resume reconciles it.
+
+    The document is the draft the interrupted run left, so every field here is
+    something that run accepted or observed. The plan answers name the domains a
+    node owns and the label the Panel registered; the checkpoint supplies the
+    identities the Panel issued. Nothing is filled in from the live Panel: a
+    resume compares this answer with the Panel's, and inventing an expectation
+    from the answer would make every comparison pass.
+    """
+    if identity not in {'panel', 'local-node'} | document['nodes'].keys():
+        raise StateError('unknown checkpoint identity')
+    checkpoint = document['checkpoints'].get(identity)
+    if checkpoint is None:
+        raise StateError('checkpoint is absent')
+    kind = 'panel' if identity == 'panel' else ('local-node' if identity == 'local-node' else 'node')
+    recorded = {key: checkpoint[key] for key in ('state', 'stage', 'attempt')}
+    for key in ('node_uuid', 'profile_uuid', 'host_uuids', 'reason_code', 'recovery'):
+        if key in checkpoint:
+            recorded[key] = checkpoint[key]
+    recorded['installer_revision'] = document['installer_revision']
+    answers = document['nodes'].get(identity, {}) if kind == 'node' else document['answers']
+    if answers.get('name'):
+        recorded['node_name'] = answers['name']
+    domains = [
+        answers[key] for key in ('primary_domain', 'reality_domain', 'vision_domain')
+        if answers.get(key)
+    ]
+    if domains:
+        recorded['host_domains'] = list(dict.fromkeys(domains))
+    return {'component': identity, 'kind': kind, 'recorded': recorded}
+
+
 def _checkpoint_update(stored, identity, update):
     if stored is None:
         raise FileNotFoundError('no deployment draft to checkpoint')
@@ -340,6 +374,8 @@ def main(argv=None):
     modes.add_argument('--save', action='store_true', help='replace the draft with the document on stdin')
     modes.add_argument('--plan', action='store_true', help='write the plan document on stdin as the draft')
     modes.add_argument('--checkpoint', metavar='IDENTITY', help='merge the checkpoint on stdin')
+    modes.add_argument('--expectation', metavar='IDENTITY',
+                       help='print what one checkpoint recorded, for a resume')
     modes.add_argument('--discard', action='store_true', help='remove the draft')
     parser.add_argument('--expected-revision', type=int, default=None, help='revision the caller last read')
     parser.add_argument('--reviewed', action='store_true', help='mark the plan as authorized by the operator')
@@ -368,6 +404,11 @@ def main(argv=None):
             stored = store.load()
             document = _checkpoint_update(stored, arguments.checkpoint, _read_document())
             _write_document(store.save(document, expected_revision=stored['revision']))
+        elif arguments.expectation is not None:
+            document = store.load()
+            if document is None:
+                raise FileNotFoundError('no deployment draft to reconcile')
+            _write_document(checkpoint_expectation(document, arguments.expectation))
         else:
             store.discard()
     except FileNotFoundError as exc:

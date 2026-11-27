@@ -325,6 +325,30 @@ class PanelOnlyProduct(aio.AioProduct):
         record.update(self.require_panel_version())
         return record
 
+    def adopt(
+        self, host: "topology.PanelOnlyTopology", source_run_id: str = "",
+        worker_registered: bool = False,
+    ) -> None:
+        """Attach a kept run's Panel host instead of installing one.
+
+        The registration is tracked separately from the install because this mode
+        has no local node: the Worker arrives through the operator's own command,
+        and a cell that never ran it leaves the cases that need one blocked rather
+        than pretending a Worker was provisioned.
+        """
+        super().adopt(host, source_run_id)
+        if worker_registered:
+            self.node_add_outcome = topology.InstallOutcome(
+                returncode=0,
+                stdout="",
+                stderr="",
+                duration=0.0,
+                command=(
+                    f"adopted from run {source_run_id}" if source_run_id
+                    else "adopted kept registration"
+                ),
+            )
+
     def require_panel_version(self) -> Dict[str, str]:
         """The Panel reports the version this deployment configured.
 
@@ -918,15 +942,25 @@ def case_add_node_refused(product: PanelOnlyProduct) -> Dict[str, Any]:
     }
 
 
-def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
+def cases(
+    podman: Any, distribution: str = "ubuntu-24.04",
+    adopted: Optional[topology.PanelOnlyTopology] = None, source_run_id: str = "",
+    worker_registered: bool = False,
+) -> List[Case]:
     """The Panel-only suite in run order.
 
     The install owns the host; every later case reuses it. The registration runs
     once, after the two read-only shapes, because it is what adds API state to
     the host the API shape case measures, and the negative reads the records the
     positive created rather than provisioning a second Worker.
+
+    ``adopted`` is a kept run's host rebuilt from its setup record. The install
+    and the registration stay declared, and an adopting run refuses to select
+    them: both provision, and the flag exists to avoid exactly that.
     """
     product = PanelOnlyProduct(podman, distribution)
+    if adopted is not None:
+        product.adopt(adopted, source_run_id, worker_registered=worker_registered)
     return [
         Case(INSTALL_CASE_ID, "panel-only", lambda context: product.install(),
              timeout_seconds=INSTALL_TIMEOUT_SECONDS),

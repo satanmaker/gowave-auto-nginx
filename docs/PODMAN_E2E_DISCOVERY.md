@@ -208,9 +208,9 @@ creating a second one.
 | --- | --- | --- | --- |
 | authentication | `POST /api/auth/register` | `internal/server/server.go:514` | `modules/api_client.py:425` `register_initial_admin` |
 | authentication | `POST /api/auth/login` | `internal/server/server.go:513` | `modules/api_client.py:437` `login` |
-| authentication | `POST /api/tokens` | `internal/server/server.go:534` | `modules/api_client.py:998` `issue_api_token` |
-| authentication | `GET /api/tokens` | `internal/server/server.go:533` | `modules/api_client.py:1022` `ensure_api_token` |
-| authentication | `DELETE /api/tokens/{uuid}` | `internal/server/server.go:535` | `modules/api_client.py:1007` `delete_token` |
+| authentication | `POST /api/tokens` | `internal/server/server.go:534` | `modules/api_client.py:1008` `issue_api_token` |
+| authentication | `GET /api/tokens` | `internal/server/server.go:533` | `modules/api_client.py:1032` `ensure_api_token` |
+| authentication | `DELETE /api/tokens/{uuid}` | `internal/server/server.go:535` | `modules/api_client.py:1017` `delete_token` |
 
 **Node registration.** The node record and its REALITY key material are made
 through the Panel, which is why `AIO-INSTALL`, `AIO-IDEMPOTENT` and `MN-INSTALL`
@@ -221,10 +221,10 @@ provisions the Worker.
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
 | node registration | `GET /api/system/tools/x25519/generate` | `internal/stubs/stubs.go:218` | `modules/api_client.py:448` `generate_x25519` |
-| node registration | `GET /api/nodes` | `internal/server/server.go:590` | `modules/api_client.py:716` `associate_node` |
-| node registration | `POST /api/nodes` | `internal/server/server.go:593` | `modules/api_client.py:767` `associate_node` |
-| node registration | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:724` `associate_node` |
-| node registration | `DELETE /api/nodes/{uuid}` | `internal/server/server.go:600` | `modules/api_client.py:1060` `delete_node` |
+| node registration | `GET /api/nodes` | `internal/server/server.go:590` | `modules/api_client.py:726` `associate_node` |
+| node registration | `POST /api/nodes` | `internal/server/server.go:593` | `modules/api_client.py:777` `associate_node` |
+| node registration | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:734` `associate_node` |
+| node registration | `DELETE /api/nodes/{uuid}` | `internal/server/server.go:600` | `modules/api_client.py:1070` `delete_node` |
 
 **Provisioning.** Hosts, internal squads and config profiles are the Panel
 objects an install creates before a client can be served: the host record links
@@ -236,19 +236,19 @@ through `rollback_provisioning`.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| provisioning | `GET /api/hosts` | `internal/server/server.go:612` | `modules/api_client.py:809` `provision_hosts` |
-| provisioning | `POST /api/hosts` | `internal/server/server.go:613` | `modules/api_client.py:874` `provision_hosts` |
-| provisioning | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:871` `provision_hosts` |
-| provisioning | `DELETE /api/hosts/{uuid}` | `internal/server/server.go:616` | `modules/api_client.py:1044` `delete_host` |
-| provisioning | `GET /api/internal-squads` | `internal/server/server.go:638` | `modules/api_client.py:776` `provision_internal_squad` |
-| provisioning | `POST /api/internal-squads` | `internal/server/server.go:639` | `modules/api_client.py:795` `provision_internal_squad` |
-| provisioning | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:792` `provision_internal_squad` |
-| provisioning | `DELETE /api/internal-squads/{uuid}` | `internal/server/server.go:642` | `modules/api_client.py:1052` `delete_internal_squad` |
+| provisioning | `GET /api/hosts` | `internal/server/server.go:612` | `modules/api_client.py:819` `provision_hosts` |
+| provisioning | `POST /api/hosts` | `internal/server/server.go:613` | `modules/api_client.py:884` `provision_hosts` |
+| provisioning | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:881` `provision_hosts` |
+| provisioning | `DELETE /api/hosts/{uuid}` | `internal/server/server.go:616` | `modules/api_client.py:1054` `delete_host` |
+| provisioning | `GET /api/internal-squads` | `internal/server/server.go:638` | `modules/api_client.py:786` `provision_internal_squad` |
+| provisioning | `POST /api/internal-squads` | `internal/server/server.go:639` | `modules/api_client.py:805` `provision_internal_squad` |
+| provisioning | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:802` `provision_internal_squad` |
+| provisioning | `DELETE /api/internal-squads/{uuid}` | `internal/server/server.go:642` | `modules/api_client.py:1062` `delete_internal_squad` |
 | provisioning | `GET /api/config-profiles` | `internal/server/server.go:628` | `modules/api_client.py:604` `provision_config_profile` |
 | provisioning | `POST /api/config-profiles` | `internal/server/server.go:629` | `modules/api_client.py:626` `provision_config_profile` |
 | provisioning | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:622` `provision_config_profile` |
-| provisioning | `DELETE /api/config-profiles/{uuid}` | `internal/server/server.go:633` | `modules/api_client.py:1068` `delete_config_profile` |
-| provisioning | `GET /api/config-profiles/{uuid}/inbounds` | `internal/server/server.go:635` | `modules/api_client.py:649` `provision_config_profile` |
+| provisioning | `DELETE /api/config-profiles/{uuid}` | `internal/server/server.go:633` | `modules/api_client.py:1078` `delete_config_profile` |
+| provisioning | `GET /api/config-profiles/{uuid}/inbounds` | `internal/server/server.go:635` | `modules/api_client.py:659` `provision_config_profile` |
 | provisioning | `GET /api/config-profiles/{uuid}/computed-config` | `internal/server/server.go:636` | `modules/api_client.py:632` `provision_config_profile` |
 
 **Client lifecycle.** A client is a Panel user with a subscription: `AIO-CLIENT`
@@ -259,9 +259,9 @@ duplicating it.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| client lifecycle | `POST /api/users` | `internal/server/server.go:554` | `modules/api_client.py:941` `provision_user` |
-| client lifecycle | `GET /api/users/by-username/{username}` | `internal/server/server.go:581` | `modules/api_client.py:920` `provision_user` |
-| client lifecycle | `DELETE /api/users/{userId}` | `internal/server/server.go:579` | `modules/api_client.py:1036` `delete_user` |
+| client lifecycle | `POST /api/users` | `internal/server/server.go:554` | `modules/api_client.py:951` `provision_user` |
+| client lifecycle | `GET /api/users/by-username/{username}` | `internal/server/server.go:581` | `modules/api_client.py:930` `provision_user` |
+| client lifecycle | `DELETE /api/users/{userId}` | `internal/server/server.go:579` | `modules/api_client.py:1046` `delete_user` |
 
 **Update operations.** The pinned Panel exposes an update for every object an
 install creates, and the suite drives the configuration one: the journal writes
@@ -272,12 +272,12 @@ API-04's `configuration update` is that path.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| update | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:1380` `rollback_provisioning` |
-| update | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:1382` `rollback_provisioning` |
-| update | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:1384` `rollback_provisioning` |
-| update | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:1386` `rollback_provisioning` |
+| update | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:1574` `rollback_provisioning` |
+| update | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:1576` `rollback_provisioning` |
+| update | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:1578` `rollback_provisioning` |
+| update | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:1580` `rollback_provisioning` |
 | update | `PATCH /api/users` | `internal/server/server.go:555` | none — coverage gap, not `NOT_APPLICABLE` |
-| update | `PATCH /api/users/{userId}` | `internal/server/server.go:578` | `modules/api_client.py:980` `attach_squad_to_user`, `modules/api_client.py:1388` `rollback_provisioning` |
+| update | `PATCH /api/users/{userId}` | `internal/server/server.go:578` | `modules/api_client.py:990` `attach_squad_to_user`, `modules/api_client.py:1582` `rollback_provisioning` |
 
 **Subscription contracts.** A subscription is fetched without a token, by short
 UUID, so the route is the contract: one path per representation, the
@@ -902,16 +902,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 259 entries:
+than a sentence in a document. The catalog holds 262 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 245 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 248 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 12 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run prints both as justified exclusions and records them in `result.json` as `environment.justified_exclusions`, each carrying the catalog's own limitation; `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here, or that leaves one without a written reason. |
 
 Of the 125 live scenarios projected into this catalog, 111 are container, 12 are
-partial and 2 are live-only; the other 134 entries are Podman-first cases with a
+partial and 2 are live-only; the other 137 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately. That file also
 answers per scenario rather than per group: one row names the live scenario, the
 catalog case that covers it, the environment classification and the gate that

@@ -5,6 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANAGED_SECURITY_PY="${SCRIPT_DIR}/assets/security/managed.py"
 source "${SCRIPT_DIR}/modules/firewall.sh"
+source "${SCRIPT_DIR}/modules/tempdir.sh"
 
 configure_ssh_and_fail2ban() {
     echo "Configuring non-destructive SSH inspection and Fail2ban..."
@@ -435,58 +436,84 @@ EOF
 
 # Aggregate Worker security reports onto the Master.
 #
-# After all Workers are onboarded and verified, this function fetches each
-# Worker's effective-state security report via trusted SSH, validates it, and
-# writes a combined aggregate report on the Master. The aggregate includes the
-# Master's own report plus one entry per Worker, keyed by the Worker's
-# planned host name. A Worker whose report cannot be fetched or is stale/
-# invalid is recorded with a failed status so the operator sees the gap.
+# After all Workers are onboarded and verified, this function reads each
+# host's effective-state security report and writes one aggregate document on
+# the Master. The Master re-reads itself when its stored report is older than
+# the freshness window; a Worker answers a fresh readback over the existing
+# trusted SSH channel. Every report is checked against its own timestamp, and
+# one stale host refuses the whole aggregate instead of letting it ride on its
+# siblings' freshness — the refusal names the host and its age. A Worker that
+# could not be read at all is kept as an explicit `fetch_failed` entry so the
+# gap stays visible, and the aggregate verdict is the weakest of its hosts.
+#
+# Reading an existing report never rewrites it. A rerun replaces the aggregate
+# atomically (private temp sibling, fsync, rename, directory sync), so a reader
+# sees the previous document or the new one, never a patched mixture.
 #
 # Args: none (reads GOWAVE_PLAN_* arrays, GOWAVE_SSH_* vars, MANAGED_SECURITY_PY,
 #       GOWAVE_STATE_DIR for the state directory)
-# Returns 0 on success, 1 if any required Worker report is missing or invalid.
+# Returns 0 when every host is ready or ready-with-warnings, 1 otherwise.
 aggregate_worker_security_reports() {
-    local i host report rc=0
     local state_dir="${GOWAVE_STATE_DIR:-/var/lib/gowave-auto-nginx}"
-    local master_report_path="${state_dir}/security-report.json"
-    local aggregate_report=""
+    local master_path="${state_dir}/security-report.json"
+    local aggregate_path="${state_dir}/security-report-aggregate.json"
+    local owner_uid
+    owner_uid=$(id -u) || return 1
 
-    # First, load the Master's own report
-    if [[ ! -f "$master_report_path" ]]; then
-        echo "Error: Master security report not found at $master_report_path" >&2
+    if [[ ! -f "$master_path" ]]; then
+        echo "Error: Master security report not found at $master_path" >&2
         return 1
     fi
-    local master_report
-    master_report=$(cat "$master_report_path") || return 1
 
-    # Build the aggregate structure
-    aggregate_report=$(python3 -c 'import json, sys
-master = json.load(sys.stdin)
-print(json.dumps({"schema_version": 1,
-                  "master": master,
-                  "workers": {},
-                  "observed_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()}))' <<< "$master_report") || return 1
-
-    # No Workers to aggregate? Still write the aggregate with empty workers.
-    if [[ "${#GOWAVE_PLAN_NODE_NAMES[@]}" -eq 0 ]]; then
-        local agg_path="${state_dir}/security-report-aggregate.json"
-        local agg_dir
-        agg_dir=$(dirname "$agg_path")
-        mkdir -p "$agg_dir" && chmod 0700 "$agg_dir"
-        printf '%s\n' "$aggregate_report" > "$agg_path.tmp" && mv "$agg_path.tmp" "$agg_path" && chmod 0600 "$agg_path"
-        echo "Security report aggregate written (no Workers planned)."
-        return 0
+    # A stored report outside the freshness window is not evidence for this
+    # moment. Regenerate it from effective state before combining, rather than
+    # presenting an old Master readback next to fresh Worker ones. A report
+    # inside the window is used as it is; --check only reads it.
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m modules.security_report --check --path "$master_path" --owner-uid "$owner_uid" >/dev/null; then
+        local master_role node_port=""
+        master_role=$(python3 -c 'import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+role = report.get("role")
+if role not in {"aio", "panel-only"}:
+    sys.exit(1)
+print(role)' "$master_path" 2>/dev/null) || {
+            echo "Error: the Master security report at $master_path is stale and its role cannot be read for a fresh readback." >&2
+            return 1
+        }
+        if [[ "$master_role" == "aio" ]]; then
+            node_port=3002
+        fi
+        echo "Refreshing the Master security report: the recorded one is outside the freshness window."
+        write_security_report "$master_role" "$node_port" "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || {
+            echo "Error: the Master security report could not be refreshed; no aggregate was written." >&2
+            return 1
+        }
     fi
 
+    local workdir
+    workdir=$(mktemp -d) || return 1
+    track_temp_dir "$workdir"
+    local rc=0 index=0 host entries='[]' request='' result
+
     local ipv4 ipv6 policy
-    ipv4=$(resolve_panel_ipv4) || return 1
-    ipv6=$(resolve_panel_ipv6) || return 1
+    if ! ipv4=$(resolve_panel_ipv4) || ! ipv6=$(resolve_panel_ipv6); then
+        release_temp_dir "$workdir"
+        return 1
+    fi
     policy="${GOWAVE_DOT_POLICY:-best-effort}"
 
-    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
-        host="${GOWAVE_PLAN_NODE_NAMES[$i]}"
-        local remote_command worker_report worker_rc=0
+    for host in "${GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        [[ -n "$host" ]] || continue
+        # The name-to-file mapping is recorded before the fetch: a Worker whose
+        # readback fails then appears as a present gap, not as a missing row.
+        entries=$(python3 -c 'import json, sys
+entries = json.load(sys.stdin)
+entries.append({"name": sys.argv[1], "file": sys.argv[2]})
+print(json.dumps(entries))' "$host" "$index.json" <<< "$entries") || { rc=1; index=$((index + 1)); continue; }
 
+        local remote_command worker_report
         remote_command=$(python3 -c 'import ipaddress, shlex, sys
 port, v4, v6, policy = sys.argv[1:]
 if (not v4 or ipaddress.ip_address(v4).version != 4
@@ -494,61 +521,42 @@ if (not v4 or ipaddress.ip_address(v4).version != 4
         or policy not in {"off", "best-effort", "required"}):
     sys.exit(1)
 print(shlex.join(["python3", "-", "--worker-security-readback", port, v4, v6, policy]))' \
-            "$GOWAVE_SSH_NODE_PORT" "$ipv4" "$ipv6" "$policy" 2>/dev/null) || { rc=1; continue; }
+            "$GOWAVE_SSH_NODE_PORT" "$ipv4" "$ipv6" "$policy" 2>/dev/null) || {
+            echo "Warning: cannot build a security readback command for Worker $host" >&2
+            rc=1
+            index=$((index + 1))
+            continue
+        }
 
         worker_report=$(timeout 45 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=5 -o ClearAllForwardings=yes -o ForwardAgent=no -o UpdateHostKeys=no \
             -p "${GOWAVE_SSH_PORT:-22}" -- "root@$host" "$remote_command" \
-            < "$MANAGED_SECURITY_PY" 2>/dev/null) || worker_rc=$?
-
-        if [[ "$worker_rc" -ne 0 ]]; then
-            echo "Warning: failed to fetch security report from Worker $host" >&2
-            aggregate_report=$(python3 -c 'import json, sys
-agg = json.load(sys.stdin)
-agg["workers"][sys.argv[1]] = {"status": "fetch_failed", "error": "SSH or helper execution failed"}
-print(json.dumps(agg))' "$host" <<< "$aggregate_report") || rc=1
+            < "$MANAGED_SECURITY_PY" 2>/dev/null) || {
+            echo "Warning: failed to fetch a security report from Worker $host" >&2
             rc=1
+            index=$((index + 1))
             continue
-        fi
-
-        # Validate the Worker report and add to aggregate
-        local validated
-        validated=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
-import json
-import sys
-from modules.security_report import StateError, validate
-
-try:
-    report = json.load(sys.stdin)
-    validate(report)
-    if report["role"] != "worker":
-        raise StateError("Worker report has non-worker role")
-    print(json.dumps({"status": "ok", "report": report}))
-except (StateError, ValueError, TypeError) as exc:
-    print(json.dumps({"status": "invalid", "error": str(exc)}))
-    sys.exit(1)
-' <<< "$worker_report") || { rc=1; continue; }
-
-        aggregate_report=$(python3 -c 'import json, sys
-agg = json.load(sys.stdin)
-worker_data = json.load(sys.stdin)
-agg["workers"][sys.argv[1]] = worker_data
-print(json.dumps(agg))' "$host" <<< "$aggregate_report" <<< "$validated") || rc=1
+        }
+        printf '%s' "$worker_report" > "$workdir/$index.json" || rc=1
+        index=$((index + 1))
     done
 
-    # Write the aggregate report atomically
-    local agg_path="${state_dir}/security-report-aggregate.json"
-    local agg_dir
-    agg_dir=$(dirname "$agg_path")
-    mkdir -p "$agg_dir" && chmod 0700 "$agg_dir"
-    local agg_tmp
-    agg_tmp=$(mktemp "${agg_path}.gowave.XXXXXX") || return 1
-    printf '%s\n' "$aggregate_report" > "$agg_tmp" || { rm -f "$agg_tmp"; return 1; }
-    chmod 0600 "$agg_tmp" || { rm -f "$agg_tmp"; return 1; }
-    sync "$agg_tmp" 2>/dev/null || true
-    mv -f "$agg_tmp" "$agg_path" || { rm -f "$agg_tmp"; return 1; }
-    sync "$agg_dir" 2>/dev/null || true
-
-    echo "Security report aggregate written to $agg_path"
-    return "$rc"
+    request=$(printf '{"workers": %s}' "$entries") || { release_temp_dir "$workdir"; return 1; }
+    # Validation, the weakest-host reduction and the atomic replacement all
+    # live in one place; this shell only carries the readbacks to it. The
+    # request holds paths and host names, never a report body on argv.
+    result=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m modules.security_report --aggregate --master "$master_path" \
+        --workers "$workdir" --path "$aggregate_path" --owner-uid "$owner_uid" \
+        <<< "$request") || rc=1
+    release_temp_dir "$workdir"
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Error: the security report aggregate was not written or names a host that is not ready." >&2
+        return 1
+    fi
+    echo "Security report aggregate written to $aggregate_path"
+    return 0
 }

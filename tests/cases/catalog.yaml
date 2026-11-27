@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 134
-  total: 259
+  podman_first: 137
+  total: 262
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -9509,6 +9509,82 @@ cases:
       - routes
       - vhost
   promotion_target: Distributed Worker VPS Deployment Verification
+- id: FW-08
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: 'A reload does not undo the managed ingress: with the policy applied, `ufw reload`, `systemctl
+    reload nginx` and a full restart of the web server leave the IPv4 and IPv6 rule sets and the listening
+    sockets byte-identical to the snapshot taken before them, so a certificate renewal cannot quietly
+    replace a managed policy with an unmanaged one. A reload that exits non-zero, or a rule set or listener
+    list that differs afterwards, fails the case.'
+  assertion_sha256: 8fda05fc7164f5698768175d754604013c8f26d42486bc683e2dff0495d6bcc8
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: firewall_runtime:case_rules_survive_reload
+      evidence:
+      - events
+      - listeners
+      - rules
+  promotion_target: Security and network isolation verification
+- id: FW-07
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: 'Re-applying the Worker''s firewall policy does not cut the control path it runs over: an
+    established multiplexed SSH session from the Master answers `-O check` after the Worker''s policy
+    is re-applied over that same session, and the Worker''s SSH unit is still active. A refusal that tears
+    the session down, or a session that survives while the transport underneath is dead, fails the case
+    — a fresh login is not evidence, because the policy allows the Master.'
+  assertion_sha256: 09005449fdf2ba67988ea3a548af52320fd3d6702ff394516ef4ec49d1413461
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: firewall_runtime:case_ssh_survives_firewall
+      evidence:
+      - mutation
+      - session
+  promotion_target: Security and network isolation verification
+- id: NGX-PIN
+  requirement: Independent Multi-Node acceptance topology
+  live_scenario: null
+  assertion: 'Both roles carry the approved NGINX installation and not the distribution build: `dpkg-query
+    -W nginx` on the Master and on the Worker reports exactly the suite-suffixed revision `1.30.8-1~<bookworm|trixie|noble|resolute>`,
+    `nginx -V` shows both a static `--with-stream` and `--with-stream_ssl_preread_module` so the Stream
+    SNI plane is really built in, and the host''s APT history holds the download of `nginx_1.30.8-1~<suite>_<arch>.deb`,
+    which the distribution archive cannot produce at that revision. A host left on its archive version,
+    a build without the Stream SNI module, or an install with no record of the approved package fails
+    the case instead of passing as configured.'
+  assertion_sha256: d2c324838e3c0d9bfa06960eedec90b2b26ef8835c892a313bbfc5606af21d22
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_nginx_pin
+      evidence:
+      - master
+      - suite
+      - worker
+  promotion_target: Independent Multi-Node acceptance topology
 - id: MN-WORKER-RESUME
   requirement: Distributed Worker VPS Deployment Verification
   live_scenario: null

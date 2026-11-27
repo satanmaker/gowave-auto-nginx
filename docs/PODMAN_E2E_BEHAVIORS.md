@@ -13,17 +13,17 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 44 across 9 areas, naming 259 of 259 catalog cases.
+Behaviours: 44 across 9 areas, naming 262 of 262 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
 | installation | 11 | 29 | 13 |
-| provisioning | 8 | 27 | 19 |
+| provisioning | 8 | 28 | 19 |
 | subscription-representations | 2 | 7 | 4 |
 | data-plane | 5 | 45 | 11 |
 | decoy | 2 | 8 | 2 |
 | tls-dns-acme | 5 | 7 | 9 |
-| network-policy | 2 | 8 | 6 |
+| network-policy | 2 | 10 | 6 |
 | lifecycle | 7 | 23 | 20 |
 | failure-injection | 2 | 14 | 7 |
 
@@ -54,7 +54,7 @@ Behaviours: 44 across 9 areas, naming 259 of 259 catalog cases.
 | Temporary access is bounded by an armed remote expiry | aio, multi-node | pre-push | `TSSH-01`, `BOOT-02` | `TSSH-02` |
 | Target credentials stay on the control machine and are revoked | aio, multi-node | pre-push | `LOCAL-01`, `LOCAL-02`, `REV-01` | `REV-02` |
 | Each Vision domain is provisioned per node or refuses the host | aio, multi-node | pre-push | `VIS-01`, `VIS-02`, `VIS-03`, `VIS-07`, `VIS-08`, `MN-VISION` | `VIS-04`, `VIS-CONFIG`, `VIS-05`, `VIS-06` |
-| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR`, `MN-PARTIAL-SUCCESS`, `MN-WIZARD-FLOW`, `MN-MIGRATE` |
+| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `NGX-PIN`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR`, `MN-PARTIAL-SUCCESS`, `MN-WIZARD-FLOW`, `MN-MIGRATE` |
 
 ## subscription-representations
 
@@ -94,7 +94,7 @@ Behaviours: 44 across 9 areas, naming 259 of 259 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| The installed firewall admits only the declared paths and survives a reload | aio, multi-node | pre-push | `FW-01`, `FW-03`, `FW-04`, `FW-05`, `FW-06` | `FW-02` |
+| The installed firewall admits only the declared paths and survives a reload | aio, multi-node | pre-push | `FW-01`, `FW-03`, `FW-04`, `FW-05`, `FW-06`, `FW-07`, `FW-08` | `FW-02` |
 | The control plane is mutual TLS and refuses anything less | multi-node | pre-push | `MTLS-01`, `MTLS-02`, `MTLS-03` | `MTLS-04`, `MTLS-05`, `MTLS-06`, `MTLS-07`, `MTLS-08` |
 
 ## lifecycle

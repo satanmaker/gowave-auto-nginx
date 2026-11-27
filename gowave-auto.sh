@@ -973,6 +973,34 @@ install_finish() {
         multi-node | panel-only) nodes_planned=1 ;;
     esac
 
+    # A resumed plan may record a node as done that the Panel no longer holds
+    # as recorded. Reconcile every such component before the batch sees the
+    # plan: drift is re-applied through its recorded UUID, a missing node is
+    # marked pending so the batch re-creates only it, and an incompatible or
+    # ambiguous one is recorded as stopped and held out of the batch. A Panel
+    # that does not answer writes nothing and leaves the draft resumable.
+    local resume_stopped=0 resume_reconcile_rc=0
+    if (( nodes_planned == 1 )) && (( ${GOWAVE_DRAFT_RESUMED:-0} == 1 )); then
+        recovery_reconcile_resume_nodes || resume_reconcile_rc=$?
+        case "$resume_reconcile_rc" in
+            0)
+                if (( ${#RESUME_STOPPED_NODES[@]} > 0 )); then
+                    resume_stopped=1
+                    recovery_exclude_stopped_nodes
+                    printf '\nResume: %d component(s) stopped and held out of this batch; every other component keeps its recorded status.\n' \
+                        "${#RESUME_STOPPED_NODES[@]}" >&2
+                fi
+                ;;
+            3)
+                # The readback did not answer; the draft was not written.
+                return 2
+                ;;
+            *)
+                echo "Warning: the resume reconciliation could not run; the planned nodes were left as recorded." >&2
+                ;;
+        esac
+    fi
+
     if (( nodes_planned == 1 )); then
         wizard_panel_installed_notice "https://$panel_domain"
         echo "Panel Web UI:        https://$panel_domain"
@@ -983,6 +1011,12 @@ install_finish() {
         echo ""
         echo "Onboarding the planned remote nodes..."
         wizard_onboard_nodes "https://$panel_domain" "127.0.0.1" "yes" || onboard_rc=$?
+        # A stopped component is not verified readiness even when every other
+        # node in the batch was repaired, so the run keeps the partial-success
+        # code instead of reporting a clean install over a stopped sibling.
+        if (( resume_stopped == 1 )) && (( onboard_rc == 0 )); then
+            onboard_rc=2
+        fi
         # Return code 2 means a ready Panel with at least one node that did not
         # reach verified registration and cleanup — including when no node
         # registered at all. The Panel deployment and the successful nodes are
@@ -1019,6 +1053,88 @@ panel_admin_user() {
         user=$(grep -s '^ADMIN_USERNAME=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
     fi
     printf '%s' "${user:-admin}"
+}
+
+# Classify the Panel and the local node the draft calls verified.
+#
+# The checkpoint is a verdict about a moment; this reads the same records again
+# before the run trusts it. One classifier decides whether the Panel still
+# serves the recorded state, the local node still owns the recorded profile and
+# Host records, and the host security report still belongs to this machine. A
+# drift is repaired through the recorded UUIDs; a record this installer cannot
+# attribute stops the Panel work and leaves the checkpoint exactly as it was,
+# so a later run reads the same mismatch instead of a record this one invented.
+#
+# 0 — the records agree; 1 — a mismatch stopped this component; 3 — the Panel
+# did not answer and the draft stays resumable.
+resume_reconcile_panel_identity() {
+    local install_mode="$1" security_document="${2:-}"
+    local -a identities=() expectations=() profiles=()
+    local identity expectation live verdict klass action reason detail node_uuid
+    local profile attempt revision index
+    declare -F draft_load >/dev/null 2>&1 || return 0
+    local panel_state local_state
+    panel_state=$(draft_checkpoint_field panel state 2>/dev/null || printf 'missing')
+    if [[ "$panel_state" == "verified" || "$panel_state" == "indeterminate" ]]; then
+        identities+=("panel")
+    fi
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        local_state=$(draft_checkpoint_field local-node state 2>/dev/null || printf 'missing')
+        if [[ "$local_state" == "verified" || "$local_state" == "indeterminate" ]]; then
+            identities+=("local-node")
+        fi
+    fi
+    (( ${#identities[@]} > 0 )) || return 0
+    for identity in "${identities[@]}"; do
+        expectation=$(recovery_draft_expectation "$identity") || return 1
+        expectation=$(recovery_expectation_with_state "$expectation" "$STATE_FILE") || return 1
+        expectations+=("$expectation")
+        profile=$(recovery_json_field "$expectation" recorded.profile_uuid)
+        if [[ -n "$profile" ]]; then
+            profiles+=("$profile")
+        fi
+    done
+    revision=$(draft_installer_revision 2>/dev/null || printf '')
+    live=$(recovery_panel_live_state "$CREDENTIALS_FILE" "$STATE_FILE" "$revision" "${profiles[@]}") \
+        || live='{"reachable": false, "error": "unreadable"}'
+    if [[ "$(recovery_json_field "$live" reachable)" != "true" ]]; then
+        printf '%s\n' \
+            'Resume: the Panel did not answer the reconciliation readback; the draft is unchanged and this run can be retried.' >&2
+        return 3
+    fi
+    for index in "${!identities[@]}"; do
+        identity="${identities[$index]}"
+        expectation="${expectations[$index]}"
+        attempt=$(recovery_json_field "$expectation" recorded.attempt)
+        verdict=$(recovery_classify_component "$expectation" "$live" "$security_document") || return 1
+        IFS=$'\t' read -r klass action reason detail node_uuid <<< "$verdict"
+        if [[ "$klass" == "drift" ]]; then
+            profile=$(recovery_json_field "$expectation" recorded.profile_uuid)
+            if recovery_reapply_node "$node_uuid" "$profile"; then
+                live=$(recovery_panel_live_state "$CREDENTIALS_FILE" "$STATE_FILE" "$revision" "${profiles[@]}") \
+                    || live='{"reachable": false, "error": "unreadable"}'
+                if [[ "$(recovery_json_field "$live" reachable)" != "true" ]]; then
+                    printf '%s\n' \
+                        "Resume: the Panel did not answer after re-applying $identity; the draft is unchanged and this run can be retried." >&2
+                    return 3
+                fi
+                verdict=$(recovery_classify_component "$expectation" "$live" "$security_document") || return 1
+                IFS=$'\t' read -r klass action reason detail node_uuid <<< "$verdict"
+                if [[ "$klass" == "match" ]]; then
+                    recovery_checkpoint_verified "$identity" "$attempt" "$node_uuid" "$profile" || true
+                    printf 'Resume: re-applied the recorded Panel association for %s.\n' "$identity" >&2
+                    continue
+                fi
+            fi
+        fi
+        if [[ "$klass" != "match" ]]; then
+            printf 'Resume: %s stopped; %s\n' "$identity" "$detail" >&2
+            printf '%s\n' \
+                'Resume: the recorded checkpoint is unchanged; repair the Panel or start a new plan, then retry.' >&2
+            return 1
+        fi
+    done
+    return 0
 }
 
 # Re-establish a Panel that an interrupted run recorded as verified.
@@ -1080,10 +1196,34 @@ resume_verify_panel() {
             echo "Resume: the planned local node's UUID, profile or Host associations could not be confirmed." >&2
             return 1
         fi
-        write_security_report aio 3002 "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || return 1
-        draft_checkpoint local-node verified complete 1 "$local_uuid" || true
+    fi
+    # The security report is the host's readiness identity. This run's readback
+    # replaces the one the previous run recorded, so the recorded copy is read
+    # first and put back if the reconciliation stops the component.
+    local recorded_security security_output="" security_rc=0 security_document=""
+    recorded_security=$(recovery_read_security_report)
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        security_output=$(write_security_report aio 3002 "" \
+            "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}") || security_rc=$?
     else
-        write_security_report panel-only "" "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || return 1
+        security_output=$(write_security_report panel-only "" "" \
+            "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}") || security_rc=$?
+    fi
+    (( security_rc == 0 )) || return 1
+    security_document=$(recovery_security_document "$recorded_security" "$(recovery_read_security_report)") \
+        || security_document=""
+    # The checkpoint records a verdict, not the deployment: this reads the same
+    # records again. A drift is re-applied through the recorded UUIDs; a record
+    # this installer cannot attribute stops the Panel work without touching the
+    # draft, and an unread Panel leaves the draft for a later retry.
+    local identity_rc=0
+    resume_reconcile_panel_identity "$install_mode" "$security_document" || identity_rc=$?
+    if (( identity_rc != 0 )); then
+        recovery_restore_security_report "$recorded_security"
+        return "$identity_rc"
+    fi
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        draft_checkpoint local-node verified complete 1 "$local_uuid" || true
     fi
     echo "Resume: the Panel this host serves is the one the saved plan recorded."
     return 0
@@ -1107,8 +1247,13 @@ resume_recorded_panel() {
     if (( GOWAVE_DRAFT_RESUMED != 1 )) || [[ "$(draft_checkpoint_state panel)" != "verified" ]]; then
         return 1
     fi
-    if ! resume_verify_panel "$panel_domain" "$install_mode"; then
-        wizard_resume_panel_unverified
+    local verify_rc=0
+    resume_verify_panel "$panel_domain" "$install_mode" || verify_rc=$?
+    if (( verify_rc != 0 )); then
+        # 3 is the unreachable Panel, which the reconciliation already reported
+        # once; the draft is untouched and the next run can retry. Any other
+        # failure is a readback that disagreed and names what to inspect.
+        (( verify_rc == 3 )) || wizard_resume_panel_unverified
         finish_out=1
         return 0
     fi

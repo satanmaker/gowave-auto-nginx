@@ -844,6 +844,37 @@ bootstrap trust. A compromised root/Panel account or leaked backup/subscription 
 of “hidden” ports or a decoy. The static cover does not make an endpoint invisible or guarantee safety
 from scanning or blocking.
 
+### Security reports and readiness
+
+Every hardened host writes `/var/lib/gowave-auto-nginx/security-report.json`; after a multi-node
+deployment the Master combines those documents into
+`/var/lib/gowave-auto-nginx/security-report-aggregate.json`. Both are built from effective state — the
+live ruleset, the SSH jail, the update timers and the resolver are read back, not restated from the step
+that configured them — and both appear by atomic replacement (private temporary file, `fsync`, rename,
+directory `fsync`) at mode `0600`. Reading an existing report is read-only; a rerun produces a new
+document, never a patched one.
+
+The readiness verdict is the weakest of the aggregate's hosts. A control declared `required` that is not
+`verified` blocks that host; a `best-effort` control can lower readiness to `ready-with-warnings` only
+when its rollback was verified. The aggregate names the host and the control that decided its verdict in
+`decided_by`, and each Worker entry lists its `blocking` and `warnings` controls, so a `failed` verdict is
+never anonymous. A Worker whose report could not be read stays as an explicit `fetch_failed` entry
+instead of disappearing from the document.
+
+Freshness is part of the verdict: a report is evidence for 300 seconds. An older report, or one dated in
+the future, is stale, and an aggregate that would mix a stale host with fresh ones is refused rather
+than published; the refusal names the host and its age. When the Master's own report is outside the
+window it is regenerated from effective state before combining, and a failed regeneration writes no
+aggregate. Stale files may remain on disk as history, but they are not current evidence.
+
+Two limits are deliberate. Security updates: only the distribution security origin is added and
+verified; other APT origins and pinned repositories are preserved, and the report re-verifies that the
+security origin is effective and the periodic timers are enabled — it does not claim to have witnessed a
+preservation it did not observe. DNS-over-TLS: the `dot` control covers the system resolver only.
+Applications that speak DNS themselves bypass it, a network that blocks outbound `853` is a working-DNS
+failure rather than proof of encryption, and DNSSEC validation is a separate control that this policy
+does not enable. Neither DoT nor the firewall promises DPI invisibility or upstream DDoS protection.
+
 Mutations use an exclusive lock, staged/atomic file publication where implemented, snapshots and
 journaling. Handled failures attempt rollback of covered resources; the code can explicitly report
 **incomplete rollback** and retain evidence for operator recovery. CA issuance/rate limits, DNS changes,

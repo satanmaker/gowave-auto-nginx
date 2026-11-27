@@ -219,6 +219,8 @@ class RunContext:
         labels: Optional[Dict[str, str]] = None,
         distribution: Optional[str] = None,
         reused_from: Optional[str] = None,
+        keep: bool = False,
+        secret_dir: Optional[Path] = None,
     ) -> None:
         self.topology = topology
         # The distribution is a fact about the hosts, not about the suite: a run
@@ -245,10 +247,23 @@ class RunContext:
         # Every evidence file is listed here as it is written, so a case result can
         # name the files it produced instead of only inlining their content.
         self.evidence_files: List[str] = []
+        # ``keep`` is the switch behind ``--keep`` and behind an adopted run: the
+        # resources this context touches still belong to a cell someone needs, so
+        # the exit-time cleanup is not registered for them.
+        self.keep_resources = bool(keep)
         # Secrets never live under artifact_dir: artifacts are retained and shared.
-        self.secret_dir = Path(tempfile.mkdtemp(prefix=f"gowave-e2e-{self.run_id}-"))
+        # An adopting run is handed the kept run's directory because the running
+        # containers mount it — the payloads they read and the CA they trust are
+        # files inside it — and it never removes a directory it did not create.
+        if secret_dir is not None:
+            self.secret_dir = Path(secret_dir)
+            self.owns_secret_dir = False
+        else:
+            self.secret_dir = Path(tempfile.mkdtemp(prefix=f"gowave-e2e-{self.run_id}-"))
+            self.owns_secret_dir = not self.keep_resources
         self.secret_dir.chmod(0o700)
-        self.add_cleanup(lambda: shutil.rmtree(self.secret_dir, ignore_errors=True))
+        if self.owns_secret_dir:
+            self.add_cleanup(lambda: shutil.rmtree(self.secret_dir, ignore_errors=True))
         self._previous_signal_handlers: Dict[int, Any] = {}
 
     def install_signal_handlers(self) -> None:
@@ -526,6 +541,7 @@ class Runner:
                 # "never ran", and nothing else in the artifact says a run was
                 # only partly its own; ``summary.json`` reports both.
                 "executed": list(self.executed),
+                "reused": bool(self.context.reused_from),
                 "reused_from": self.context.reused_from,
                 "cases": [case_record(result) for result in self.results],
             }

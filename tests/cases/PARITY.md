@@ -293,6 +293,9 @@ be published.
 - **MN-ADD-NODE-REFUSED** — promotion target: Distributed Worker VPS Deployment Verification
 - **MN-WIZARD-FLOW** — promotion target: Distributed Worker VPS Deployment Verification
 - **MN-MIGRATE** — promotion target: Distributed Worker VPS Deployment Verification
+- **FW-08** — promotion target: Security and network isolation verification
+- **FW-07** — promotion target: Security and network isolation verification
+- **NGX-PIN** — promotion target: Independent Multi-Node acceptance topology
 - **MN-WORKER-RESUME** — promotion target: Distributed Worker VPS Deployment Verification
 - **MN-COMPOSED-MIXED** — promotion target: Distributed Worker VPS Deployment Verification
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

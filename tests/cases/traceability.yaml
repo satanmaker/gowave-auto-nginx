@@ -41,11 +41,12 @@ requirements:
   - requirement: Independent Multi-Node acceptance topology
     scenarios:
       - scenario: Multi-Node clean installation and registration
-        cases: [MN-INSTALL, WRK-04, WRK-05, CLUS-01, CLUS-02, CLUS-03]
+        cases: [NGX-PIN, MN-INSTALL, WRK-04, WRK-05, CLUS-01, CLUS-02, CLUS-03]
         topologies: [multi-node]
         tests:
           - tests.test_podman_multi_node.TestMultiNodeSuite
           - tests.test_podman_multi_node.TestWorkerRegistrationCase
+          - tests.test_podman_multi_node.TestNginxPinCase
           - tests.test_podman_cluster.TestClusterCases
         jobs: [Multi-Node Podman Acceptance]
       - scenario: Master and Worker optional domain configuration
@@ -295,7 +296,7 @@ requirements:
   - requirement: Security and network isolation verification
     scenarios:
       - scenario: Unauthorized management access
-        cases: [FW-01, FW-02, FW-03, FW-04, FW-05, FW-06, PO-FIREWALL, AIO-NEG-PORT]
+        cases: [FW-01, FW-02, FW-03, FW-04, FW-05, FW-06, FW-07, FW-08, PO-FIREWALL, AIO-NEG-PORT]
         topologies: [aio, multi-node, panel-only]
         tests:
           - tests.test_podman_denial.TestManagementDenialCase
@@ -308,6 +309,7 @@ requirements:
           - tests.test_podman_ingress_matrix.TestDeclaredPolicy
           - tests.test_podman_ingress_matrix.TestReload
           - tests.test_podman_ingress_matrix.TestCaseDriver
+          - tests.test_podman_firewall_runtime.TestFirewallRuntimeCases
         jobs:
           - All-in-One Podman Acceptance
           - Multi-Node Podman Acceptance

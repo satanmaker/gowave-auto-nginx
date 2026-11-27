@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, acme_mode, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
+    acme_fixture, acme_mode, aio, argv_probe, budget, denial, environment_gate,
+    firewall_runtime, hook_ownership,
     ingress, ingress_matrix, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
     firewall_image, gate_tiers, mutation_baseline,
@@ -1185,6 +1186,30 @@ class MultiNodeProduct:
                 f"{self.node_add_outcome.returncode}, so this case had nothing to verify"
             )
         return host
+
+    def adopt(
+        self, host: "topology.MultiNodeTopology", source_run_id: str = "",
+        worker_registered: bool = False,
+    ) -> None:
+        """Attach a kept run's pair instead of installing and provisioning one.
+
+        ``worker_registered`` is read from the kept run's own result, so a cell that
+        never registered its Worker blocks the cases that need one rather than
+        pretending the registration happened.
+        """
+        self.master.adopt(host, source_run_id)
+        self.topology = host
+        if worker_registered:
+            self.node_add_outcome = topology.InstallOutcome(
+                returncode=0,
+                stdout="",
+                stderr="",
+                duration=0.0,
+                command=(
+                    f"adopted from run {source_run_id}" if source_run_id
+                    else "adopted kept Worker"
+                ),
+            )
 
     # --------------------------------------------------------------- node add
     def add_worker(self) -> Dict[str, Any]:
@@ -8863,6 +8888,30 @@ def case_worker_resume(product: MultiNodeProduct) -> Dict[str, Any]:
 # restarts the Worker's unit, and reads the cluster back: TLS on every name, the
 # security report over SSH, and the Panel's own node/Host identity unchanged
 # across the whole cycle.
+def wait_for_worker_transport(product: MultiNodeProduct, host: Any,
+                              attempts: int = 60) -> bool:
+    """Poll the Master's SSH path to the Worker until it answers or the bound ends."""
+    for _ in range(attempts):
+        probe = product.podman.exec_bash(
+            host.target_name,
+            f"timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no "
+            f"root@{host.plan.worker_ip} true", check=False)
+        if probe.returncode == 0:
+            return True
+        time.sleep(1)
+    return False
+
+
+def wait_before_interrupt(seconds: float) -> None:
+    """Let the payload reach the mutation before it is interrupted.
+
+    The pause is part of the scenario — a SIGTERM arriving before the re-apply
+    starts would test nothing — so it lives in one named, bounded place instead
+    of a bare `time.sleep` inside the case body.
+    """
+    time.sleep(seconds)
+
+
 def case_composed_mixed_topology(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-COMPOSED-MIXED: failure, retry, interruption and restart on a mixed topology."""
     case_id = COMPOSED_MIXED_CASE_ID
@@ -8913,16 +8962,7 @@ def case_composed_mixed_topology(product: MultiNodeProduct) -> Dict[str, Any]:
         host.worker_name,
         "systemctl start ssh.socket 2>/dev/null; systemctl start ssh.service 2>/dev/null; true",
         check=False)
-    recovered = False
-    for _ in range(60):
-        probe = product.podman.exec_bash(
-            host.target_name,
-            f"timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no "
-            f"root@{host.plan.worker_ip} true", check=False)
-        if probe.returncode == 0:
-            recovered = True
-            break
-        time.sleep(1)
+    recovered = wait_for_worker_transport(product, host)
     require(case_id, recovered, "the Master could not reach the Worker after the transport restarted")
     evidence["recovered"] = True
 
@@ -8944,7 +8984,7 @@ def case_composed_mixed_topology(product: MultiNodeProduct) -> Dict[str, Any]:
 
     thread = threading.Thread(target=run_retry, daemon=True)
     thread.start()
-    time.sleep(3)
+    wait_before_interrupt(3)
     product.podman.exec_bash(
         host.target_name, "pkill -TERM -f 'gowave-auto.sh node reapply' 2>/dev/null || true",
         check=False)
@@ -11600,11 +11640,20 @@ def data_plane_cases(product: MultiNodeProduct) -> List[Tuple[str, Dict[str, Any
 def cases(
     podman: Any, distribution: str = "ubuntu-24.04",
     vision: bool = False, worker_vision: bool = False,
+    adopted: Optional[topology.MultiNodeTopology] = None, source_run_id: str = "",
+    worker_registered: bool = False,
 ) -> List[Case]:
-    """The Multi-Node suite: install, Worker provisioning, then observation."""
+    """The Multi-Node suite: install, Worker provisioning, then observation.
+
+    ``adopted`` is a kept run's Master, Worker and vantages rebuilt from its setup
+    record; the install and the Worker provisioning stay declared and an adopting
+    run refuses to select them, because both would provision a second time.
+    """
     product = MultiNodeProduct(
         podman, distribution, vision=vision, worker_vision=worker_vision,
     )
+    if adopted is not None:
+        product.adopt(adopted, source_run_id, worker_registered=worker_registered)
     data_plane = data_plane_cases(product)
     product.declare_data_plane([case_id for case_id, _inbound, _client, _node in data_plane])
     suite = [
@@ -12084,6 +12133,19 @@ def cases(
              lambda context: case_worker_migration(product),
              timeout_seconds=WORKER_MIGRATION_TIMEOUT_SECONDS),
         # MN-WORKER-RESUME: re-verify Worker TLS and security on resume.
+        # The ingress contract under the event that silently undoes it: the
+        # Worker's policy is re-applied over an established control session, and
+        # the session must survive. A new login is not the question — the
+        # connection an operator already holds is.
+        Case(firewall_runtime.SSH_SURVIVES_CASE_ID, "multi-node",
+             lambda context: firewall_runtime.case_ssh_survives_firewall(product),
+             timeout_seconds=firewall_runtime.RELOAD_TIMEOUT_SECONDS),
+        # The package a host runs is a fact about that host, so it is read after
+        # the Worker exists and before any case that depends on the edge behaves
+        # as installed. It only reads: no container is mutated.
+        Case(NGINX_PIN_CASE_ID, "multi-node",
+             lambda context: case_nginx_pin(product),
+             timeout_seconds=NGINX_PIN_TIMEOUT_SECONDS),
         # Runs after migration so the edge is in its adopted state, and before
         # lifecycle cases that fault the cluster. It reads the live containers
         # without modifying them.

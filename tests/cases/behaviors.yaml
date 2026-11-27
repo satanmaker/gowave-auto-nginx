@@ -284,7 +284,7 @@ behaviors:
       node and Host records.
     topology: [multi-node]
     gate: pre-push
-    cases: [MN-INSTALL, MN-ARGV-OBSERVER, WRK-01, WRK-04, WRK-05, WRK-06, CLUS-01, CLUS-02, CLUS-03]
+    cases: [MN-INSTALL, NGX-PIN, MN-ARGV-OBSERVER, WRK-01, WRK-04, WRK-05, WRK-06, CLUS-01, CLUS-02, CLUS-03]
     error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR, MN-PARTIAL-SUCCESS, MN-WIZARD-FLOW, MN-MIGRATE]
 
   # ------------------------------------------------ subscription representations
@@ -512,10 +512,14 @@ behaviors:
       absent with no listener on a Panel-only host — for the port the product
       installs and for a port it does not, with the operator's SSH ports still
       public, the IPv6 half mirrored wherever the kernel offers one, and both
-      readings unchanged after the unit a boot runs re-applies the files.
+      readings unchanged after the unit a boot runs re-applies the files. Two
+      events that would silently undo the policy are measured too: a firewall
+      reload and a web-server reload/restart leave the rule sets and listeners
+      byte-identical, and re-applying the Worker's policy over an established
+      control session leaves that session alive instead of cutting it.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [FW-01, FW-03, FW-04, FW-05, FW-06]
+    cases: [FW-01, FW-03, FW-04, FW-05, FW-06, FW-07, FW-08]
     error_paths: [FW-02]
 
   - name: The control plane is mutual TLS and refuses anything less

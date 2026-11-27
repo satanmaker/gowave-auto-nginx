@@ -428,6 +428,185 @@ class TestSecurityReport(unittest.TestCase):
         with self.assertRaises(StateError):
             reports.final_exit(self.component, [dict(self.component, cleanup='success')])
 
+    def host_report(self, host='worker-1', role='worker', **overrides):
+        report = copy.deepcopy(self.report)
+        report['host_id'] = host
+        report['role'] = role
+        report['observed_at'] = overrides.pop('observed_at', self.now.isoformat())
+        for name, changes in overrides.items():
+            report['controls'][name].update(changes)
+        return report
+
+    def document(self, master=None, workers=None):
+        return reports.combine(master or self.host_report(host='master-1', role='panel-only'),
+                               workers or {}, now=self.now)
+
+    def test_reading_a_report_is_read_only_and_a_rerun_replaces_it_atomically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'private' / 'security-report.json'
+            store = reports.SecurityReportStore(path, owner_uid=os.getuid())
+            store.save(self.report, now=self.now)
+            before = path.stat()
+            original = path.read_bytes()
+            self.assertEqual(store.load(now=self.now), self.report)
+            after = path.stat()
+            self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+            self.assertEqual(path.read_bytes(), original)
+
+            drifted = self.host_report(firewall={'status': 'failed', 'recovery': 'unknown'})
+            store.save(drifted, now=self.now)
+            self.assertEqual(store.load(now=self.now), drifted)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.read_bytes(), json.dumps(drifted, sort_keys=True).encode() + b'\n')
+            self.assertEqual([entry.name for entry in path.parent.iterdir()], ['security-report.json'])
+
+    def test_the_store_reports_which_host_is_stale_and_how_old_it_is(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'private' / 'security-report.json'
+            store = reports.SecurityReportStore(path, owner_uid=os.getuid())
+            store.save(self.report, now=self.now)
+            with self.assertRaises(reports.StaleReport) as raised:
+                store.load(now=self.now + timedelta(seconds=901))
+            self.assertEqual(raised.exception.host, 'worker-1')
+            self.assertGreaterEqual(raised.exception.age_seconds, 901)
+            self.assertIn('worker-1 is stale', str(raised.exception))
+            self.assertIn('seconds old', str(raised.exception))
+            self.assertEqual(path.read_bytes(), json.dumps(self.report, sort_keys=True).encode() + b'\n')
+
+    def test_an_aggregate_refuses_a_stale_report_next_to_a_fresh_one(self):
+        master = self.host_report(host='master-1', role='panel-only')
+        fresh = self.host_report('worker-1')
+        cases = (((self.now - timedelta(seconds=901)).isoformat(), 'seconds old'),
+                 ((self.now + timedelta(seconds=5)).isoformat(), 'in the future'))
+        for observed, wording in cases:
+            with self.subTest(observed=observed):
+                stale = self.host_report('worker-2', observed_at=observed)
+                with self.assertRaises(reports.StaleReport) as raised:
+                    reports.combine(master, {'worker-1': fresh, 'worker-2': stale}, now=self.now)
+                self.assertEqual(raised.exception.host, 'worker-2')
+                self.assertIn('worker-2 is stale', str(raised.exception))
+                self.assertIn(wording, str(raised.exception))
+
+    def test_an_aggregate_refuses_a_stale_master_too(self):
+        master = self.host_report('master-1', role='panel-only',
+                             observed_at=(self.now - timedelta(seconds=600)).isoformat())
+        with self.assertRaises(reports.StaleReport) as raised:
+            reports.combine(master, {'worker-1': self.host_report('worker-1')}, now=self.now)
+        self.assertEqual(raised.exception.host, 'master-1')
+        self.assertGreaterEqual(raised.exception.age_seconds, 600)
+
+    def test_the_aggregate_is_the_weakest_host_and_names_the_control(self):
+        master = self.host_report('master-1', role='panel-only')
+        ready = self.host_report('worker-1')
+        blocked = self.host_report('worker-2', firewall={'status': 'failed', 'recovery': 'unknown'})
+        document = reports.combine(master, {'worker-1': ready, 'worker-2': blocked}, now=self.now)
+        self.assertEqual(document['readiness'], 'failed')
+        self.assertEqual(document['decided_by'],
+                         {'host': 'worker-2', 'control': 'firewall', 'readiness': 'failed'})
+        self.assertEqual(document['workers']['worker-2']['blocking'], ['firewall'])
+        self.assertEqual(document['workers']['worker-1']['readiness'], 'ready')
+        self.assertEqual(document['workers']['worker-1']['blocking'], [])
+        reports.validate_aggregate(document)
+        self.assertEqual(reports.aggregate_readiness(document), ('failed', document['decided_by']))
+
+        failed_master = self.host_report('master-1', role='panel-only',
+                                    ssh_protection={'status': 'failed', 'recovery': 'unknown'})
+        document = reports.combine(failed_master, {'worker-1': ready}, now=self.now)
+        self.assertEqual(document['readiness'], 'failed')
+        self.assertEqual(document['decided_by']['host'], 'master')
+        self.assertEqual(document['decided_by']['control'], 'ssh_protection')
+
+    def test_required_and_best_effort_are_gated_differently(self):
+        master = self.host_report('master-1', role='panel-only')
+        warning = self.host_report('worker-1', dot={'policy': 'best-effort', 'status': 'failed',
+                                              'recovery': 'verified'})
+        document = reports.combine(master, {'worker-1': warning}, now=self.now)
+        self.assertEqual(document['readiness'], 'ready-with-warnings')
+        self.assertEqual(document['decided_by'],
+                         {'host': 'worker-1', 'control': 'dot', 'readiness': 'ready-with-warnings'})
+        self.assertEqual(document['workers']['worker-1']['warnings'], ['dot'])
+        self.assertEqual(document['workers']['worker-1']['blocking'], [])
+
+        blocked = self.host_report('worker-1', dot={'policy': 'required', 'status': 'failed',
+                                               'recovery': 'verified'})
+        document = reports.combine(master, {'worker-1': blocked}, now=self.now)
+        self.assertEqual(document['readiness'], 'failed')
+        self.assertEqual(document['decided_by']['control'], 'dot')
+        self.assertEqual(document['workers']['worker-1']['blocking'], ['dot'])
+
+        unproven = self.host_report('worker-1', dot={'policy': 'best-effort', 'status': 'failed',
+                                                'recovery': 'unknown'})
+        document = reports.combine(master, {'worker-1': unproven}, now=self.now)
+        self.assertEqual(document['readiness'], 'failed')
+        self.assertEqual(document['decided_by']['control'], 'dot')
+
+    def test_a_missing_report_is_a_named_gap_not_a_pass(self):
+        master = self.host_report('master-1', role='panel-only')
+        document = reports.combine(master, {'worker-1': {'status': 'fetch_failed'},
+                                            'worker-2': {'status': 'invalid'}}, now=self.now)
+        self.assertEqual(document['readiness'], 'failed')
+        self.assertEqual(document['decided_by'],
+                         {'host': 'worker-1', 'control': 'security_report', 'readiness': 'failed'})
+        self.assertEqual(document['workers']['worker-1']['reason_code'], 'WORKER_READBACK_FAILED')
+        self.assertEqual(document['workers']['worker-2']['reason_code'], 'REPORT_INVALID')
+        reports.validate_aggregate(document)
+
+        tampered = copy.deepcopy(document)
+        tampered['readiness'] = 'ready'
+        with self.assertRaises(StateError):
+            reports.validate_aggregate(tampered)
+        tampered = copy.deepcopy(document)
+        tampered['workers']['worker-1']['reason_code'] = 'password=hunter2'
+        with self.assertRaises(StateError):
+            reports.validate_aggregate(tampered)
+
+    def test_an_aggregate_is_read_only_to_read_and_replaced_as_a_whole(self):
+        master = self.host_report('master-1', role='panel-only')
+        document = reports.combine(master, {'worker-1': self.host_report('worker-1')}, now=self.now)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'private' / 'security-report-aggregate.json'
+            store = reports.AggregateStore(path, owner_uid=os.getuid())
+            store.save(document)
+            before = path.stat()
+            original = path.read_bytes()
+            self.assertEqual(store.load(), document)
+            after = path.stat()
+            self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+            self.assertEqual(path.read_bytes(), original)
+
+            rerun = reports.combine(master, {'worker-1': self.host_report(
+                'worker-1', firewall={'status': 'failed', 'recovery': 'unknown'})}, now=self.now)
+            store.save(rerun)
+            self.assertEqual(store.load(), rerun)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual([entry.name for entry in path.parent.iterdir()],
+                             ['security-report-aggregate.json'])
+
+    def test_a_report_and_an_aggregate_refuse_secret_material(self):
+        for payload in ({'value': '-----BEGIN OPENSSH PRIVATE KEY-----'},
+                        {'value': '-----BEGIN CERTIFICATE-----'},
+                        {'value': 'password=hunter2'},
+                        {'value': 'token=abc'},
+                        {'value': 'PRIVATE KEY'}):
+            with self.subTest(payload=payload):
+                self.assertFalse(reports.redacted(payload))
+                with self.assertRaises(StateError):
+                    reports.require_redacted(payload)
+
+        master = self.host_report('master-1', role='panel-only')
+        document = reports.combine(master, {'worker-1': self.host_report('worker-1')}, now=self.now)
+        self.assertTrue(reports.redacted(document))
+        tampered = copy.deepcopy(document)
+        tampered['workers']['worker-1']['error'] = 'password=hunter2'
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'private' / 'security-report-aggregate.json'
+            store = reports.AggregateStore(path, owner_uid=os.getuid())
+            store.save(document)
+            with self.assertRaises(StateError):
+                store.save(tampered)
+            self.assertEqual(store.load(), document)
+            self.assertNotIn('hunter2', path.read_text(encoding='utf-8'))
+
 
 class TestAggregateWorkerReports(unittest.TestCase):
     """Tests for the aggregate_worker_security_reports function in modules/security.sh."""
@@ -460,8 +639,35 @@ class TestAggregateWorkerReports(unittest.TestCase):
         self.master_report_path.write_text(json.dumps(self.master_report) + '\n')
         self.master_report_path.chmod(0o600)
 
-    def _run_aggregate(self, env=None):
-        """Run the aggregate_worker_security_reports function from security.sh."""
+    def worker_report(self, host='worker-1', role='worker', old_seconds=0, **controls):
+        report = {
+            'schema_version': 1, 'host_id': host, 'role': role, 'installer_revision': 'test-1',
+            'observed_at': (datetime.now(timezone.utc) - timedelta(seconds=old_seconds)).isoformat(),
+            'controls': {
+                name: {'policy': 'best-effort' if name == 'dot' else 'required',
+                       'status': 'verified', 'reason_code': 'VERIFIED',
+                       'recovery': 'not-needed', 'evidence_codes': ['EFFECTIVE_STATE_READBACK']}
+                for name in reports.CONTROLS
+            },
+        }
+        for name, changes in controls.items():
+            report['controls'][name].update(changes)
+        return report
+
+    def _run_aggregate(self, env=None, names=(), readbacks=None, extra=''):
+        """Run aggregate_worker_security_reports against a disposable state tree.
+
+        `readbacks` maps a planned host name to the JSON its readback returns; a
+        name without an entry fails at the SSH step, which is how a hole in the
+        fleet is simulated. `extra` is appended before the call so a test can
+        replace the helper functions this module owns.
+        """
+        worker_dir = self.root / 'readbacks'
+        worker_dir.mkdir(exist_ok=True)
+        for host, report in (readbacks or {}).items():
+            (worker_dir / f'{host}.json').write_text(
+                report if isinstance(report, str) else json.dumps(report), encoding='utf-8')
+        quoted_names = ' '.join(f"'{name}'" for name in names)
         script = f'''source "{self.security_sh}"
 # Mock the required functions and variables
 resolve_panel_ipv4() {{ printf '203.0.113.10'; }}
@@ -469,15 +675,27 @@ resolve_panel_ipv6() {{ :; }}
 GOWAVE_SSH_NODE_PORT=3002
 GOWAVE_SSH_PORT=22
 GOWAVE_DOT_POLICY=best-effort
-GOWAVE_PLAN_NODE_NAMES=()
+GOWAVE_PLAN_NODE_NAMES=({quoted_names})
 MANAGED_SECURITY_PY="{self.managed_py}"
 # Override state directory
 export GOWAVE_STATE_DIR="{self.state_dir}"
-# Mock ssh to fail (no Workers)
+WORKER_DIR="{worker_dir}"
+# The readback travels over SSH in the product; here the fake answers from a
+# file and consumes the helper stream the caller redirects into it.
+timeout() {{ shift; "$@"; }}
 ssh() {{
-    echo "ssh called unexpectedly" >&2
-    return 1
+    local arg host=""
+    for arg in "$@"; do
+        if [[ "$arg" == root@* ]]; then
+            host="${{arg#root@}}"
+        fi
+    done
+    cat >/dev/null
+    [[ -n "$host" ]] || return 1
+    [[ -f "$WORKER_DIR/$host.json" ]] || return 1
+    cat "$WORKER_DIR/$host.json"
 }}
+{extra}
 aggregate_worker_security_reports
 '''
         env_vars = {**os.environ}
@@ -485,15 +703,21 @@ aggregate_worker_security_reports
             env_vars.update(env)
         return subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=env_vars)
 
+    def aggregate(self):
+        return json.loads((self.state_dir / 'security-report-aggregate.json').read_text())
+
     def test_aggregate_with_no_workers_writes_empty_aggregate(self):
         result = self._run_aggregate()
         self.assertEqual(result.returncode, 0, result.stderr)
         agg_path = self.state_dir / 'security-report-aggregate.json'
         self.assertTrue(agg_path.exists())
-        agg = json.loads(agg_path.read_text())
+        agg = self.aggregate()
         self.assertEqual(agg['schema_version'], 1)
         self.assertEqual(agg['master'], self.master_report)
         self.assertEqual(agg['workers'], {})
+        self.assertEqual(agg['readiness'], 'ready')
+        self.assertIsNone(agg['decided_by'])
+        self.assertEqual(agg_path.stat().st_mode & 0o777, 0o600)
 
     def test_aggregate_fails_when_master_report_missing(self):
         self.master_report_path.unlink()
@@ -504,10 +728,102 @@ aggregate_worker_security_reports
     def test_aggregate_structure_has_expected_fields(self):
         result = self._run_aggregate()
         self.assertEqual(result.returncode, 0, result.stderr)
-        agg_path = self.state_dir / 'security-report-aggregate.json'
-        agg = json.loads(agg_path.read_text())
+        agg = self.aggregate()
         self.assertIn('schema_version', agg)
         self.assertIn('master', agg)
         self.assertIn('workers', agg)
         self.assertIn('observed_at', agg)
         self.assertEqual(agg['schema_version'], 1)
+
+    def test_a_fresh_worker_report_is_counted_and_named(self):
+        worker = self.worker_report('worker-1')
+        result = self._run_aggregate(names=('worker-1',), readbacks={'worker-1': worker})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agg = self.aggregate()
+        self.assertEqual(agg['readiness'], 'ready')
+        self.assertEqual(agg['workers']['worker-1']['status'], 'ok')
+        self.assertEqual(agg['workers']['worker-1']['readiness'], 'ready')
+        self.assertEqual(agg['workers']['worker-1']['report'], worker)
+        self.assertEqual(agg['workers']['worker-1']['observed_at'], worker['observed_at'])
+        self.assertIn('Security report aggregate written', result.stdout)
+
+    def test_a_stale_worker_report_refuses_the_aggregate_and_names_the_host(self):
+        stale = self.worker_report('worker-2', old_seconds=900)
+        previous = self.state_dir / 'security-report-aggregate.json'
+        previous.write_text('{"previous": true}\n')
+        previous.chmod(0o600)
+        result = self._run_aggregate(names=('worker-1', 'worker-2'),
+                                     readbacks={'worker-1': self.worker_report('worker-1'),
+                                                'worker-2': stale})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('worker-2 is stale', result.stderr)
+        self.assertIn('seconds old', result.stderr)
+        self.assertIn('"status": "refused"', result.stdout)
+        # A refused rerun leaves the previous aggregate alone: no host list is
+        # silently patched into a document that now claims a fresh verdict.
+        self.assertEqual(previous.read_text(), '{"previous": true}\n')
+
+    def test_a_stale_master_report_is_regenerated_before_aggregation(self):
+        stub = '''write_security_report() {
+    python3 - "$GOWAVE_STATE_DIR/security-report.json" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    report = json.load(stream)
+report["observed_at"] = datetime.now(timezone.utc).isoformat()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(report, stream)
+    stream.write("\\n")
+PY
+    printf '%s\\n' "$1:$2" >> "$GOWAVE_STATE_DIR/refresh.log"
+}
+'''
+        # The multi-node Master is `panel-only`, so the branch that passes no
+        # Node port is the production one, not the All-in-One branch.
+        for role, expected in (('aio', 'aio:3002'), ('panel-only', 'panel-only:')):
+            with self.subTest(role=role):
+                self.master_report['role'] = role
+                self.master_report['observed_at'] = (
+                    datetime.now(timezone.utc) - timedelta(seconds=3600)).isoformat()
+                self.master_report_path.write_text(json.dumps(self.master_report) + '\n')
+                result = self._run_aggregate(extra=stub)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('Refreshing the Master security report', result.stdout)
+                self.assertEqual((self.state_dir / 'refresh.log').read_text().splitlines()[-1], expected)
+                agg = self.aggregate()
+                self.assertGreater(agg['master']['observed_at'], self.master_report['observed_at'])
+                self.assertEqual(agg['readiness'], 'ready')
+
+    def test_a_master_report_that_cannot_be_refreshed_writes_no_aggregate(self):
+        self.master_report['observed_at'] = (
+            datetime.now(timezone.utc) - timedelta(seconds=3600)).isoformat()
+        self.master_report_path.write_text(json.dumps(self.master_report) + '\n')
+        result = self._run_aggregate(extra='write_security_report() { return 1; }')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('could not be refreshed', result.stderr)
+        self.assertFalse((self.state_dir / 'security-report-aggregate.json').exists())
+
+    def test_a_worker_that_cannot_be_read_is_a_named_gap(self):
+        result = self._run_aggregate(names=('worker-1', 'worker-2'),
+                                     readbacks={'worker-1': self.worker_report('worker-1')})
+        self.assertEqual(result.returncode, 1)
+        agg = self.aggregate()
+        self.assertEqual(agg['readiness'], 'failed')
+        self.assertEqual(agg['workers']['worker-2']['status'], 'fetch_failed')
+        self.assertEqual(agg['workers']['worker-2']['reason_code'], 'WORKER_READBACK_FAILED')
+        self.assertEqual(agg['decided_by'],
+                         {'host': 'worker-2', 'control': 'security_report', 'readiness': 'failed'})
+        self.assertIn('failed to fetch a security report from Worker worker-2', result.stderr)
+
+    def test_a_worker_readback_with_a_secret_is_invalid_and_not_copied(self):
+        poisoned = self.worker_report('worker-1')
+        poisoned['password'] = 'hunter2'
+        result = self._run_aggregate(names=('worker-1',), readbacks={'worker-1': poisoned})
+        self.assertEqual(result.returncode, 1)
+        agg_path = self.state_dir / 'security-report-aggregate.json'
+        self.assertNotIn('hunter2', agg_path.read_text(encoding='utf-8'))
+        agg = json.loads(agg_path.read_text())
+        self.assertEqual(agg['workers']['worker-1']['status'], 'invalid')
+        self.assertEqual(agg['workers']['worker-1']['reason_code'], 'REPORT_INVALID')
+        self.assertNotIn('hunter2', result.stdout + result.stderr)

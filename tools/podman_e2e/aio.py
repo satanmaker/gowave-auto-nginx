@@ -31,6 +31,7 @@ from . import (
     client_trust,
     diagnostics,
     environment_gate,
+    firewall_runtime,
     hook_ownership,
     ingress,
     ingress_matrix,
@@ -91,13 +92,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Mirrors get_required_packages in modules/os.sh. The harness keeps its own copy
 # so a case can never be satisfied by asking the product what it installed; a
 # nonroot test fails if the two lists drift apart.
+# NGINX is not here on purpose: the installer pins the official build, which
+# replaces the distribution's nginx-full/nginx-common, so listing either would
+# demand the archive package back. NGX-PIN reads the installed package instead.
 REQUIRED_PACKAGES: Sequence[str] = (
-    "nginx-full",
-    "libnginx-mod-stream",
     "certbot",
     "python3",
     "python3-systemd",
     "sqlite3",
+    "gnupg",
     "curl",
     "tar",
     "gzip",
@@ -1807,6 +1810,26 @@ class AioProduct:
                 "so this case had nothing to verify"
             )
         return self.host
+
+    def adopt(self, host: "topology.AioTopology", source_run_id: str = "") -> None:
+        """Attach a kept run's installed host instead of installing one.
+
+        The outcome is the provenance of the earlier run, not a claim that this
+        process observed an install: it records zero duration and names the run it
+        came from, so an artifact cannot mistake adoption for a second install.
+        """
+        if self.host is not None:
+            raise AssertionError(
+                f"{self.install_case_id}: the host is installed once per run and reused by later cases"
+            )
+        self.host = host
+        self.outcome = topology.InstallOutcome(
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration=0.0,
+            command=f"adopted from run {source_run_id}" if source_run_id else "adopted kept host",
+        )
 
     # ---------------------------------------------------------------- versions
     def installed_versions(self) -> Dict[str, Any]:
@@ -10075,14 +10098,24 @@ def case_fail_step(product: AioProduct) -> Dict[str, Any]:
     }
 
 
-def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
+def cases(
+    podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False,
+    adopted: Optional[topology.AioTopology] = None, source_run_id: str = "",
+) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
     The data-plane cases are generated from the protocol/client matrix, so the
     selected Vision configuration decides their number (8 without the optional
     inbound, 10 with it) and no case id is written by hand.
+
+    ``adopted`` is a kept run's host rebuilt from its setup record. It takes the
+    place the install case would have filled, so every later case addresses the
+    hosts that already exist; the install case itself stays declared (the suite is
+    the same suite) and an adopting run refuses to select it.
     """
     product = AioProduct(podman, distribution, vision=vision)
+    if adopted is not None:
+        product.adopt(adopted, source_run_id)
     data_plane = [
         (matrix.case_id(product.matrix, "aio", str(inbound["id"]), client), inbound, client)
         for inbound, client in matrix.tuples(product.matrix, vision)
@@ -10226,6 +10259,12 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(acme_mode.CASE_ID, "aio",
              lambda context: acme_mode.case_arbitrary_directory_is_refused(product, context),
              timeout_seconds=300),
+        # The ingress contract under a reload: the rules and listeners the
+        # install case just proved must survive `ufw reload` and a web-server
+        # restart, because a certificate renewal restarts them in production.
+        Case(firewall_runtime.RULES_SURVIVE_RELOAD_CASE_ID, "aio",
+             lambda context: firewall_runtime.case_rules_survive_reload(product),
+             timeout_seconds=firewall_runtime.RELOAD_TIMEOUT_SECONDS),
         Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),

@@ -887,7 +887,7 @@ class TestRunnerEntrypoint(unittest.TestCase):
             def execute(self):
                 return 0
 
-        def suite(podman, topology, distribution, vision=False, worker_vision=False):
+        def suite(podman, topology, distribution, vision=False, worker_vision=False, **kwargs):
             captured.update(
                 topology=topology, distribution=distribution,
                 vision=vision, worker_vision=worker_vision,

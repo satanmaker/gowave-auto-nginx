@@ -9,8 +9,10 @@ against the shipped scripts, where a lookup could be added outside a function
 a test can call.
 """
 import fcntl
+import json
 import os
 import pty
+from datetime import datetime, timezone
 import re
 import select
 import shlex
@@ -2257,7 +2259,11 @@ class TestResumePanelReuse(unittest.TestCase):
             # makes the store a participant rather than a no-op.
             "GOWAVE_PLAN_VARIANT=multi-node\n"
             + script,
-            env={"GOWAVE_DRAFT_PATH": self.path, "GOWAVE_DRAFT_LOG": self.log},
+            env={"GOWAVE_DRAFT_PATH": self.path, "GOWAVE_DRAFT_LOG": self.log,
+                 # A draft written by another revision is not resumed, so the
+                 # resume cases pin the revision both the draft and the live
+                 # answer report.
+                 "GOWAVE_INSTALLER_REVISION": "test-1"},
         )
 
     def seed_panel(self, record="verified complete 1"):
@@ -2275,6 +2281,9 @@ class TestResumePanelReuse(unittest.TestCase):
     def verify_panel(self, extra="", mode="all-in-one"):
         return self.run_install(
             self.READBACKS
+            # The Panel's record is reconciled by its own cases; these drive the
+            # surrounding readbacks, so the classifier is stubbed here.
+            + "resume_reconcile_panel_identity() { printf 'reconcile\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
             + extra
             + "rc=0\n"
             f"resume_verify_panel panel.example.com {shlex.quote(mode)} || rc=$?\n"
@@ -2294,7 +2303,7 @@ class TestResumePanelReuse(unittest.TestCase):
         self.assertIn("checkpoint=panel:verified", result.stdout)
         self.assertIn("checkpoint=local-node:verified", result.stdout,
                       "a Panel that answered every readback left its local node unrecorded")
-        self.assertEqual(self.calls(), ["dns", "startup", "sni", "mtls", "report"],
+        self.assertEqual(self.calls(), ["dns", "startup", "sni", "mtls", "report", "reconcile"],
                          "the verification did not run the readbacks the checkpoint describes")
 
     def test_a_panel_that_stopped_answering_fails_the_verification(self):
@@ -2317,7 +2326,7 @@ class TestResumePanelReuse(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stored_values(result.stdout)["RC"], "0")
         self.assertNotIn("checkpoint=local-node", result.stdout)
-        self.assertEqual(self.calls(), ["dns", "startup", "sni", "report"])
+        self.assertEqual(self.calls(), ["dns", "startup", "sni", "report", "reconcile"])
 
     def test_an_all_in_one_panel_that_answers_with_no_nodes_is_not_verified(self):
         # The node list is the readback that proves the credentials in this
@@ -2337,6 +2346,7 @@ class TestResumePanelReuse(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("the planned local node has an unexpected address, port or UUID", result.stderr)
         self.assertNotIn("checkpoint=local-node", result.stdout)
         self.assertEqual(self.calls(), ["dns", "startup", "sni", "mtls"])
 
@@ -2392,6 +2402,28 @@ class TestResumePanelReuse(unittest.TestCase):
         self.assertNotIn("INSTALL", result.stdout)
         self.assertIn("finish=1", result.stdout)
         self.assertIn("Check Panel health, DNS, TLS and the security report", result.stderr)
+        self.assertEqual(self.calls(), ["verify"])
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+
+    def test_an_unreachable_panel_is_reported_once_and_leaves_the_checkpoint(self):
+        # The reconciliation already named the unread Panel; the resume must not
+        # repeat it as a generic readback failure, and must not downgrade the
+        # record a later retry compares against.
+        self.seed_panel()
+        result = self.run_install(
+            "GOWAVE_DRAFT_RESUMED=1\nGOWAVE_WIZARD_LANG=en\n"
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 3; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+            "printf 'finish=%s\\n' \"$finish\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("finish=1", result.stdout)
+        self.assertNotIn("Check Panel health, DNS, TLS and the security report", result.stderr,
+                         "the unreachable verdict was repeated as a generic readback failure")
         self.assertEqual(self.calls(), ["verify"])
         self.assertIn("checkpoint=panel:verified", result.stdout)
 
@@ -2485,6 +2517,323 @@ class TestResumePanelReuse(unittest.TestCase):
                     self.assertEqual(self.calls(), ["lock"])
                 else:
                     self.assertEqual(self.calls(), ["lock", "inspect", "resume"])
+
+    # -- Resume reconciliation ------------------------------------------------
+    #
+    # A checkpoint is a verdict about a moment, so a resume compares the record
+    # with the Panel before it continues. These cases drive the shipped
+    # reconciliation with a draft, a state file and a Panel answer: a stopped
+    # component must not take its completed sibling with it, an unread Panel
+    # must write nothing, and a drifted component must be re-applied through
+    # the UUID the Panel issued rather than registered a second time.
+
+    OK_UUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    BAD_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    OTHER_UUID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    OK_PROFILE = "profile-ok"
+    BAD_PROFILE = "profile-bad"
+    OK_INBOUND = "inbound-ok"
+    BAD_INBOUND = "inbound-bad"
+    OK_HOST = "host-ok"
+    BAD_HOST = "host-bad"
+    NODE_PLAN = (
+        "GOWAVE_PLAN_VARIANT=multi-node\n"
+        "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+        "GOWAVE_PLAN_NODE_NAMES=('ok.example.com' 'bad.example.com')\n"
+        "GOWAVE_PLAN_NODE_CAMOUFLAGE=('cam-ok.example.com' 'cam-bad.example.com')\n"
+        "GOWAVE_PLAN_NODE_VISION=('' '')\n"
+        "GOWAVE_PLAN_NODE_LABELS=('ok-01' 'bad-01')\n"
+    )
+
+    def write_json(self, name, document):
+        path = Path(self.directory) / name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def seed_resume_plan(self):
+        result = self.run_install(
+            self.NODE_PLAN
+            + "draft_save_plan\n"
+            + f"draft_checkpoint node-1 verified complete 1 {self.OK_UUID}\n"
+            + f"draft_checkpoint node-2 verified complete 1 {self.BAD_UUID}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def resume_state(self):
+        return {
+            "schemaVersion": 2,
+            "installationMode": "multi-node",
+            "panelDomain": "panel.example.com",
+            "realityDomain": "cdn.example.com",
+            "squadUuid": "squad-ink",
+            "nodes": [
+                {"name": "ok-01", "address": "203.0.113.7", "port": 3002,
+                 "workerDomain": "ok.example.com", "realityDomain": "cam-ok.example.com",
+                 "uuid": self.OK_UUID, "profileUuid": self.OK_PROFILE,
+                 "hostUuids": [self.OK_HOST]},
+                {"name": "bad-01", "address": "203.0.113.8", "port": 3002,
+                 "workerDomain": "bad.example.com", "realityDomain": "cam-bad.example.com",
+                 "uuid": self.BAD_UUID, "profileUuid": self.BAD_PROFILE,
+                 "hostUuids": [self.BAD_HOST]},
+            ],
+        }
+
+    def live_document(self, ok_profile=None, bad_held=False):
+        ok_profile = ok_profile or self.OK_PROFILE
+        nodes = [{
+            "uuid": self.OK_UUID, "name": "ok-01",
+            "configProfile": {
+                "activeConfigProfileUuid": ok_profile,
+                "activeInbounds": [{"uuid": self.OK_INBOUND}],
+            },
+        }]
+        hosts = [{
+            "uuid": self.OK_HOST, "address": "ok.example.com", "sni": "cam-ok.example.com",
+            "inbound": {"configProfileUuid": self.OK_PROFILE,
+                        "configProfileInboundUuid": self.OK_INBOUND},
+            "nodes": [{"uuid": self.OK_UUID}],
+        }]
+        profiles = [{"uuid": self.OK_PROFILE, "inbounds": [self.OK_INBOUND]}]
+        if ok_profile != self.OK_PROFILE:
+            profiles.append({"uuid": ok_profile, "inbounds": [self.OK_INBOUND]})
+        if bad_held:
+            nodes.append({
+                "uuid": self.OTHER_UUID, "name": "bad-01",
+                "configProfile": {
+                    "activeConfigProfileUuid": self.BAD_PROFILE,
+                    "activeInbounds": [{"uuid": self.BAD_INBOUND}],
+                },
+            })
+        else:
+            nodes.append({
+                "uuid": self.BAD_UUID, "name": "bad-01",
+                "configProfile": {
+                    "activeConfigProfileUuid": self.BAD_PROFILE,
+                    "activeInbounds": [{"uuid": self.BAD_INBOUND}],
+                },
+            })
+            hosts.append({
+                "uuid": self.BAD_HOST, "address": "bad.example.com",
+                "sni": "cam-bad.example.com",
+                "inbound": {"configProfileUuid": self.BAD_PROFILE,
+                            "configProfileInboundUuid": self.BAD_INBOUND},
+                "nodes": [{"uuid": self.BAD_UUID}],
+            })
+        profiles.append({"uuid": self.BAD_PROFILE, "inbounds": [self.BAD_INBOUND]})
+        return {
+            "reachable": True, "schema_version": 2, "installer_revision": "test-1",
+            "nodes": nodes, "hosts": hosts, "profiles": profiles,
+        }
+
+    def reconcile(self, extra):
+        return self.run_install(
+            self.NODE_PLAN
+            + extra
+            + 'rc=0\n'
+            + "recovery_reconcile_resume_nodes || rc=$?\n"
+            + "printf 'RC=%d\\n' \"$rc\"\n"
+            + 'printf "stopped=%s\\n" "${RESUME_STOPPED_NODES[*]:-}"\n'
+            + 'printf "reapplied=%s\\n" "${RESUME_REAPPLIED_NODES[*]:-}"\n'
+            + "recovery_exclude_stopped_nodes\n"
+            + 'printf "names=%s\\n" "${GOWAVE_PLAN_NODE_NAMES[*]:-}"\n'
+            + 'printf "labels=%s\\n" "${GOWAVE_PLAN_NODE_LABELS[*]:-}"\n'
+            + DUMP_STORED_CHECKPOINTS
+        )
+
+    def test_a_pending_node_is_left_to_the_batch(self):
+        # A checkpoint that never reached a verdict is not reconciled: there is
+        # no identity to compare, and rewriting it here would fight the batch
+        # that is about to register it.
+        result = self.run_install(
+            self.NODE_PLAN
+            + "draft_save_plan\n"
+            + f"draft_checkpoint node-1 verified complete 1 {self.OK_UUID}\n"
+            + "draft_checkpoint node-2 pending registration 0\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state_path = self.write_json("state.json", self.resume_state())
+        live_path = self.write_json("live.json", self.live_document(bad_held=True))
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+        self.assertIn("checkpoint=node-2:pending", result.stdout)
+        self.assertNotIn("node-2", stored_values(result.stdout)["stopped"])
+
+    def test_a_stopped_component_keeps_its_completed_sibling(self):
+        self.seed_resume_plan()
+        state_path = self.write_json("state.json", self.resume_state())
+        live_path = self.write_json("live.json", self.live_document(bad_held=True))
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        self.assertEqual(values["stopped"], "node-2")
+        self.assertIn("checkpoint=node-1:verified", result.stdout,
+                      "a stopped sibling took the completed node with it")
+        self.assertIn("checkpoint=node-2:indeterminate", result.stdout)
+        self.assertIn("node-2 stopped;", result.stderr)
+        self.assertIn("held by UUID", result.stderr)
+        self.assertNotIn("node-1 stopped", result.stderr)
+        # The batch receives the completed sibling and not the stopped node.
+        self.assertEqual(values["names"], "ok.example.com")
+        self.assertEqual(values["labels"], "ok-01")
+
+    def test_an_unreachable_panel_leaves_the_draft_resumable(self):
+        self.seed_resume_plan()
+        draft_before = Path(self.path).read_bytes()
+        state_path = self.write_json("state.json", self.resume_state())
+        live_path = self.write_json("live.json", {"reachable": False, "error": "connection refused"})
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+            + "recovery_reapply_node() { printf 'REAPPLY\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "3",
+                         "an unread Panel was reported as a classified run")
+        self.assertEqual(result.stderr.count("did not answer the reconciliation readback"), 1,
+                         "the operator was told more than once about one readback")
+        self.assertEqual(Path(self.path).read_bytes(), draft_before,
+                         "an unread Panel rewrote the draft it could not check")
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+        self.assertNotIn("REAPPLY", self.calls())
+
+    def test_a_drifted_node_is_reapplied_and_never_registered_again(self):
+        self.seed_resume_plan()
+        state_path = self.write_json("state.json", self.resume_state())
+        drift_path = self.write_json("drift.json", self.live_document(ok_profile="profile-other"))
+        match_path = self.write_json("match.json", self.live_document())
+        counter = Path(self.directory) / "live-calls"
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"LIVE_DRIFT={shlex.quote(str(drift_path))}\n"
+            f"LIVE_MATCH={shlex.quote(str(match_path))}\n"
+            f"LIVE_COUNTER={shlex.quote(str(counter))}\n"
+            "recovery_panel_live_state() {\n"
+            "  local count=0\n"
+            "  [[ -f \"$LIVE_COUNTER\" ]] && count=$(cat \"$LIVE_COUNTER\")\n"
+            "  count=$((count + 1))\n"
+            "  printf '%s' \"$count\" > \"$LIVE_COUNTER\"\n"
+            "  if (( count == 1 )); then cat \"$LIVE_DRIFT\"; else cat \"$LIVE_MATCH\"; fi\n"
+            "}\n"
+            "recovery_reapply_node() {\n"
+            "  printf 'REAPPLY:%s:%s\\n' \"$1\" \"$2\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+            "  return 0\n"
+            "}\n"
+            "ssh_bootstrap_onboard_one() { printf 'ONBOARD\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        self.assertEqual(values["reapplied"], "node-1")
+        self.assertEqual(values["stopped"], "")
+        self.assertEqual(self.calls(), [f"REAPPLY:{self.OK_UUID}:{self.OK_PROFILE}"],
+                         "the drift was repaired by registering or onboarding instead of "
+                         "writing through the recorded UUID")
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+
+    def test_install_finish_holds_a_stopped_node_out_of_the_batch(self):
+        result = self.run_install(
+            self.NODE_PLAN
+            + "GOWAVE_DRAFT_RESUMED=1\n"
+            + "RESUME_STOPPED_NODES=(node-2)\n"
+            + "recovery_reconcile_resume_nodes() { return 0; }\n"
+            + "wizard_panel_installed_notice() { :; }\n"
+            + "cmd_user_links() { :; }\n"
+            + "aggregate_worker_security_reports() { return 0; }\n"
+            + "wizard_onboard_nodes() {\n"
+            + "  printf 'ONBOARD:%s\\n' \"${GOWAVE_PLAN_NODE_NAMES[*]}\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+            + "  return 0\n"
+            + "}\n"
+            + "rc=0\ninstall_finish panel.example.com admin || rc=$?\n"
+            + "printf 'RC=%d\\n' \"$rc\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2",
+                         "a stopped node left the run reporting complete readiness")
+        self.assertEqual(self.calls(), ["ONBOARD:ok.example.com"])
+        self.assertIn("1 component(s) stopped and held out of this batch", result.stderr)
+
+    def test_a_security_report_from_another_machine_stops_the_panel(self):
+        self.seed_panel()
+        now = datetime.now(timezone.utc).isoformat()
+
+        def report(host_id):
+            return {
+                "schema_version": 1, "host_id": host_id, "role": "panel-only",
+                "installer_revision": "test-1", "observed_at": now,
+                "controls": {
+                    name: {"policy": "required", "status": "verified",
+                           "reason_code": "OK", "recovery": "not-needed",
+                           "evidence_codes": ["PROBE"]}
+                    for name in ("firewall", "ssh_protection", "security_updates", "dot")
+                },
+            }
+
+        report_path = Path(self.directory) / "security-report.json"
+        recorded = report("machine-a")
+        report_path.write_text(json.dumps(recorded), encoding="utf-8")
+        live_path = self.write_json("live-report.json", report("machine-b"))
+        result = self.run_install(
+            self.READBACKS
+            + f"GOWAVE_SECURITY_REPORT={shlex.quote(str(report_path))}\n"
+            + "recovery_panel_live_state() {\n"
+            + "  printf '{\"reachable\": true, \"schema_version\": 2,"
+              " \"installer_revision\": \"test-1\", \"nodes\": [], \"hosts\": [], \"profiles\": []}'\n"
+            + "}\n"
+            + "write_security_report() { cp "
+            + shlex.quote(str(live_path)) + ' "$GOWAVE_SECURITY_REPORT"; return 0; }\n'
+            + "rc=0\nresume_verify_panel panel.example.com panel-only || rc=$?\n"
+            + "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("panel stopped;", result.stderr)
+        self.assertIn("comes from host machine-b", result.stderr)
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+        self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), recorded,
+                         "the refused host's report replaced the recorded identity")
+
+    def test_an_incompatible_panel_stops_itself_without_rewriting_the_checkpoint(self):
+        state_path = self.write_json("state.json", {"schemaVersion": 2})
+        live_path = self.write_json("live.json", {
+            "reachable": True, "schema_version": 3, "installer_revision": "test-1",
+            "nodes": [], "hosts": [], "profiles": [],
+        })
+        result = self.run_install(
+            "GOWAVE_PLAN_VARIANT=panel-only\n"
+            "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+            "draft_save_plan\n"
+            "draft_checkpoint panel verified complete 1\n"
+            "GOWAVE_DRAFT_RESUMED=1\n"
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+            "recovery_reapply_node() { printf 'REAPPLY\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+            "rc=0\nresume_reconcile_panel_identity panel-only || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("panel stopped;", result.stderr)
+        self.assertIn("schema 3", result.stderr)
+        self.assertIn("recorded checkpoint is unchanged", result.stderr)
+        self.assertIn("checkpoint=panel:verified", result.stdout,
+                      "the stopped Panel lost the record the next run must compare")
+        self.assertNotIn("REAPPLY", self.calls())
 
 
 class TestNodeRegistrationReadback(unittest.TestCase):

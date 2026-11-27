@@ -646,6 +646,16 @@ class GoWaveClient:
             raise GoWaveAPIError(f"5-point checklist failure: expected {expected_count} inbounds, got {len(inbounds)}")
 
         # Retrieve inbounds list
+        inbounds_list = self.list_profile_inbounds(profile_uuid)
+        return {"profile_uuid": profile_uuid, "inbounds": inbounds_list}
+
+    def list_profile_inbounds(self, profile_uuid):
+        """The inbounds one profile holds, as the Panel answers them.
+
+        The provisioning checklist and the resume re-apply both read the same
+        answer: a profile is the authority on which inbound UUIDs exist, so a
+        recorded association is only re-appliable when its inbounds are here.
+        """
         inbounds_res = self.request("GET", f"/api/config-profiles/{profile_uuid}/inbounds")
         inbounds_data = inbounds_res.get("response", inbounds_res) if isinstance(inbounds_res, dict) else inbounds_res
         if isinstance(inbounds_data, dict) and "inbounds" in inbounds_data:
@@ -654,7 +664,7 @@ class GoWaveClient:
             inbounds_list = inbounds_data
         else:
             inbounds_list = []
-        return {"profile_uuid": profile_uuid, "inbounds": inbounds_list}
+        return [item for item in inbounds_list if isinstance(item, dict)]
 
     def list_nodes(self):
         """The nodes the Panel already holds.
@@ -1070,6 +1080,190 @@ class GoWaveClient:
             if e.status_code == 404:
                 return None
             raise
+
+
+def read_admin_credentials(credentials_path):
+    """The administrative login a credentials file records.
+
+    The credentials file is written by the install and read by the resume; both
+    have to accept the same spelling, including the older ``Admin Username:``
+    form the backup restore still writes.
+    """
+    values = {}
+    try:
+        text = Path(credentials_path).read_text(encoding="utf-8")
+    except OSError:
+        return {"username": "", "password": ""}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and not key.lstrip().startswith("#"):
+            values[key.strip()] = value.strip()
+            continue
+        key, separator, value = line.partition(":")
+        if separator:
+            values[key.strip()] = value.strip()
+    username = values.get("ADMIN_USERNAME") or values.get("Admin Username") or ""
+    password = values.get("ADMIN_PASSWORD") or values.get("Admin Password") or ""
+    return {"username": username, "password": password}
+
+
+def _read_state_document(state_path):
+    """state.json as the resume reads it: a regular file this product wrote."""
+    path = Path(state_path)
+    if not os.path.lexists(path):
+        raise GoWaveAPIError("state.json is absent")
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise GoWaveAPIError("state.json is not a regular file")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise GoWaveAPIError(f"state.json cannot be read ({type(exc).__name__})") from exc
+    if not isinstance(state, dict):
+        raise GoWaveAPIError("state.json does not hold an object")
+    return state
+
+
+def resume_live_inventory(credentials_path, state_path=None, base_url="http://127.0.0.1:3000",
+                          profile_uuids=()):
+    """The Panel answer a resume reconciles before it trusts its draft.
+
+    ``nodes`` and ``hosts`` are what the Panel holds now; ``schema_version`` is
+    the schema of the state file on the Panel host, which is the version claim
+    the installer can check. ``profiles`` carries the inbound UUIDs of every
+    profile the draft recorded, so a recorded association can be compared with
+    what the profile still offers instead of being assumed.
+
+    Raises ``GoWaveAPIError``, ``OSError`` or ``ValueError`` when the Panel or
+    its state cannot be read: the caller reports that as `unreachable`, never
+    as a missing component.
+    """
+    credentials = read_admin_credentials(credentials_path)
+    if not credentials["username"] or not credentials["password"]:
+        raise GoWaveAPIError("the credentials file holds no administrative login")
+    client = GoWaveClient(base_url)
+    client.login(credentials["username"], credentials["password"])
+    inventory = {
+        "reachable": True,
+        "nodes": client.list_nodes(),
+        "hosts": _extract_list(client.request("GET", "/api/hosts"), "hosts"),
+        "profiles": [],
+    }
+    if state_path:
+        state = _read_state_document(state_path)
+        inventory["schema_version"] = state.get("schemaVersion")
+    for profile_uuid in sorted({str(uuid) for uuid in profile_uuids if uuid}):
+        inbounds = client.list_profile_inbounds(profile_uuid)
+        inventory["profiles"].append({
+            "uuid": profile_uuid,
+            "inbounds": [item.get("uuid") for item in inbounds if item.get("uuid")],
+        })
+    return inventory
+
+
+def reapply_node_identity(credentials_path, state_path, node_uuid, profile_uuid=None,
+                          journal_path=None, base_url="http://127.0.0.1:3000"):
+    """Re-apply a drifted node's recorded profile, inbounds and Host records.
+
+    This is the repair a `drift` verdict names. It writes through the UUIDs the
+    state file recorded — the node is updated in place and every Host is
+    adopted by its recorded UUID — so it cannot register a second node and
+    cannot adopt a record this deployment did not create. When the write is
+    journaled and then fails, the recorded actions are rolled back before the
+    error leaves the function.
+
+    Returns ``{"node_uuid", "profile_uuid", "inbound_uuids", "host_uuids"}``.
+    """
+    state = _read_state_document(state_path)
+    nodes = state.get("nodes") if isinstance(state.get("nodes"), list) else []
+    entry = next(
+        (node for node in nodes
+         if isinstance(node, dict) and str(node.get("uuid") or "") == str(node_uuid)),
+        None,
+    )
+    if entry is None:
+        raise GoWaveAPIError(f"state.json records no node with UUID {node_uuid}")
+    name = str(entry.get("name") or "")
+    address = str(entry.get("address") or "")
+    port = entry.get("port")
+    profile_uuid = profile_uuid or entry.get("profileUuid") or state.get("profileUuid")
+    if not name or not address or type(port) is not int:
+        raise GoWaveAPIError(f"state.json has no complete registration for node {node_uuid}")
+    if not isinstance(profile_uuid, str) or not profile_uuid:
+        raise GoWaveAPIError(f"state.json records no profile for node {node_uuid}")
+    squad_uuid = str(state.get("squadUuid") or "")
+
+    credentials = read_admin_credentials(credentials_path)
+    if not credentials["username"] or not credentials["password"]:
+        raise GoWaveAPIError("the credentials file holds no administrative login")
+    client = GoWaveClient(base_url)
+    client.login(credentials["username"], credentials["password"])
+    inbounds = client.list_profile_inbounds(profile_uuid)
+    inbound_uuids = [str(item.get("uuid")) for item in inbounds if item.get("uuid")]
+    if not inbound_uuids:
+        raise GoWaveAPIError(f"profile {profile_uuid} holds no inbounds to re-apply")
+
+    journal = None
+    if journal_path:
+        from modules.recovery import write_journal_atomically
+        journal = {
+            "transaction_id": f"resume_reapply_{node_uuid}",
+            "op": "provision",
+            "state": "PROVISION_PREPARED",
+            "node_uuid": node_uuid,
+            "entities": {},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        write_journal_atomically(str(journal_path), journal)
+
+        def persist(entities):
+            journal["state"] = "PROVISION_APPLYING"
+            journal["entities"] = list(entities)
+            journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_journal_atomically(str(journal_path), journal)
+
+        client.transaction_callback = persist
+
+    try:
+        client.associate_node(
+            name, address, port, profile_uuid, inbound_uuids,
+            existing_node_uuid=node_uuid,
+        )
+        host_uuids = []
+        if entry.get("hostUuids"):
+            if not squad_uuid:
+                raise GoWaveAPIError(
+                    f"state.json records Host records for node {node_uuid} but no squad to keep them in")
+            front_domain = str(entry.get("workerDomain") or state.get("panelDomain") or "")
+            reality_domain = str(entry.get("realityDomain") or state.get("realityDomain") or "")
+            host_uuids = client.provision_hosts(
+                profile_uuid, inbounds, node_uuid, squad_uuid,
+                front_domain, reality_domain, name,
+                vision_domain=entry.get("visionDomain"),
+                known_host_uuids=[str(uuid) for uuid in entry.get("hostUuids") if uuid],
+                country=str(entry.get("country") or ""),
+            )
+    except Exception:
+        if journal is not None:
+            try:
+                rollback_provisioning(str(journal_path), state_path, credentials_path, base_url=base_url)
+            except Exception:  # the original error is the one the caller needs
+                pass
+        raise
+
+    if journal is not None:
+        from modules.recovery import write_journal_atomically
+        journal["entities"] = list(client.transaction_entities)
+        journal["state"] = "PROVISION_COMMITTED"
+        journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_path), journal)
+
+    return {
+        "node_uuid": str(node_uuid),
+        "profile_uuid": profile_uuid,
+        "inbound_uuids": inbound_uuids,
+        "host_uuids": [str(uuid) for uuid in host_uuids],
+    }
 
 
 def confirmed_country(value, previous=""):

@@ -2,6 +2,7 @@ import copy
 import fcntl
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import unittest
 from unittest import mock
 
 from modules import deployment_state as state
+from modules import resume_reconcile
 
 
 class TestDeploymentState(unittest.TestCase):
@@ -265,3 +267,281 @@ class TestDeploymentDraftCli(unittest.TestCase):
         result = self.run_cli('--load', '--owner-uid', str(os.geteuid() + 1))
         self.assertEqual(result.returncode, state.EXIT_INVALID)
         self.assertIn('current user', result.stderr)
+
+    # -- The resume expectation ----------------------------------------------
+    #
+    # A resume may not replay a saved verdict, so it asks the store what the
+    # checkpoint recorded and compares that with the Panel. These cases pin the
+    # recorded half of that comparison: the identity, profile, Host UUIDs and
+    # domains the draft owns, and nothing filled in from the live answer.
+
+    def test_expectation_prints_the_identity_the_checkpoint_owns(self):
+        self.assertEqual(self.plan_cli(self.plan).returncode, state.EXIT_OK)
+        marked = self.run_cli('--checkpoint', 'node-1', stdin=json.dumps({
+            'state': 'verified', 'stage': 'complete', 'attempt': 1,
+            'node_uuid': '3d5c9a71-0000-4000-8000-000000000000',
+            'profile_uuid': '3d5c9a71-0000-4000-8000-000000000001',
+            'host_uuids': ['3d5c9a71-0000-4000-8000-000000000002'],
+        }))
+        self.assertEqual(marked.returncode, state.EXIT_OK, marked.stderr)
+        result = self.run_cli('--expectation', 'node-1')
+        self.assertEqual(result.returncode, state.EXIT_OK, result.stderr)
+        expectation = json.loads(result.stdout)
+        self.assertEqual(expectation['component'], 'node-1')
+        self.assertEqual(expectation['kind'], 'node')
+        recorded = expectation['recorded']
+        self.assertEqual(recorded['node_uuid'], '3d5c9a71-0000-4000-8000-000000000000')
+        self.assertEqual(recorded['profile_uuid'], '3d5c9a71-0000-4000-8000-000000000001')
+        self.assertEqual(recorded['host_uuids'], ['3d5c9a71-0000-4000-8000-000000000002'])
+        self.assertEqual(recorded['node_name'], 'Worker 1')
+        self.assertEqual(recorded['installer_revision'], 'test-1')
+        self.assertEqual(recorded['state'], 'verified')
+        self.assertEqual(recorded['attempt'], 1)
+
+    def test_expectation_names_the_domains_the_plan_answered(self):
+        plan = dict(self.plan, answers={
+            'primary_domain': 'panel.example.com',
+            'reality_domain': 'cdn.example.com',
+            'vision_domain': 'vision.example.com',
+        })
+        self.assertEqual(self.plan_cli(plan).returncode, state.EXIT_OK)
+        self.assertEqual(self.run_cli('--checkpoint', 'panel', stdin=json.dumps({
+            'state': 'verified', 'stage': 'complete', 'attempt': 1})).returncode, state.EXIT_OK)
+        expectation = json.loads(self.run_cli('--expectation', 'panel').stdout)
+        self.assertEqual(expectation['kind'], 'panel')
+        self.assertEqual(expectation['recorded']['host_domains'],
+                         ['panel.example.com', 'cdn.example.com', 'vision.example.com'])
+
+    def test_expectation_of_an_unrecorded_component_is_refused(self):
+        self.assertEqual(self.plan_cli(self.plan).returncode, state.EXIT_OK)
+        result = self.run_cli('--expectation', 'node-1')
+        self.assertEqual(result.returncode, state.EXIT_INVALID)
+        self.assertIn('checkpoint is absent', result.stderr)
+        self.assertEqual(self.run_cli('--expectation', 'node-9').returncode, state.EXIT_INVALID)
+
+    # -- The resume classifier -----------------------------------------------
+    #
+    # `modules.resume_reconcile` is the single comparison a resumed component
+    # goes through. These cases drive it with recorded and live answers for
+    # every class it can answer, so a change in the vocabulary fails here.
+
+    OK_NODE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    OTHER_NODE = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    OK_HOST = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+
+    def expectation(self, **recorded):
+        base = {
+            'state': 'verified', 'stage': 'complete', 'attempt': 1,
+            'node_uuid': self.OK_NODE, 'profile_uuid': 'profile-ok',
+            'inbound_uuids': ['inb-ok'], 'host_uuids': [self.OK_HOST],
+            'node_name': 'ok-01',
+            'host_domains': ['ok.example.com', 'cam-ok.example.com'],
+            'installer_revision': 'test-1',
+        }
+        base.update(recorded)
+        return {'component': 'node-1', 'kind': 'node', 'recorded': base}
+
+    def live(self, **overrides):
+        document = {
+            'reachable': True, 'schema_version': 2, 'installer_revision': 'test-1',
+            'nodes': [{
+                'uuid': self.OK_NODE, 'name': 'ok-01',
+                'configProfile': {
+                    'activeConfigProfileUuid': 'profile-ok',
+                    'activeInbounds': [{'uuid': 'inb-ok'}],
+                },
+            }],
+            'hosts': [{
+                'uuid': self.OK_HOST,
+                'address': 'ok.example.com', 'sni': 'cam-ok.example.com',
+                'inbound': {
+                    'configProfileUuid': 'profile-ok',
+                    'configProfileInboundUuid': 'inb-ok',
+                },
+                'nodes': [{'uuid': self.OK_NODE}],
+            }],
+            'profiles': [{'uuid': 'profile-ok', 'inbounds': ['inb-ok']}],
+        }
+        document.update(overrides)
+        return document
+
+    def security_report(self, host_id='machine-a', role='worker', status='verified'):
+        controls = {}
+        for name in ('firewall', 'ssh_protection', 'security_updates', 'dot'):
+            controls[name] = {
+                'policy': 'required',
+                'status': status,
+                'reason_code': 'OK' if status == 'verified' else 'CONTROL_FAILED',
+                'recovery': 'not-needed' if status == 'verified' else 'verified',
+                'evidence_codes': ['PROBE'],
+            }
+        return {
+            'schema_version': 1,
+            'host_id': host_id,
+            'role': role,
+            'installer_revision': 'test-1',
+            'observed_at': datetime.now(timezone.utc).isoformat(),
+            'controls': controls,
+        }
+
+    def test_a_recorded_component_the_panel_still_holds_is_a_match(self):
+        verdict = resume_reconcile.classify(self.expectation(), self.live())
+        self.assertEqual(verdict.status, 'match')
+        self.assertEqual(verdict.action, 'keep')
+        self.assertEqual(verdict.node_uuid, self.OK_NODE)
+
+    def test_a_component_the_panel_no_longer_holds_is_missing(self):
+        verdict = resume_reconcile.classify(
+            self.expectation(), self.live(nodes=[], hosts=[]))
+        self.assertEqual(verdict.status, 'missing')
+        self.assertEqual(verdict.action, 'recreate')
+        self.assertEqual(verdict.reason, 'node_absent')
+
+    def test_a_present_node_with_another_association_is_drift(self):
+        live = self.live()
+        live['nodes'][0]['configProfile']['activeConfigProfileUuid'] = 'profile-other'
+        live['profiles'].append({'uuid': 'profile-other', 'inbounds': ['inb-other']})
+        verdict = resume_reconcile.classify(self.expectation(), live)
+        self.assertEqual(verdict.status, 'drift')
+        self.assertEqual(verdict.action, 'reapply')
+        self.assertEqual(verdict.reason, 'profile_association_changed')
+        self.assertEqual(verdict.node_uuid, self.OK_NODE,
+                         'the re-apply lost the UUID it must write through')
+
+    def test_a_state_schema_this_installer_cannot_serve_is_incompatible(self):
+        verdict = resume_reconcile.classify(self.expectation(), self.live(schema_version=3))
+        self.assertEqual(verdict.status, 'incompatible')
+        self.assertEqual(verdict.action, 'stop')
+        self.assertEqual(verdict.reason, 'state_schema_unsupported')
+        self.assertIn('schema 3', verdict.detail)
+
+    def test_a_checkpoint_without_an_identity_is_ambiguous(self):
+        verdict = resume_reconcile.classify(self.expectation(node_uuid=''), self.live())
+        self.assertEqual(verdict.status, 'ambiguous')
+        self.assertEqual(verdict.reason, 'node_identity_unrecorded')
+
+    def test_an_unreadable_panel_is_unreachable_and_not_missing(self):
+        for live in (None, {'reachable': False, 'error': 'connection refused'}):
+            with self.subTest(live=live):
+                verdict = resume_reconcile.classify(self.expectation(), live)
+                self.assertEqual(verdict.status, 'unreachable')
+                self.assertEqual(verdict.action, 'retry')
+                self.assertEqual(verdict.reason, 'panel_unreachable')
+
+    def test_a_name_held_by_another_uuid_is_never_adopted_or_duplicated(self):
+        live = self.live()
+        live['nodes'] = [{
+            'uuid': self.OTHER_NODE, 'name': 'ok-01',
+            'configProfile': {
+                'activeConfigProfileUuid': 'profile-other',
+                'activeInbounds': [{'uuid': 'inb-other'}],
+            },
+        }]
+        live['hosts'] = []
+        verdict = resume_reconcile.classify(self.expectation(), live)
+        self.assertEqual(verdict.status, 'ambiguous')
+        self.assertEqual(verdict.reason, 'node_name_held')
+        self.assertIn(self.OTHER_NODE, verdict.detail)
+        self.assertEqual(verdict.node_uuid, '',
+                         'a name collision must not be reported as a proven identity')
+
+    def test_a_domain_held_by_an_unrecorded_host_is_ambiguous(self):
+        live = self.live(hosts=[{
+            'uuid': 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+            'address': 'ok.example.com', 'sni': 'cam-ok.example.com',
+            'inbound': {
+                'configProfileUuid': 'profile-ok',
+                'configProfileInboundUuid': 'inb-ok',
+            },
+            'nodes': [{'uuid': self.OK_NODE}],
+        }])
+        verdict = resume_reconcile.classify(self.expectation(), live)
+        self.assertEqual(verdict.status, 'ambiguous')
+        self.assertEqual(verdict.reason, 'host_domain_held_elsewhere')
+
+    def test_drift_always_carries_the_recorded_uuid(self):
+        # Every drift path re-applies through the UUID the Panel issued. A
+        # verdict that named no UUID, or that said `recreate`, would be the
+        # path that registers a second node.
+        live = self.live()
+        live['nodes'][0]['configProfile']['activeInbounds'] = [
+            {'uuid': 'inb-ok'}, {'uuid': 'inb-new'}]
+        live['profiles'][0]['inbounds'] = ['inb-ok', 'inb-new']
+        verdict = resume_reconcile.classify(self.expectation(), live)
+        self.assertEqual(verdict.status, 'drift')
+        self.assertEqual(verdict.node_uuid, self.OK_NODE)
+        self.assertNotEqual(verdict.action, 'recreate')
+
+        live = self.live()
+        live['hosts'][0]['inbound']['configProfileInboundUuid'] = 'inb-ok'
+        live['hosts'][0]['nodes'] = [{'uuid': self.OK_NODE}, {'uuid': self.OTHER_NODE}]
+        verdict = resume_reconcile.classify(self.expectation(), live)
+        self.assertEqual(verdict.status, 'ambiguous',
+                         'a Host shared with another node is not re-appliable')
+        self.assertEqual(verdict.reason, 'host_claim_conflict')
+
+    def test_a_recorded_endpoint_that_moved_is_drift_and_not_a_second_node(self):
+        live = self.live()
+        live['nodes'][0]['address'] = '198.51.100.9'
+        live['nodes'][0]['port'] = 3002
+        verdict = resume_reconcile.classify(
+            self.expectation(address='203.0.113.7', port=3002), live)
+        self.assertEqual(verdict.status, 'drift')
+        self.assertEqual(verdict.reason, 'node_endpoint_changed')
+        self.assertEqual(verdict.node_uuid, self.OK_NODE)
+
+    def test_a_host_record_that_lost_a_planned_domain_is_drift(self):
+        live = self.live()
+        live['hosts'][0]['sni'] = 'other.example.com'
+        verdict = resume_reconcile.classify(self.expectation(), live)
+        self.assertEqual(verdict.status, 'drift')
+        self.assertEqual(verdict.reason, 'host_domain_missing')
+        self.assertEqual(verdict.node_uuid, self.OK_NODE)
+
+    def test_a_security_report_from_another_machine_is_ambiguous(self):
+        security = {
+            'recorded': self.security_report(host_id='machine-a'),
+            'live': self.security_report(host_id='machine-b'),
+        }
+        verdict = resume_reconcile.classify(self.expectation(), self.live(), security)
+        self.assertEqual(verdict.status, 'ambiguous')
+        self.assertEqual(verdict.reason, 'security_identity_changed')
+
+    def test_a_failed_security_control_is_drift_not_a_stop(self):
+        security = {
+            'recorded': self.security_report(),
+            'live': self.security_report(status='failed'),
+        }
+        verdict = resume_reconcile.classify(self.expectation(), self.live(), security)
+        self.assertEqual(verdict.status, 'drift')
+        self.assertEqual(verdict.reason, 'security_not_ready')
+
+    def test_an_unreadable_host_identity_is_unreachable(self):
+        security = {'recorded': self.security_report(), 'error': 'unreachable'}
+        verdict = resume_reconcile.classify(self.expectation(), self.live(), security)
+        self.assertEqual(verdict.status, 'unreachable')
+        self.assertEqual(verdict.reason, 'host_unreachable')
+
+    def test_the_cli_classifies_one_document_and_names_the_result(self):
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+        document = {'expectation': self.expectation(), 'live': self.live()}
+        result = subprocess.run(
+            [sys.executable, '-m', 'modules.resume_reconcile', '--classify'],
+            input=json.dumps(document), text=True, capture_output=True,
+            env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual(verdict['class'], 'match')
+        self.assertEqual(verdict['action'], 'keep')
+        self.assertEqual(verdict['component'], 'node-1')
+
+    def test_the_probe_without_a_readable_panel_reports_it_as_unreachable(self):
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+        result = subprocess.run(
+            [sys.executable, '-m', 'modules.resume_reconcile', '--probe',
+             '--credentials', str(Path(self.temporary.name) / 'missing-credentials')],
+            text=True, capture_output=True, env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['reachable'], False)

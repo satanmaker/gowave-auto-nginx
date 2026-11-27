@@ -971,6 +971,27 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Distributed Worker VPS Deployment Verification",
     },
     {
+        "id": "FW-08",
+        "requirement": "Security and network isolation verification",
+        "assertion": "A reload does not undo the managed ingress: with the policy applied, `ufw reload`, `systemctl reload nginx` and a full restart of the web server leave the IPv4 and IPv6 rule sets and the listening sockets byte-identical to the snapshot taken before them, so a certificate renewal cannot quietly replace a managed policy with an unmanaged one. A reload that exits non-zero, or a rule set or listener list that differs afterwards, fails the case.",
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "FW-07",
+        "requirement": "Security and network isolation verification",
+        "assertion": "Re-applying the Worker's firewall policy does not cut the control path it runs over: an established multiplexed SSH session from the Master answers `-O check` after the Worker's policy is re-applied over that same session, and the Worker's SSH unit is still active. A refusal that tears the session down, or a session that survives while the transport underneath is dead, fails the case — a fresh login is not evidence, because the policy allows the Master.",
+        "topology": ["multi-node"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "NGX-PIN",
+        "requirement": "Independent Multi-Node acceptance topology",
+        "assertion": "Both roles carry the approved NGINX installation and not the distribution build: `dpkg-query -W nginx` on the Master and on the Worker reports exactly the suite-suffixed revision `1.30.8-1~<bookworm|trixie|noble|resolute>`, `nginx -V` shows both a static `--with-stream` and `--with-stream_ssl_preread_module` so the Stream SNI plane is really built in, and the host's APT history holds the download of `nginx_1.30.8-1~<suite>_<arch>.deb`, which the distribution archive cannot produce at that revision. A host left on its archive version, a build without the Stream SNI module, or an install with no record of the approved package fails the case instead of passing as configured.",
+        "topology": ["multi-node"],
+        "promotion_target": "Independent Multi-Node acceptance topology",
+    },
+    {
         "id": "MN-WORKER-RESUME",
         "requirement": "Distributed Worker VPS Deployment Verification",
         "assertion": "A Worker that was successfully provisioned and deployed is re-verified on resume: the public TLS certificate for each planned SNI (primary, REALITY camouflage, optional Vision) is verified at the Worker's primary endpoint, and the security report is read back via trusted, non-interactive SSH to confirm role, DoT policy, firewall, Fail2ban, security updates and DNS policy freshness. A TLS or security readback failure holds only that Worker as indeterminate without repeating registration or affecting siblings. No temporary key is installed and no report is written remotely by the readback.",

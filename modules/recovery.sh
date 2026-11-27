@@ -509,3 +509,476 @@ prune_snapshots('$RECOVERY_DIR')
 "
     echo "Switched to channel '$target_channel' successfully."
 }
+
+# ---------------------------------------------------------------------------
+# Resume reconciliation
+#
+# A checkpoint is a verdict about a moment. A resume reads the same records
+# again before it continues, and `modules/resume_reconcile.py` is the single
+# place that decides whether what the Panel and the host answer is still what
+# the draft recorded. The functions below hand it the draft's expectation and
+# the live answer and translate one verdict into a checkpoint write and an
+# operator sentence:
+#
+#   match                        keep the completed checkpoint
+#   missing / drift             re-create or re-apply only that component
+#   incompatible / ambiguous    stop only that component, name why
+#   unreachable                  write nothing; the draft stays resumable
+#
+# The expectation comes from the draft and from state.json — both records this
+# deployment wrote. Nothing is filled in from the Panel answer, because an
+# expectation copied from the answer would agree with itself.
+# ---------------------------------------------------------------------------
+
+# Node checkpoints a resume stopped, will re-create or re-applied, by identity.
+RESUME_STOPPED_NODES=()
+RESUME_RECREATED_NODES=()
+RESUME_REAPPLIED_NODES=()
+
+recovery_resume_root() {
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
+}
+
+# One field of a JSON document, as text. Args: document, dotted path.
+recovery_json_field() {
+    python3 -c '
+import json
+import sys
+
+value = json.load(sys.stdin)
+for part in sys.argv[1].split("."):
+    if not isinstance(value, dict):
+        value = None
+        break
+    value = value.get(part)
+if value is None:
+    print("", end="")
+elif isinstance(value, str):
+    print(value, end="")
+else:
+    print(json.dumps(value), end="")
+' "$2" <<< "$1"
+}
+
+# The Panel answer a resume reconciles, or {"reachable": false} when it cannot
+# be read. Never fails: an unread Panel is a classification, not a crash.
+#
+# Args: credentials file, state file, running installer revision, profile UUIDs
+recovery_panel_live_state() {
+    local credentials="$1" state_file="${2:-}" revision="${3:-}"
+    local profile
+    local -a profile_args=() profiles=("${@:4}")
+    for profile in "${profiles[@]}"; do
+        if [[ -n "$profile" ]]; then
+            profile_args+=(--profile "$profile")
+        fi
+    done
+    local root
+    root=$(recovery_resume_root)
+    PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m modules.resume_reconcile --probe \
+            --credentials "$credentials" \
+            --state "$state_file" \
+            --installer-revision "$revision" \
+            "${profile_args[@]}"
+}
+
+# What one checkpoint recorded, from the draft alone.
+recovery_draft_expectation() {
+    local identity="$1" root
+    declare -F draft_load >/dev/null 2>&1 || return 1
+    root=$(recovery_resume_root)
+    PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m modules.deployment_state \
+            --path "${GOWAVE_DRAFT_PATH:-/var/lib/gowave-auto-nginx/deployment/active.json}" \
+            --expectation "$identity"
+}
+
+# Fill the identities a checkpoint written before they were recorded took from
+# the state file the same deployment wrote. Nothing here reads the Panel.
+#
+# Args: expectation JSON, state file
+recovery_expectation_with_state() {
+    local expectation="$1" state_file="${2:-}"
+    RECOVERY_EXPECTATION="$expectation" RECOVERY_STATE="$state_file" python3 - <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+expectation = json.loads(os.environ['RECOVERY_EXPECTATION'])
+recorded = expectation.setdefault('recorded', {})
+state_path = Path(os.environ.get('RECOVERY_STATE') or '')
+if state_path and os.path.lexists(state_path) and not os.path.islink(state_path) \
+        and stat.S_ISREG(os.stat(state_path).st_mode):
+    try:
+        state = json.loads(state_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        state = None
+    if isinstance(state, dict):
+        nodes = [node for node in state.get('nodes') or [] if isinstance(node, dict)]
+        node_uuid = str(recorded.get('node_uuid') or '')
+        name = str(recorded.get('node_name') or '').lower()
+        entry = None
+        for candidate in nodes:
+            if node_uuid and str(candidate.get('uuid') or '') == node_uuid:
+                entry = candidate
+                break
+        if entry is None and name:
+            for candidate in nodes:
+                if str(candidate.get('name') or '').lower() == name:
+                    entry = candidate
+                    break
+        if entry is not None:
+            if not recorded.get('node_uuid') and entry.get('uuid'):
+                recorded['node_uuid'] = str(entry['uuid'])
+            if not recorded.get('profile_uuid'):
+                profile = entry.get('profileUuid') or state.get('profileUuid')
+                if profile:
+                    recorded['profile_uuid'] = str(profile)
+            if not recorded.get('host_uuids'):
+                hosts = entry.get('hostUuids')
+                if isinstance(hosts, list) and hosts:
+                    recorded['host_uuids'] = [str(uuid) for uuid in hosts if uuid]
+            if not recorded.get('address') and entry.get('address'):
+                recorded['address'] = str(entry['address'])
+            if recorded.get('port') is None and type(entry.get('port')) is int:
+                recorded['port'] = entry['port']
+json.dump(expectation, sys.stdout)
+PY
+}
+
+# One classified verdict, as a tab-separated line:
+#   class  action  reason  detail  node_uuid
+#
+# Args: expectation JSON, live JSON, [security JSON]
+recovery_classify_component() {
+    local expectation="$1" live="$2" security="${3:-}" root document
+    root=$(recovery_resume_root)
+    document=$(RECOVERY_EXPECTATION="$expectation" RECOVERY_LIVE="$live" \
+        RECOVERY_SECURITY="$security" python3 - <<'PY'
+import json
+import os
+import sys
+
+document = {
+    'expectation': json.loads(os.environ['RECOVERY_EXPECTATION']),
+    'live': json.loads(os.environ['RECOVERY_LIVE']),
+}
+security = os.environ.get('RECOVERY_SECURITY') or ''
+if security:
+    try:
+        document['security'] = json.loads(security)
+    except ValueError:
+        pass
+json.dump(document, sys.stdout)
+PY
+    ) || return 1
+    printf '%s' "$document" \
+        | PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m modules.resume_reconcile --classify \
+        | python3 -c '
+import json
+import sys
+
+verdict = json.load(sys.stdin)
+print("\t".join([
+    verdict["class"],
+    verdict["action"],
+    verdict["reason"],
+    verdict["detail"],
+    verdict.get("node_uuid") or "",
+]))
+'
+}
+
+# Write one checkpoint through the draft store. Args: identity, JSON update
+recovery_draft_checkpoint_record() {
+    local identity="$1" payload="$2" root
+    [[ -n "${GOWAVE_DRAFT_PATH:-}" ]] || return 1
+    root=$(recovery_resume_root)
+    printf '%s' "$payload" \
+        | PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m modules.deployment_state \
+                --path "$GOWAVE_DRAFT_PATH" --checkpoint "$identity" >/dev/null
+}
+
+# Record that one component was stopped, keeping its identity for the operator.
+# Args: identity, reason code, attempt
+recovery_checkpoint_stop() {
+    local identity="$1" reason="$2" attempt="${3:-0}" payload
+    [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+    payload=$(printf \
+        '{"state":"indeterminate","stage":"verification","attempt":%d,"reason_code":"%s","recovery":"unknown"}' \
+        "$((attempt + 1))" "${reason^^}")
+    recovery_draft_checkpoint_record "$identity" "$payload"
+}
+
+# Record a component whose recorded association was just re-applied.
+# Args: identity, attempt, node UUID, [profile UUID], [space-separated Host UUIDs]
+recovery_checkpoint_verified() {
+    local identity="$1" attempt="$2" node_uuid="$3" profile_uuid="${4:-}" hosts="${5:-}" payload
+    payload=$(RECOVERY_ATTEMPT="$attempt" RECOVERY_NODE_UUID="$node_uuid" \
+        RECOVERY_PROFILE_UUID="$profile_uuid" RECOVERY_HOST_UUIDS="$hosts" python3 - <<'PY'
+import json
+import os
+
+attempt = os.environ.get('RECOVERY_ATTEMPT') or '1'
+payload = {
+    'state': 'verified',
+    'stage': 'complete',
+    'attempt': int(attempt) if attempt.isdigit() else 1,
+}
+for key, variable in (('node_uuid', 'RECOVERY_NODE_UUID'),
+                      ('profile_uuid', 'RECOVERY_PROFILE_UUID')):
+    value = os.environ.get(variable) or ''
+    if value:
+        payload[key] = value
+hosts = [uuid for uuid in (os.environ.get('RECOVERY_HOST_UUIDS') or '').split() if uuid]
+if hosts:
+    payload['host_uuids'] = hosts
+print(json.dumps(payload))
+PY
+    )
+    recovery_draft_checkpoint_record "$identity" "$payload"
+}
+
+# Re-apply a drifted node's recorded Panel association. The API client writes
+# through the recorded UUIDs, so this cannot register a second node.
+# Args: node UUID, [profile UUID]
+recovery_reapply_node() {
+    local node_uuid="$1" profile_uuid="${2:-}" root
+    [[ -n "$node_uuid" ]] || return 1
+    root=$(recovery_resume_root)
+    PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 - "$CREDENTIALS_FILE" "$STATE_FILE" "$node_uuid" "$profile_uuid" "$JOURNAL_FILE" <<'PY'
+import json
+import sys
+
+from modules.api_client import reapply_node_identity
+
+credentials, state, node_uuid, profile_uuid, journal = sys.argv[1:6]
+result = reapply_node_identity(
+    credentials, state, node_uuid, profile_uuid or None,
+    journal_path=journal or None,
+)
+print(json.dumps(result))
+PY
+}
+
+# Reconcile every node checkpoint a resumed draft calls done, before the batch
+# is handed the plan. Only the affected component is rewritten:
+#
+#   drift        re-applied through its recorded UUID, then verified again
+#   missing      marked pending, so the batch re-creates just that node
+#   incompatible
+#   ambiguous    recorded as indeterminate, held out of the batch
+#   unreachable  nothing is written; the draft is left for a later retry
+#
+# 0 — every checkpoint was classified; 3 — the Panel did not answer; 1 — the
+# classifier itself could not run.
+recovery_reconcile_resume_nodes() {
+    RESUME_STOPPED_NODES=()
+    RESUME_RECREATED_NODES=()
+    RESUME_REAPPLIED_NODES=()
+    (( ${GOWAVE_DRAFT_RESUMED:-0} == 1 )) || return 0
+    declare -F draft_load >/dev/null 2>&1 || return 0
+    local document identities revision live verdict
+    local identity expectation profile attempt node_uuid
+    local klass action reason detail
+    local -a identities_all=() expectations=() profiles=()
+    document=$(draft_load 2>/dev/null) || return 0
+    identities=$(printf '%s' "$document" | python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+for identity, checkpoint in sorted(document["checkpoints"].items()):
+    # Only a component the draft calls done is reconciled here. Pending,
+    # failed and skipped checkpoints belong to the batch: classifying them
+    # would either re-create them twice or stop work that never completed.
+    if identity.startswith("node-") and checkpoint.get("state") in {"verified", "indeterminate"}:
+        print(identity)
+' 2>/dev/null) || return 1
+    [[ -n "$identities" ]] || return 0
+    revision=$(declare -F draft_installer_revision >/dev/null 2>&1 && draft_installer_revision || true)
+    while IFS= read -r identity; do
+        [[ -n "$identity" ]] || continue
+        expectation=$(recovery_draft_expectation "$identity") || return 1
+        expectation=$(recovery_expectation_with_state "$expectation" "$STATE_FILE") || return 1
+        identities_all+=("$identity")
+        expectations+=("$expectation")
+        profile=$(recovery_json_field "$expectation" recorded.profile_uuid)
+        if [[ -n "$profile" ]]; then
+            profiles+=("$profile")
+        fi
+    done <<< "$identities"
+
+    live=$(recovery_panel_live_state "$CREDENTIALS_FILE" "$STATE_FILE" "$revision" "${profiles[@]}") \
+        || live='{"reachable": false, "error": "unreadable"}'
+    if [[ "$(recovery_json_field "$live" reachable)" != "true" ]]; then
+        printf '%s\n' \
+            'Resume: the Panel did not answer the reconciliation readback; no component checkpoint was changed and this run can be retried.' >&2
+        return 3
+    fi
+
+    for index in "${!identities_all[@]}"; do
+        identity="${identities_all[$index]}"
+        expectation="${expectations[$index]}"
+        attempt=$(recovery_json_field "$expectation" recorded.attempt)
+        verdict=$(recovery_classify_component "$expectation" "$live" "") || return 1
+        IFS=$'\t' read -r klass action reason detail node_uuid <<< "$verdict"
+        case "$klass" in
+            match)
+                ;;
+            drift)
+                profile=$(recovery_json_field "$expectation" recorded.profile_uuid)
+                if recovery_reapply_node "$node_uuid" "$profile"; then
+                    live=$(recovery_panel_live_state "$CREDENTIALS_FILE" "$STATE_FILE" "$revision" "${profiles[@]}") \
+                        || live='{"reachable": false, "error": "unreadable"}'
+                    if [[ "$(recovery_json_field "$live" reachable)" != "true" ]]; then
+                        printf '%s\n' \
+                            "Resume: the Panel did not answer after re-applying $identity; no component checkpoint was changed and this run can be retried." >&2
+                        return 3
+                    fi
+                    verdict=$(recovery_classify_component "$expectation" "$live" "") || return 1
+                    IFS=$'\t' read -r klass action reason detail node_uuid <<< "$verdict"
+                else
+                    klass="ambiguous"
+                    reason="reapply_failed"
+                    detail="the recorded association could not be re-applied; inspect the Panel and the recovery journal, then retry."
+                fi
+                if [[ "$klass" == "match" ]]; then
+                    recovery_checkpoint_verified "$identity" "$attempt" "$node_uuid" "$profile" || true
+                    RESUME_REAPPLIED_NODES+=("$identity")
+                    printf 'Resume: re-applied the recorded Panel association for %s.\n' "$identity" >&2
+                else
+                    recovery_checkpoint_stop "$identity" "$reason" "$attempt" || true
+                    RESUME_STOPPED_NODES+=("$identity")
+                    printf 'Resume: %s stopped; %s\n' "$identity" "$detail" >&2
+                fi
+                ;;
+            missing)
+                recovery_draft_checkpoint_record "$identity" \
+                    "$(printf '{"state":"pending","stage":"registration","attempt":%d}' "$attempt")" || true
+                RESUME_RECREATED_NODES+=("$identity")
+                printf 'Resume: %s will be re-created; %s\n' "$identity" "$detail" >&2
+                ;;
+            incompatible | ambiguous)
+                # Only this component stops: every sibling keeps the checkpoint
+                # it already holds.
+                recovery_checkpoint_stop "$identity" "$reason" "$attempt" || true
+                RESUME_STOPPED_NODES+=("$identity")
+                printf 'Resume: %s stopped; %s\n' "$identity" "$detail" >&2
+                ;;
+            unreachable)
+                printf '%s\n' "Resume: $detail" >&2
+                return 3
+                ;;
+            *)
+                recovery_checkpoint_stop "$identity" "classifier_unknown" "$attempt" || true
+                RESUME_STOPPED_NODES+=("$identity")
+                printf 'Resume: %s stopped; the classifier answered %s.\n' "$identity" "$klass" >&2
+                ;;
+        esac
+    done
+    return 0
+}
+
+# Hold the stopped components out of the batch, keeping every planned sibling.
+# The arrays are the plan's; the caller has already recorded the stop.
+recovery_exclude_stopped_nodes() {
+    (( ${#RESUME_STOPPED_NODES[@]} > 0 )) || return 0
+    [[ -n "${GOWAVE_PLAN_NODE_NAMES+x}" ]] || return 0
+    local -a names=() camouflage=() vision=() labels=()
+    local index identity stopped skipped
+    for index in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        identity="node-$((index + 1))"
+        skipped=0
+        for stopped in "${RESUME_STOPPED_NODES[@]}"; do
+            if [[ "$identity" == "$stopped" ]]; then
+                skipped=1
+                break
+            fi
+        done
+        if (( skipped == 1 )); then
+            continue
+        fi
+        names+=("${GOWAVE_PLAN_NODE_NAMES[$index]}")
+        camouflage+=("${GOWAVE_PLAN_NODE_CAMOUFLAGE[$index]}")
+        vision+=("${GOWAVE_PLAN_NODE_VISION[$index]:-}")
+        labels+=("${GOWAVE_PLAN_NODE_LABELS[$index]:-}")
+    done
+    GOWAVE_PLAN_NODE_NAMES=("${names[@]}")
+    GOWAVE_PLAN_NODE_CAMOUFLAGE=("${camouflage[@]}")
+    GOWAVE_PLAN_NODE_VISION=("${vision[@]}")
+    GOWAVE_PLAN_NODE_LABELS=("${labels[@]}")
+}
+
+# The security report this host wrote, as text. Empty when there is none or the
+# path is not a regular file this product owns: a report that cannot be read is
+# not a report, and reading through a symlink would adopt whatever it names.
+recovery_read_security_report() {
+    local path="${GOWAVE_SECURITY_REPORT:-/var/lib/gowave-auto-nginx/security-report.json}"
+    if [[ ! -f "$path" || -L "$path" ]]; then
+        return 0
+    fi
+    cat -- "$path" 2>/dev/null || true
+}
+
+# The recorded and live security answers as one reconciliation document.
+# Empty when neither side is a report object, which is how a caller that does
+# not produce structured security evidence opts out instead of stopping.
+#
+# Args: recorded report text, live report text
+recovery_security_document() {
+    local recorded="$1" live="$2"
+    RECOVERY_SECURITY_RECORDED="$recorded" RECOVERY_SECURITY_LIVE="$live" python3 - <<'PY'
+import json
+import os
+import sys
+
+
+def report(text):
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+recorded = report(os.environ.get('RECOVERY_SECURITY_RECORDED'))
+live = report(os.environ.get('RECOVERY_SECURITY_LIVE'))
+if recorded is None and live is None:
+    sys.exit(0)
+document = {'recorded': recorded, 'live': live}
+if live is None and recorded is not None:
+    document['error'] = 'unreadable'
+print(json.dumps(document))
+PY
+}
+
+# Put the recorded report back after a stopped component. The readback writes a
+# fresh report over it; a component this run refused to adopt must not leave
+# the stranger's evidence where the next resume reads "recorded".
+recovery_restore_security_report() {
+    local content="$1"
+    local path="${GOWAVE_SECURITY_REPORT:-/var/lib/gowave-auto-nginx/security-report.json}"
+    [[ -n "$content" ]] || return 0
+    local directory temporary
+    directory=$(dirname "$path")
+    [[ -d "$directory" ]] || return 0
+    temporary=$(mktemp "$directory/.security-report.XXXXXX" 2>/dev/null) || return 0
+    if printf '%s\n' "$content" > "$temporary" \
+        && chmod 0600 "$temporary" \
+        && sync "$temporary" 2>/dev/null; then
+        mv -f -- "$temporary" "$path" || true
+        sync "$directory" 2>/dev/null || true
+    else
+        rm -f -- "$temporary"
+    fi
+    return 0
+}
