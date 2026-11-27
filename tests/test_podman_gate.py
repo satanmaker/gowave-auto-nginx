@@ -68,8 +68,17 @@ class TestPodmanGateContract(unittest.TestCase):
     def job(self, document, name):
         for job in (document.get("jobs") or {}).values():
             if (job or {}).get("name") == name:
-                return job
+                return document["jobs"][job["needs"]] if "needs" in job else job
         raise AssertionError(f"no job named {name!r}")
+
+    def test_missing_distribution_and_failure_masking_are_refused(self):
+        document = copy.deepcopy(self.document)
+        name = "Multi-Node Podman Acceptance"
+        self.job(document, name)["strategy"]["matrix"]["distribution"].remove("debian-12")
+        document["jobs"]["multi-node-required"]["steps"][0]["run"] = "true"
+        problems = self.problems(document=document)
+        self.assertTrue(any("must run all four distributions" in problem for problem in problems), problems)
+        self.assertTrue(any("must require success from its complete matrix" in problem for problem in problems), problems)
 
     def test_the_contract_agrees_with_the_workflow(self):
         self.assertEqual(
@@ -181,10 +190,10 @@ class TestPodmanGateContract(unittest.TestCase):
 
     def test_a_raised_timeout_is_refused(self):
         document = copy.deepcopy(self.document)
-        self.job(document, "Multi-Node Podman Acceptance")["timeout-minutes"] = 120
+        self.job(document, "Multi-Node Podman Acceptance")["timeout-minutes"] = 150
         problems = self.problems(document=document)
         self.assertTrue(
-            any("declares 90 minutes, the job allows 120" in problem for problem in problems),
+            any("declares 120 minutes, the job allows 150" in problem for problem in problems),
             problems,
         )
 
@@ -214,10 +223,10 @@ class TestPodmanGateContract(unittest.TestCase):
 
     def test_a_topology_budget_that_breaks_the_pre_push_total_is_refused(self):
         problems = self.budget_problems(
-            lambda manifest: manifest["topologies"]["aio"].__setitem__("runtime_budget_seconds", 3000)
+            lambda manifest: manifest["topologies"]["aio"].__setitem__("runtime_budget_seconds", 4000)
         )
         self.assertTrue(
-            any("declares 7500s of budget, past runtime_budget.pre_push_total_seconds = 7200s"
+            any("declares 10300s of budget, past runtime_budget.pre_push_total_seconds = 9600s"
                 in problem for problem in problems),
             problems,
         )
@@ -225,12 +234,12 @@ class TestPodmanGateContract(unittest.TestCase):
     def test_a_topology_budget_that_breaks_the_pull_request_wave_is_refused(self):
         problems = self.budget_problems(
             lambda manifest: manifest["topologies"]["multi-node"].__setitem__(
-                "runtime_budget_seconds", 4600
+                "runtime_budget_seconds", 6400
             )
         )
         self.assertTrue(
-            any("one full wave plus one recovery wave declares 9200s" in problem
-                and "pr_total_seconds = 9000s" in problem
+            any("one full wave plus one recovery wave declares 12800s" in problem
+                and "pr_total_seconds = 12600s" in problem
                 for problem in problems),
             problems,
         )

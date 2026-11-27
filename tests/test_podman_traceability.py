@@ -410,8 +410,8 @@ class TestTraceabilityRules(unittest.TestCase):
             problems = trace.run_count_problems(directory)
         self.assertTrue(
             any(
-                "the panel-only suite declares 6 cases" in p
-                and "executed 5" in p
+                "the panel-only suite declares 7 cases" in p
+                and "executed 6" in p
                 and "PO-SQUAD-REFUSED did not run" in p
                 for p in problems
             ),

@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 127
-  total: 252
+  podman_first: 134
+  total: 259
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -7481,9 +7481,14 @@ cases:
 - id: NGX-COVER-DERIVE
   requirement: Camouflage decoy and certificate lineage
   live_scenario: null
-  assertion: The cover apex is the last two labels of panel_domain and a domain with fewer than three
-    labels produces no cover lineage and is handled explicitly.
-  assertion_sha256: d743362e7871c15495dfb5416fab2506507b5e62cb80de64d51396639b031863
+  assertion: 'No role derives a cover apex. The Master''s is the name the deployment selected: its decision
+    echoes no selection, the selected apex only when that apex resolves to the host itself, refuses the
+    Panel''s own name as a conflict and a value that is not a fully qualified domain name as such, and
+    refuses an apex whose records do not resolve here while naming them; its rendered decoy claims the
+    apex pair exactly when its own resolver points there and never carries the first-two-label derivation.
+    A Worker owns no apex at all: the payload it is installed from defines none of the four decision functions,
+    and its camouflage vhost names only the camouflage name its site was rendered for.'
+  assertion_sha256: d82df17d7c29ada0cf8b68077835c3d0360b8047e5204569a94de2539ed3e8b7
   runs_in:
   - podman
   state: incubating
@@ -7557,6 +7562,48 @@ cases:
       - management
       - paths
       - roles
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: MN-WORKER-EDGE
+  requirement: Camouflage decoy and certificate lineage
+  live_scenario: null
+  assertion: 'The Worker''s public 443 is read twice — where the host keeps it and where a client meets
+    it: the primary vhost names only the primary name, serves the rendered cover root with the brand''s
+    own 404 page and declares exactly one `/api/` refusal beside its three transport locations, the camouflage
+    vhost carries the site and no location at all, and the Vision vhost exists exactly when the deployment
+    names one, while the stream map sends each configured name to its own loopback port and no name straight
+    to 9443; an independent client fetching the primary name receives the Worker''s own front page and
+    every asset it references byte for byte with the MIME type NGINX assigns, an unknown path and the
+    scanned /metrics and /server-status are answered by the site''s own 404 document, and the four management
+    paths are closed without any HTTP status; the same client still receives the cover page and the closure
+    while sending the Panel''s name in its Host header, over a certificate that names the SNI it asked
+    for and never that header, and a handshake with no SNI at all and an SNI the product never configured
+    both end on the camouflage site over the REALITY lineage; a malformed ClientHello is answered by a
+    closure or a TLS alert and never by an HTTP response, and public 443 still serves the site afterwards.'
+  assertion_sha256: 425e4f657a0b2568531fb17c60f06e6d70efeb4baf7385c258e1f937ab449692
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_edge
+      evidence:
+      - absent_sni
+      - assets
+      - management
+      - mismatch
+      - paths
+      - routes
+      - scanners
+      - site
+      - still_serving
+      - unknown_path
+      - unmapped_sni
+      - vhost
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: NGX-COVER-UNRESOLVED
   requirement: Camouflage decoy and certificate lineage
@@ -9019,6 +9066,101 @@ cases:
       driver: panel_only:case_refused_payload
       evidence: []
   promotion_target: Independent Panel-only acceptance topology
+- id: PO-FIREWALL
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: 'A Panel-only host has no Node API to expose: its applied rules carry no allow for port 3002
+    and no listener binds it, and the shipped renderer asked for that port and for a port the install
+    never uses answers with no node port at all, so no port number can invent one. The SSH ports the helper
+    discovers on that host stay reachable from every source, and the same decisions are read back after
+    `systemctl restart ufw.service`, the unit a boot runs, with the unit still enabled.'
+  assertion_sha256: 2d2c831516a2ccbcaf2d142a6d5ed1e7add23904f5a37dea58f9ab994f109c1d
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    panel-only:
+      driver: ingress_matrix:case_panel_only_ingress
+      evidence:
+      - after_reload
+      - container
+      - declared_ports
+      - installed
+      - kernel_ipv6
+      - master_sources
+      - node_port
+      - role
+      - ssh_ports
+      - unit
+      - verdict
+  promotion_target: Independent Panel-only acceptance topology
+- id: FW-05
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: On the All-in-One host the local Node's port is denied to every source with no source-scoped
+    allow beside it, so the Panel reaches it over loopback and nothing else does; every SSH port the shipped
+    helper discovers on that host stays allowed to every source; the declaration the same helper renders
+    for the installed port matches the rules that were applied; the IPv6 half is required whenever the
+    kernel offers an address; and the identical decisions are read back after `systemctl restart ufw.service`
+    with the unit still enabled. The All-in-One installs 3002 and offers no non-default port, so that
+    half is reported not applicable rather than rendered and called installed.
+  assertion_sha256: 302fc8e694fc4be17d08a9a9d8a58d9bb313d6401bdd989585f85b44f17f1192
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: ingress_matrix:case_aio_ingress
+      evidence:
+      - after_reload
+      - container
+      - declared_ports
+      - installed
+      - kernel_ipv6
+      - master_sources
+      - node_port
+      - non_default_port
+      - role
+      - ssh_ports
+      - unit
+      - verdict
+  promotion_target: Security and network isolation verification
+- id: FW-06
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: 'The pair''s two rule sets answer one question: the Master denies its local Node port to
+    every source, and the Worker grants that port to exactly the Master address it was registered with
+    and to nobody else. The shipped renderer asked for the Worker''s installed port and for a port the
+    run never used answers with the same source-scoped grant and the same deny — the deny after the grant,
+    so the one permitted source still connects — and both hosts keep every discovered SSH port public,
+    mirror the decision on IPv6 where the kernel offers it, and read the same decisions back after the
+    unit a boot runs re-applies them, still enabled.'
+  assertion_sha256: a0de75d54782242325d1126c4cb1dffa96e994a00995311b89236eeb3dfc6aac
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: ingress_matrix:case_worker_ingress
+      evidence:
+      - master
+      - worker
+  promotion_target: Security and network isolation verification
 - id: PRE-PROXY-CIDR
   requirement: Independent All-in-One acceptance topology
   live_scenario: null
@@ -9330,6 +9472,101 @@ cases:
       - registered_uuid
       - registered_worker
       - retry_attempted_only_for
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: MN-MIGRATE
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: 'A Worker that still carries the legacy edge — its primary name terminating on 127.0.0.1:9443,
+    so a management path is answered by the site''s own 404 page instead of being closed — is re-provisioned
+    through the operator''s own `node reapply`: with no terminal and no confirmation the command exits
+    non-zero after printing the preview that names the identity it would serve and the GOWAVE_MIGRATE_EXISTING=yes
+    it needs, streams no payload and leaves the host''s stream map byte-identical, while the confirmed
+    run adopts the edge so that the stream map, the three vhosts and the cover site return byte for byte
+    to the digests the product rendered, the management path is closed again, the port 80 vhost still
+    answers that Worker''s own HTTP-01 challenge from the client, and the Panel still publishes the same
+    node uuid, profile, inbounds and Host records for that Worker, which is connected again afterwards.'
+  assertion_sha256: b036312a540934bca2bb9af8816c1636ceefc9e1d8fd8d680d63696219cc6ee7
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_migration
+      evidence:
+      - adopted
+      - connected
+      - identity
+      - identity_unchanged
+      - legacy
+      - refused
+      - renewal
+      - renewal_unchanged
+      - routes
+      - vhost
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: MN-WORKER-RESUME
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: 'A Worker that was successfully provisioned and deployed is re-verified on resume: the public
+    TLS certificate for each planned SNI (primary, REALITY camouflage, optional Vision) is verified at
+    the Worker''s primary endpoint, and the security report is read back via trusted, non-interactive
+    SSH to confirm role, DoT policy, firewall, Fail2ban, security updates and DNS policy freshness. A
+    TLS or security readback failure holds only that Worker as indeterminate without repeating registration
+    or affecting siblings. No temporary key is installed and no report is written remotely by the readback.'
+  assertion_sha256: 1d904a2a68f16469aad7b16964b98c06b4b051c4ecd2a5e5e52ce9d84d489975
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_resume
+      evidence:
+      - connected
+      - master_panel
+      - resume_verification
+      - security
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: MN-COMPOSED-MIXED
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: A full mixed-topology deployment (Panel + local Node + 1 remote Worker) runs through the
+    real wizard flow with country entry, installs successfully, then simulates a Worker onboarding failure
+    by breaking SSH connectivity, verifies the failure is clean, restores SSH and retries the Worker,
+    sends SIGTERM during the retry to test interruption handling, restarts the Worker service, and finally
+    verifies the Panel readback shows the Worker as connected with TLS verified, security report ready,
+    and all identities (node name, credentials) preserved across the failure/retry/interrupt/restart cycle.
+  assertion_sha256: 8b52ea39f12ee88c6a5073cff9538199bc1f919a700f5f3b3eb78aec98476dcc
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_composed_mixed_topology
+      evidence:
+      - failure
+      - identity
+      - identity_preserved
+      - interrupted
+      - recovered
+      - retried
+      - security_after
+      - tls_after
+      - tls_before
   promotion_target: Distributed Worker VPS Deployment Verification
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification

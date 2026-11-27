@@ -13,19 +13,19 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 44 across 9 areas, naming 252 of 252 catalog cases.
+Behaviours: 44 across 9 areas, naming 259 of 259 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 11 | 28 | 13 |
-| provisioning | 8 | 27 | 18 |
+| installation | 11 | 29 | 13 |
+| provisioning | 8 | 27 | 19 |
 | subscription-representations | 2 | 7 | 4 |
 | data-plane | 5 | 45 | 11 |
-| decoy | 2 | 7 | 2 |
+| decoy | 2 | 8 | 2 |
 | tls-dns-acme | 5 | 7 | 9 |
-| network-policy | 2 | 6 | 6 |
+| network-policy | 2 | 8 | 6 |
 | lifecycle | 7 | 23 | 20 |
-| failure-injection | 2 | 12 | 7 |
+| failure-injection | 2 | 14 | 7 |
 
 ## installation
 
@@ -36,7 +36,7 @@ Behaviours: 44 across 9 areas, naming 252 of 252 catalog cases.
 | The installed host keeps serving across a restart and a repeated install | aio, multi-node | pre-push | `AIO-01`, `AIO-02`, `AIO-03`, `AIO-04`, `AIO-05`, `AIO-RESTART`, `AIO-IDEMPOTENT` | `AIO-NEG-DEP` |
 | The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01`, `AIO-AUTH-NEG` | `NEG-06` |
 | Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02`, `AIO-NEG-PIN` |
-| The Panel-only mode installs a Panel and a decoy and no traffic plane | panel-only | pr | `PO-INSTALL`, `PO-HOST`, `PO-API`, `PO-SQUAD` | `PO-SQUAD-REFUSED`, `MN-ADD-NODE-REFUSED` |
+| The Panel-only mode installs a Panel and a decoy and no traffic plane | panel-only | pr | `PO-INSTALL`, `PO-HOST`, `PO-FIREWALL`, `PO-API`, `PO-SQUAD` | `PO-SQUAD-REFUSED`, `MN-ADD-NODE-REFUSED` |
 | The public edge hides its build and hands the Panel only the peer address | aio | pre-push | `NGX-HYGIENE` | `NGX-SCANNER` |
 | An incomplete install request is refused before the installed host is touched | aio | pre-push | `PRE-INPUTS` | `PRE-INPUTS-BAD` |
 | A Cloudflare-proxied name is refused before any certificate request | aio | pre-push | `PRE-PROXY-CIDR` | `PRE-PROXY-CIDR-OVERRIDE` |
@@ -54,7 +54,7 @@ Behaviours: 44 across 9 areas, naming 252 of 252 catalog cases.
 | Temporary access is bounded by an armed remote expiry | aio, multi-node | pre-push | `TSSH-01`, `BOOT-02` | `TSSH-02` |
 | Target credentials stay on the control machine and are revoked | aio, multi-node | pre-push | `LOCAL-01`, `LOCAL-02`, `REV-01` | `REV-02` |
 | Each Vision domain is provisioned per node or refuses the host | aio, multi-node | pre-push | `VIS-01`, `VIS-02`, `VIS-03`, `VIS-07`, `VIS-08`, `MN-VISION` | `VIS-04`, `VIS-CONFIG`, `VIS-05`, `VIS-06` |
-| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR`, `MN-PARTIAL-SUCCESS`, `MN-WIZARD-FLOW` |
+| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR`, `MN-PARTIAL-SUCCESS`, `MN-WIZARD-FLOW`, `MN-MIGRATE` |
 
 ## subscription-representations
 
@@ -77,8 +77,8 @@ Behaviours: 44 across 9 areas, naming 252 of 252 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| The cover apex is derived, rendered complete and refused when unresolved | aio, multi-node | pre-push | `NGX-03`, `NGX-COVER-DERIVE`, `NGX-COVER-SITE` | `NGX-COVER-UNRESOLVED` |
-| The camouflage listener never exposes the management surface | aio, multi-node | pre-push | `NGX-01`, `NGX-04`, `NGX-DECOY-ROUTE`, `DECOY-01` | `NGX-02` |
+| The selected cover apex is rendered complete and refused when unresolved | aio, multi-node | pre-push | `NGX-03`, `NGX-COVER-DERIVE`, `NGX-COVER-SITE` | `NGX-COVER-UNRESOLVED` |
+| The camouflage listener never exposes the management surface | aio, multi-node | pre-push | `NGX-01`, `NGX-04`, `NGX-DECOY-ROUTE`, `DECOY-01`, `MN-WORKER-EDGE` | `NGX-02` |
 
 ## tls-dns-acme
 
@@ -94,7 +94,7 @@ Behaviours: 44 across 9 areas, naming 252 of 252 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| The Worker's firewall admits the Master and refuses every other origin | multi-node | pre-push | `FW-01`, `FW-03`, `FW-04` | `FW-02` |
+| The installed firewall admits only the declared paths and survives a reload | aio, multi-node | pre-push | `FW-01`, `FW-03`, `FW-04`, `FW-05`, `FW-06` | `FW-02` |
 | The control plane is mutual TLS and refuses anything less | multi-node | pre-push | `MTLS-01`, `MTLS-02`, `MTLS-03` | `MTLS-04`, `MTLS-05`, `MTLS-06`, `MTLS-07`, `MTLS-08` |
 
 ## lifecycle
@@ -113,5 +113,5 @@ Behaviours: 44 across 9 areas, naming 252 of 252 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| Every injected fault is survived or reported without collateral damage | aio, multi-node | pre-push | `NEG-01`, `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY`, `MN-OUTAGE`, `MN-RESTART`, `MN-SSH-DOWN`, `MN-DUP-ADD`, `MN-ENV-CONTRACT` | `NEG-02`, `NEG-03`, `NEG-04`, `NEG-05` |
+| Every injected fault is survived or reported without collateral damage | aio, multi-node | pre-push | `NEG-01`, `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY`, `MN-OUTAGE`, `MN-RESTART`, `MN-SSH-DOWN`, `MN-DUP-ADD`, `MN-ENV-CONTRACT`, `MN-COMPOSED-MIXED`, `MN-WORKER-RESUME` | `NEG-02`, `NEG-03`, `NEG-04`, `NEG-05` |
 | An interrupted mutation stays recoverable and its compensation is honest | aio, multi-node | pre-push | `AIO-INTERRUPT`, `HOOK-03` | `TXN-01`, `TXN-02`, `TXN-03` |

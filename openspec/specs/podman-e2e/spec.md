@@ -218,7 +218,7 @@ The framework MUST provide controlled DNS and ACME fixtures. Certificate issuanc
 
 Every installed host MUST serve the product's camouflage decoy. The cover apex is the last two labels of `panel_domain`; the apex and `www.<apex>` MUST resolve to the host, terminate on the loopback decoy listener, serve the rendered cover site, and be covered by the REALITY certificate lineage. The port 80 ACME vhost MUST stay reachable on Master and Worker so renewal keeps a working HTTP-01 path.
 
-#### Scenario: Decoy renders for the derived apex
+#### Scenario: Decoy renders for the apex each role owns
 
 - **GIVEN** a `panel_domain` with at least three labels, and apex plus `www.<apex>` resolving to the host's IPv4 address
 - **WHEN** the operator completes installation or a domain change

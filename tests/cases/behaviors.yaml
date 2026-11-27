@@ -103,10 +103,13 @@ behaviors:
       fields. The first registration after that install resolves a squad and
       every host record names it, while a null squad entry never becomes the
       operator's own grant. An add-node attempt whose Panel API verification
-      fails reports the failure and does not begin any remote mutation.
+      fails reports the failure and does not begin any remote mutation. The
+      firewall agrees: no allow and no listener on the Node API port, and no
+      Node rule in the declaration the shipped renderer answers for that port or
+      for a port the install never uses.
     topology: [panel-only]
     gate: pr
-    cases: [PO-INSTALL, PO-HOST, PO-API, PO-SQUAD]
+    cases: [PO-INSTALL, PO-HOST, PO-FIREWALL, PO-API, PO-SQUAD]
     error_paths: [PO-SQUAD-REFUSED, MN-ADD-NODE-REFUSED]
 
   - name: The public edge hides its build and hands the Panel only the peer address
@@ -274,11 +277,15 @@ behaviors:
       Master address is refused. A multi-node deployment where one Worker fails
       continues the Panel and the successful sibling, records the failed node
       with its phase and diagnostic, exits with the partial-success code, and
-      prints a per-node summary.
+      prints a per-node summary. Re-provisioning a Worker that already serves a
+      different edge identity is a migration: without a confirmation the
+      operator's own re-apply prints the preview and streams nothing, and the
+      confirmed run adopts the product's edge while the Panel keeps the same
+      node and Host records.
     topology: [multi-node]
     gate: pre-push
     cases: [MN-INSTALL, MN-ARGV-OBSERVER, WRK-01, WRK-04, WRK-05, WRK-06, CLUS-01, CLUS-02, CLUS-03]
-    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR, MN-PARTIAL-SUCCESS, MN-WIZARD-FLOW]
+    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR, MN-PARTIAL-SUCCESS, MN-WIZARD-FLOW, MN-MIGRATE]
 
   # ------------------------------------------------ subscription representations
   - name: Every representation reaches the client family that consumes it
@@ -402,13 +409,13 @@ behaviors:
     error_paths: [PKT-02, PKT-03, AIO-PKT-02, MN-PKT-03]
 
   # ----------------------------------------------------------------------- decoy
-  - name: The cover apex is derived, rendered complete and refused when unresolved
+  - name: The selected cover apex is rendered complete and refused when unresolved
     area: decoy
     description: >-
-      The cover apex is the last two labels of the panel domain, every template
-      document is rendered with the derived brand and no template marker left
-      behind, and a host whose apex does not resolve to it refuses the lineage
-      instead of publishing a partial decoy.
+      The Master's cover apex is the name the deployment selected and a Worker
+      owns none, every template document is rendered with that apex's brand and
+      no template marker left behind, and a host whose apex does not resolve to
+      it refuses the lineage instead of publishing a partial decoy.
     topology: [aio, multi-node]
     gate: pre-push
     cases: [NGX-03, NGX-COVER-DERIVE, NGX-COVER-SITE]
@@ -420,10 +427,14 @@ behaviors:
       The stream map sends the cover apex and its www to the decoy listener and
       nothing else does, the listener answers every cover name with the cover
       site, and it refuses every panel, API and subscription path with that
-      site's own 404 while the Panel still answers on its own name.
+      site's own 404 while the Panel still answers on its own name. On a Worker
+      the public 443 is the same claim read from the client: the primary name
+      serves the site and closes the management paths without a status, an
+      unknown name and a handshake with no SNI end on the camouflage site, and a
+      malformed ClientHello is closed rather than answered.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [NGX-01, NGX-04, NGX-DECOY-ROUTE, DECOY-01]
+    cases: [NGX-01, NGX-04, NGX-DECOY-ROUTE, DECOY-01, MN-WORKER-EDGE]
     error_paths: [NGX-02]
 
   # --------------------------------------------------------------- tls-dns-acme
@@ -489,16 +500,22 @@ behaviors:
     error_paths: [HOOK-01]
 
   # --------------------------------------------------------------- network policy
-  - name: The Worker's firewall admits the Master and refuses every other origin
+  - name: The installed firewall admits only the declared paths and survives a reload
     area: network-policy
     description: >-
       The ruleset the product installs is read from the sources that can reach
       it: the Worker accepts its Master and drops an untrusted control machine,
       the Master distinguishes local from external access, and a negative probe
-      is never misclassified as an allowance.
-    topology: [multi-node]
+      is never misclassified as an allowance. The same rules are then read as
+      the Node API's own ingress decision — denied to every source on the
+      All-in-One, granted to exactly the registered Master on the Worker, and
+      absent with no listener on a Panel-only host — for the port the product
+      installs and for a port it does not, with the operator's SSH ports still
+      public, the IPv6 half mirrored wherever the kernel offers one, and both
+      readings unchanged after the unit a boot runs re-applies the files.
+    topology: [aio, multi-node]
     gate: pre-push
-    cases: [FW-01, FW-03, FW-04]
+    cases: [FW-01, FW-03, FW-04, FW-05, FW-06]
     error_paths: [FW-02]
 
   - name: The control plane is mutual TLS and refuses anything less
@@ -612,10 +629,12 @@ behaviors:
       and a restarted Worker each degrade only their own layer, leave operator
       files intact and lose none of the rows the database held, and recover when
       the cause is removed, while duplicate registration, partial deployment and
-      forged credentials are refused without mutation.
+      forged credentials are refused without mutation. A full mixed-topology
+      deployment survives failure, retry, interruption and restart. A deployed
+      Worker is re-verified on resume.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-DUP-ADD, MN-ENV-CONTRACT]
+    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-DUP-ADD, MN-ENV-CONTRACT, MN-COMPOSED-MIXED, MN-WORKER-RESUME]
     error_paths: [NEG-02, NEG-03, NEG-04, NEG-05]
 
   - name: An interrupted mutation stays recoverable and its compensation is honest

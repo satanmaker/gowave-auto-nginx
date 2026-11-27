@@ -132,7 +132,7 @@ class TestSecurityModule(unittest.TestCase):
         # The 22 allow is the policy's own rule, so only the 8080 grant is an
         # administrator exception the operator has to be told about.
         self.assertEqual(len(result['preserved_exceptions']), 1)
-        self.assertEqual(managed.firewall_conflicts(policy, {6: '-A ufw-user-input -p tcp --dport 3333 -j ACCEPT'})['conflicts'][0]['family'], 6)
+        self.assertEqual(managed.firewall_conflicts(policy, {6: '-A ufw6-user-input -p tcp --dport 3333 -j ACCEPT'})['conflicts'][0]['family'], 6)
         with self.assertRaises(ValueError):
             managed.firewall_conflicts(policy, {4: rules}, ['firewalld.service'])
         with self.assertRaises(ValueError):

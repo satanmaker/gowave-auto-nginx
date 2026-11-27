@@ -27,8 +27,12 @@ concurrency:
 
 jobs:
   aio-podman-acceptance:
-    name: All-in-One Podman Acceptance
+    name: All-in-One Podman Acceptance (${{ matrix.distribution }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [debian-12, debian-13, ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -67,7 +71,7 @@ jobs:
           PY
 
       - name: Execute the full All-in-One acceptance suite
-        run: sudo python3 -m tools.run_podman_e2e --topology aio
+        run: sudo python3 -m tools.run_podman_e2e --distribution '${{ matrix.distribution }}' --topology aio
 
       # `overall: PASS` is an aggregate: it would stay PASS if a data-plane case
       # stopped being declared, because the shorter suite is still all-green.
@@ -83,15 +87,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: podman-aio-${{ github.run_id }}
+          name: podman-aio-${{ matrix.distribution }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/podman-e2e/
           if-no-files-found: warn
           retention-days: 14
 
   multi-node-podman-acceptance:
-    name: Multi-Node Podman Acceptance
+    name: Multi-Node Podman Acceptance (${{ matrix.distribution }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [debian-12, debian-13, ubuntu-24.04, ubuntu-26.04]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
 
@@ -121,7 +129,7 @@ jobs:
           PY
 
       - name: Execute the full Multi-Node acceptance suite
-        run: sudo python3 -m tools.run_podman_e2e --topology multi-node
+        run: sudo python3 -m tools.run_podman_e2e --distribution '${{ matrix.distribution }}' --topology multi-node
 
       # Same read-back as the All-in-One job, with four Vision combinations to
       # tell apart: 16, 18 or 20 positive cases depending on what ran.
@@ -133,7 +141,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: podman-multi-node-${{ github.run_id }}
+          name: podman-multi-node-${{ matrix.distribution }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/podman-e2e/
           if-no-files-found: warn
           retention-days: 14
@@ -144,8 +152,12 @@ jobs:
   # list, and a failure here would otherwise hide behind a green All-in-One
   # install that provisioned a Node this mode must not provision.
   panel-only-podman-acceptance:
-    name: Panel-only Podman Acceptance
+    name: Panel-only Podman Acceptance (${{ matrix.distribution }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [debian-12, debian-13, ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
@@ -176,7 +188,7 @@ jobs:
           PY
 
       - name: Execute the Panel-only acceptance suite
-        run: sudo python3 -m tools.run_podman_e2e --topology panel-only
+        run: sudo python3 -m tools.run_podman_e2e --distribution '${{ matrix.distribution }}' --topology panel-only
 
       # The same read-back as the two full suites. Panel-only owes no
       # data-plane tuple, so the count rule is silent here and what it checks is
@@ -189,7 +201,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: podman-panel-only-${{ github.run_id }}
+          name: podman-panel-only-${{ matrix.distribution }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/podman-e2e/
           if-no-files-found: warn
           retention-days: 14
@@ -202,9 +214,13 @@ jobs:
   # They run on the merge gate only — a push already spends the minutes on the
   # full suites, and the recovery contract is what a review must not merge past.
   aio-lifecycle-recovery:
-    name: All-in-One Lifecycle and Recovery Acceptance
+    name: All-in-One Lifecycle and Recovery Acceptance (${{ matrix.distribution }})
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [debian-12, debian-13, ubuntu-24.04, ubuntu-26.04]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -235,7 +251,7 @@ jobs:
           PY
 
       - name: Execute the full All-in-One suite with the recovery contract
-        run: sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
+        run: sudo python3 -m tools.run_podman_e2e --distribution '${{ matrix.distribution }}' --topology aio --require-group recovery
 
       - name: Verify the positive-case counts the matrix owes
         if: success()
@@ -245,16 +261,20 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: podman-aio-recovery-${{ github.run_id }}
+          name: podman-aio-recovery-${{ matrix.distribution }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/podman-e2e/
           if-no-files-found: warn
           retention-days: 14
 
   multi-node-lifecycle-recovery:
-    name: Multi-Node Lifecycle and Recovery Acceptance
+    name: Multi-Node Lifecycle and Recovery Acceptance (${{ matrix.distribution }})
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [debian-12, debian-13, ubuntu-24.04, ubuntu-26.04]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
 
@@ -284,7 +304,7 @@ jobs:
           PY
 
       - name: Execute the full Multi-Node suite with the recovery contract
-        run: sudo python3 -m tools.run_podman_e2e --topology multi-node --require-group recovery
+        run: sudo python3 -m tools.run_podman_e2e --distribution '${{ matrix.distribution }}' --topology multi-node --require-group recovery
 
       - name: Verify the positive-case counts the matrix owes
         if: success()
@@ -294,7 +314,62 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: podman-multi-node-recovery-${{ github.run_id }}
+          name: podman-multi-node-recovery-${{ matrix.distribution }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/podman-e2e/
           if-no-files-found: warn
           retention-days: 14
+
+  aio-required:
+    name: All-in-One Podman Acceptance
+    needs: aio-podman-acceptance
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          MATRIX_RESULT: ${{ needs.aio-podman-acceptance.result }}
+        run: test "$MATRIX_RESULT" = success
+
+  multi-node-required:
+    name: Multi-Node Podman Acceptance
+    needs: multi-node-podman-acceptance
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          MATRIX_RESULT: ${{ needs.multi-node-podman-acceptance.result }}
+        run: test "$MATRIX_RESULT" = success
+
+  panel-only-required:
+    name: Panel-only Podman Acceptance
+    needs: panel-only-podman-acceptance
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          MATRIX_RESULT: ${{ needs.panel-only-podman-acceptance.result }}
+        run: test "$MATRIX_RESULT" = success
+
+  aio-recovery-required:
+    name: All-in-One Lifecycle and Recovery Acceptance
+    needs: aio-lifecycle-recovery
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          MATRIX_RESULT: ${{ needs.aio-lifecycle-recovery.result }}
+        run: test "$MATRIX_RESULT" = success
+
+  multi-node-recovery-required:
+    name: Multi-Node Lifecycle and Recovery Acceptance
+    needs: multi-node-lifecycle-recovery
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          MATRIX_RESULT: ${{ needs.multi-node-lifecycle-recovery.result }}
+        run: test "$MATRIX_RESULT" = success

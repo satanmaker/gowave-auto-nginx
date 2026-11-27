@@ -20,6 +20,10 @@ source "$_wizard_dir/ssh_bootstrap.sh"
 # The exit country asked of a traffic node after it serves.
 # shellcheck source=modules/geoip.sh
 source "$_wizard_dir/geoip.sh"
+# The draft an interrupted run leaves behind, and the checkpoints the install
+# reads back on the next one.
+# shellcheck source=modules/draft.sh
+source "$_wizard_dir/draft.sh"
 
 GOWAVE_PLAN_VARIANT=""
 GOWAVE_PLAN_SHARED_DOMAIN="no"
@@ -29,6 +33,10 @@ GOWAVE_PLAN_SHARED_CONFIRMED_COUNT=""
 GOWAVE_PLAN_PANEL_VISION="no"
 GOWAVE_PLAN_PANEL_NAME=""
 GOWAVE_PLAN_CAMOUFLAGE_NAME=""
+# The cover apex is an owned name of its own, empty until the operator selects
+# one at review: the plan never guesses it from the Panel domain's suffix.
+GOWAVE_PLAN_COVER_NAME=""
+GOWAVE_PLAN_COVER_WWW="no"
 GOWAVE_PLAN_VISION_NAME=""
 GOWAVE_PLAN_EMAIL=""
 GOWAVE_PLAN_NODE_COUNT=0
@@ -39,6 +47,10 @@ GOWAVE_PLAN_NODE_VISION=()
 # local node's name and one per remote node. Empty means "the product default".
 GOWAVE_PLAN_LOCAL_LABEL=""
 GOWAVE_PLAN_NODE_LABELS=()
+# The names the last resolution check could not answer. The repair step walks
+# this list instead of restarting collection, so a name that does not resolve
+# costs the operator the field that holds it and nothing else.
+GOWAVE_PLAN_UNRESOLVED=()
 
 wizard_reset_plan() {
     GOWAVE_PLAN_VARIANT=""
@@ -47,6 +59,8 @@ wizard_reset_plan() {
     GOWAVE_PLAN_PANEL_VISION="no"
     GOWAVE_PLAN_PANEL_NAME=""
     GOWAVE_PLAN_CAMOUFLAGE_NAME=""
+    GOWAVE_PLAN_COVER_NAME=""
+    GOWAVE_PLAN_COVER_WWW="no"
     GOWAVE_PLAN_VISION_NAME=""
     GOWAVE_PLAN_EMAIL=""
     GOWAVE_PLAN_NODE_COUNT=0
@@ -55,6 +69,7 @@ wizard_reset_plan() {
     GOWAVE_PLAN_NODE_VISION=()
     GOWAVE_PLAN_LOCAL_LABEL=""
     GOWAVE_PLAN_NODE_LABELS=()
+    GOWAVE_PLAN_UNRESOLVED=()
 }
 
 # The wizard is the only entrypoint that reads answers, and only when the
@@ -85,6 +100,9 @@ _wizard_plan_pairs() {
     fi
     if [[ -n "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ]]; then
         printf '%s\t%s\n' "$(t wizard.owner.panel_camouflage)" "$GOWAVE_PLAN_CAMOUFLAGE_NAME"
+    fi
+    if [[ -n "$GOWAVE_PLAN_COVER_NAME" ]]; then
+        printf '%s\t%s\n' "$(t wizard.owner.panel_cover)" "$GOWAVE_PLAN_COVER_NAME"
     fi
     if [[ -n "$GOWAVE_PLAN_VISION_NAME" ]]; then
         printf '%s\t%s\n' "$(t wizard.owner.panel_vision)" "$GOWAVE_PLAN_VISION_NAME"
@@ -508,12 +526,51 @@ wizard_resolve_ipv4() {
     printf '%s' "$address"
 }
 
+# Every planned name with the review field that owns it, one "field<TAB>name"
+# per line in plan order. A name an operator has to fix is answered by the one
+# field that asked for it, so the repair step never re-asks a card.
+wizard_plan_name_fields() {
+    local i
+    printf 'panel_domain\t%s\n' "$GOWAVE_PLAN_PANEL_NAME"
+    printf 'camouflage_domain\t%s\n' "$GOWAVE_PLAN_CAMOUFLAGE_NAME"
+    if [[ -n "$GOWAVE_PLAN_COVER_NAME" ]]; then
+        printf 'cover_domain\t%s\n' "$GOWAVE_PLAN_COVER_NAME"
+    fi
+    if [[ -n "${GOWAVE_PLAN_VISION_NAME:-}" ]]; then
+        printf 'vision_domain\t%s\n' "$GOWAVE_PLAN_VISION_NAME"
+    fi
+    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        printf 'node_name_%s\t%s\n' "$i" "${GOWAVE_PLAN_NODE_NAMES[$i]}"
+        printf 'node_camouflage_%s\t%s\n' "$i" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
+        if [[ -n "${GOWAVE_PLAN_NODE_VISION[$i]:-}" ]]; then
+            printf 'node_vision_%s\t%s\n' "$i" "${GOWAVE_PLAN_NODE_VISION[$i]}"
+        fi
+    done
+}
+
+# The review field that owns one planned name. Returns 1 with the field on
+# stdout when it is found, 0 when the plan does not hold the name.
+wizard_plan_field_for_name() {
+    local wanted field name
+    wanted=$(wizard_normalize_name "$1")
+    while IFS=$'\t' read -r field name; do
+        if [[ "$(wizard_normalize_name "$name")" == "$wanted" ]]; then
+            printf '%s' "$field"
+            return 1
+        fi
+    done < <(wizard_plan_name_fields)
+    return 0
+}
+
 # Every planned name must answer before the first ACME order exists.
 wizard_check_plan_names() {
     local -a names=() failed=()
     local name
     names+=("$GOWAVE_PLAN_PANEL_NAME")
     names+=("$GOWAVE_PLAN_CAMOUFLAGE_NAME")
+    if [[ -n "$GOWAVE_PLAN_COVER_NAME" ]]; then
+        names+=("$GOWAVE_PLAN_COVER_NAME")
+    fi
     if [[ -n "$GOWAVE_PLAN_VISION_NAME" ]]; then
         names+=("$GOWAVE_PLAN_VISION_NAME")
     fi
@@ -529,11 +586,52 @@ wizard_check_plan_names() {
             failed+=("$name")
         fi
     done
+    GOWAVE_PLAN_UNRESOLVED=("${failed[@]}")
     if (( ${#failed[@]} > 0 )); then
         printf '%s\n' "$(tf wizard.dns.failed "${failed[*]}")" >&2
         return 1
     fi
     return 0
+}
+
+# Sends each name that does not resolve back to the field that asked for it and
+# re-reads exactly that answer; every other answer stays as it was. Returns 1
+# only when the terminal stops answering, so a corrected plan keeps going.
+_wizard_repair_unresolved_names() {
+    local name field
+    for name in "${GOWAVE_PLAN_UNRESOLVED[@]}"; do
+        if ! field=$(wizard_plan_field_for_name "$name"); then
+            printf '%s\n' \
+                "$(tf wizard.dns.repair "$(_wizard_review_label "$field")" "$name")" >&2
+            _wizard_review_edit_field "$field" quiet || return 1
+        fi
+    done
+    GOWAVE_PLAN_UNRESOLVED=()
+    return 0
+}
+
+# The single authorization step both collection and review run: certificate
+# budget first, then resolution, with a failure routed to the field it names.
+# A declined shared-budget consent is an answer and goes back to the review menu
+# whole; only an exceeded ceiling is a field error, and the field it names is the
+# node count that produced it.
+wizard_authorize_plan() {
+    if ! wizard_certificate_preflight; then
+        if [[ "$GOWAVE_PLAN_SHARED_DOMAIN" == "yes" ]] \
+            && (( $(wizard_plan_certificate_count) > 50 )); then
+            printf '%s\n' \
+                "$(tf wizard.cert.fix_node_count "$(wizard_plan_certificate_ceiling)")" >&2
+            _wizard_review_edit_field node_count quiet || return 1
+            wizard_certificate_preflight || return 1
+        else
+            return 1
+        fi
+    fi
+    if wizard_check_plan_names; then
+        return 0
+    fi
+    _wizard_repair_unresolved_names || return 1
+    wizard_check_plan_names
 }
 
 # Checks SSH reachability for all worker nodes in the plan using ssh-keyscan.
@@ -719,10 +817,24 @@ _wizard_plan_role_label() {
 wizard_plan_summary() {
     local i vision
     printf '%s\n' "$(t wizard.plan.summary)"
-    printf '%s\n' "$(tf wizard.plan.host "$(_wizard_plan_role_label "Panel" "$GOWAVE_PLAN_LOCAL_LABEL")" "$GOWAVE_PLAN_PANEL_NAME" "$GOWAVE_PLAN_CAMOUFLAGE_NAME" "${GOWAVE_PLAN_VISION_NAME:-none}")"
+    printf '%s\n' "$(tf wizard.plan.panel_host "$(_wizard_plan_role_label "Panel" "$GOWAVE_PLAN_LOCAL_LABEL")" "$GOWAVE_PLAN_PANEL_NAME" "$GOWAVE_PLAN_CAMOUFLAGE_NAME" "${GOWAVE_PLAN_VISION_NAME:-none}")"
+    # The cover apex is its own owned name, so the plan states whether one was
+    # selected instead of showing a suffix-derived guess as if it were chosen.
+    if [[ -n "$GOWAVE_PLAN_COVER_NAME" ]]; then
+        local cover_display="$GOWAVE_PLAN_COVER_NAME"
+        if [[ "$GOWAVE_PLAN_COVER_WWW" == "yes" ]]; then
+            cover_display="$cover_display, www.$GOWAVE_PLAN_COVER_NAME"
+        fi
+        printf '%s\n' "$(tf wizard.plan.cover "$cover_display")"
+    else
+        printf '%s\n' "$(t wizard.plan.cover_none)"
+    fi
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
         vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
-        printf '%s\n' "$(tf wizard.plan.host "$(_wizard_plan_role_label "node $((i + 1))" "${GOWAVE_PLAN_NODE_LABELS[$i]:-}")" "${GOWAVE_PLAN_NODE_NAMES[$i]}" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" "${vision:-none}")"
+        # A Worker's first name is its transport plus static cover, never a
+        # Panel: the summary labels it by what the name serves, so an operator
+        # reading the plan cannot mistake the Worker for a second Panel.
+        printf '%s\n' "$(tf wizard.plan.worker_host "$(_wizard_plan_role_label "node $((i + 1))" "${GOWAVE_PLAN_NODE_LABELS[$i]:-}")" "${GOWAVE_PLAN_NODE_NAMES[$i]}" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" "${vision:-none}")"
     done
     printf '%s\n' "$(tf wizard.plan.certificates "$(wizard_plan_certificate_count)")"
     # The exit country is a fact about a node's own outbound route, and that
@@ -736,49 +848,163 @@ wizard_plan_summary() {
     fi
 }
 
+wizard_resume_require_recovery() {
+    if ! recovery_require_settled_journal; then
+        printf '%s\n' "$(t wizard.draft.recovery_required)" >&2
+        return 1
+    fi
+}
+
+wizard_resume_panel_unverified() {
+    printf '%s\n' "$(t wizard.draft.panel_unverified)" >&2
+}
+
+# Offer the plan an interrupted run left on this host.
+#
+# 0 — the saved answers are restored into `GOWAVE_PLAN_*`, and collection asks
+#     only for what the draft never answered
+# 1 — no draft, or the operator chose to start over: collect from scratch
+# 3 — the operator left the menu; nothing was changed, and the draft stays, so
+#     a later run can still continue it
+# 4 — the draft could not be read or belongs to a different installer revision
+#
+# Starting over abandons the draft without touching the deployment it
+# described: an abandoned plan is not an uninstall, a compensation or a rerun.
+draft_offer_resume() {
+    local document answer saved_revision rc=0
+    document=$(draft_load 2>/dev/null) || rc=$?
+    if (( rc == 3 )); then
+        # No draft: every install that never reached review meets this.
+        return 1
+    elif (( rc != 0 )); then
+        printf '%s\n' "$(tf wizard.draft.unreadable "$rc")" >&2
+        return 4
+    fi
+    # A plan is only meaningful in the vocabulary that collected it, so a draft
+    # another revision wrote is not resumed here: the store would refuse every
+    # answer this run tried to save, and the operator would learn that at the
+    # end instead of now. It stays on the host for the installer that wrote it.
+    if ! saved_revision=$(printf '%s' "$document" | draft_document_revision); then
+        saved_revision="unreadable"
+    fi
+    if [[ "$saved_revision" != "$(draft_installer_revision)" ]]; then
+        printf '%s\n' "$(tf wizard.draft.revision "$saved_revision" "$(draft_installer_revision)")" >&2
+        return 4
+    fi
+    if ! draft_restore <<< "$document"; then
+        printf '%s\n' "$(tf wizard.draft.unreadable 1)" >&2
+        return 4
+    fi
+    printf '\n%s\n' "$(t wizard.draft.found)"
+    printf '%s\n' "$(t wizard.draft.continue)"
+    printf '%s\n' "$(t wizard.draft.new)"
+    printf '%s\n' "$(t wizard.draft.abandon)"
+    while true; do
+        answer=$(_wizard_prompt_read "> ") || return 3
+        case "${answer,,}" in
+            1 | continue | c)
+                printf '%s\n' "$(t wizard.draft.restored)"
+                return 0
+                ;;
+            2 | new | over)
+                # The menu just promised the saved plan is forgotten, so it is
+                # forgotten here rather than whenever collection next saves: a
+                # run that stops before the first answer must not leave the old
+                # plan on disk to be offered again as if nothing had been chosen.
+                wizard_reset_plan
+                draft_abandon
+                return 1
+                ;;
+            3 | leave | abandon | quit)
+                return 3
+                ;;
+            *)
+                printf '%s\n' "$(t wizard.draft.invalid)" >&2
+                ;;
+        esac
+    done
+}
+
 wizard_collect_plan() {
-    local panel camouflage vision local_label i
+    local panel camouflage vision local_label i resume_rc=0
 
     wizard_reset_plan
-    wizard_select_language || return 1
-    wizard_select_variant || return 1
-
-    panel=$(wizard_read_plan_hostname "$(t wizard.name.panel)") || return 1
-    camouflage=$(wizard_read_plan_hostname "$(t wizard.name.camouflage)" no "$panel") || return 1
-    vision=""
-    if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
-        if wizard_read_yes_no "$(tf wizard.vision.prompt "$panel")" no; then
-            vision=$(wizard_read_plan_hostname "$(t wizard.name.vision)" yes "$panel $camouflage") || return 1
-        fi
+    # A saved plan replaces the questions it already answers. With no draft
+    # every guard below is empty and the collection asks the whole card, which
+    # is the path this function has always taken.
+    draft_offer_resume || resume_rc=$?
+    case "$resume_rc" in
+        0) GOWAVE_DRAFT_RESUMED=1 ;;
+        3) return 3 ;;
+        4) return 1 ;;
+        *) GOWAVE_DRAFT_RESUMED=0 ;;
+    esac
+    if [[ -z "${GOWAVE_WIZARD_LANG:-}" ]]; then
+        wizard_select_language || return 1
     fi
-    wizard_register_host panel "$panel" "$camouflage" "$vision" || return 1
+    if [[ -z "$GOWAVE_PLAN_VARIANT" ]]; then
+        wizard_select_variant || return 1
+        # Saved after the variant, because a plan without a topology is not a
+        # draft the schema accepts: this is the first answer that makes one.
+        draft_save_plan || true
+    fi
+
+    # The Panel card is one answer in the draft: its names are registered
+    # together, so a saved Panel domain implies the camouflage and Vision
+    # answers that were given with it.
+    if [[ -z "$GOWAVE_PLAN_PANEL_NAME" ]]; then
+        panel=$(wizard_read_plan_hostname "$(t wizard.name.panel)") || return 1
+        camouflage=$(wizard_read_plan_hostname "$(t wizard.name.camouflage)" no "$panel") || return 1
+        vision=""
+        if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
+            if wizard_read_yes_no "$(tf wizard.vision.prompt "$panel")" no; then
+                vision=$(wizard_read_plan_hostname "$(t wizard.name.vision)" yes "$panel $camouflage") || return 1
+            fi
+        fi
+        wizard_register_host panel "$panel" "$camouflage" "$vision" || return 1
+        draft_save_plan || true
+    fi
     # A Panel-only host runs no local node, so there is no local node to name.
-    if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
+    if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" && -z "$GOWAVE_PLAN_LOCAL_LABEL" ]]; then
         local_label=$(wizard_read_label "$(t wizard.name.local_node_label)") || return 1
         wizard_register_label panel "$local_label"
+        draft_save_plan || true
     fi
 
-    GOWAVE_PLAN_EMAIL=$(wizard_read_email) || return 1
+    if [[ -z "$GOWAVE_PLAN_EMAIL" ]]; then
+        GOWAVE_PLAN_EMAIL=$(wizard_read_email) || return 1
+        draft_save_plan || true
+    fi
 
     # A Panel-only host has no local node, so its workers are the whole traffic
     # plane; only the All-in-One variant ends at the local host.
     if [[ "$GOWAVE_PLAN_VARIANT" != "all-in-one" ]]; then
-        GOWAVE_PLAN_NODE_COUNT=$(wizard_read_node_count) || return 1
+        if (( GOWAVE_PLAN_NODE_COUNT == 0 )); then
+            GOWAVE_PLAN_NODE_COUNT=$(wizard_read_node_count) || return 1
+            draft_save_plan || true
+        fi
         for ((i = 1; i <= GOWAVE_PLAN_NODE_COUNT; i++)); do
-            local node_name node_camouflage node_vision=""
-            node_name=$(wizard_read_plan_hostname "$(tf wizard.name.worker "$i")") || return 1
-            node_camouflage=$(wizard_read_plan_hostname \
-                "$(tf wizard.name.worker_camouflage "$i")" no "$node_name") || return 1
-            if wizard_read_yes_no "$(tf wizard.vision.prompt "$node_name")" no; then
-                node_vision=$(wizard_read_plan_hostname \
-                    "$(t wizard.name.vision)" yes "$node_name $node_camouflage") || return 1
+            local node_name node_camouflage node_vision="" node_label
+            # A node the draft already holds is not asked again; a node the
+            # interruption never reached is asked whole. The two answers of one
+            # card are saved together, so the saved count is the whole card.
+            if (( ${#GOWAVE_PLAN_NODE_NAMES[@]} < i )); then
+                node_name=$(wizard_read_plan_hostname "$(tf wizard.name.worker "$i")") || return 1
+                node_camouflage=$(wizard_read_plan_hostname \
+                    "$(tf wizard.name.worker_camouflage "$i")" no "$node_name") || return 1
+                if wizard_read_yes_no "$(tf wizard.vision.prompt "$node_name")" no; then
+                    node_vision=$(wizard_read_plan_hostname \
+                        "$(t wizard.name.vision)" yes "$node_name $node_camouflage") || return 1
+                fi
+                if ! wizard_register_host worker "$node_name" "$node_camouflage" "$node_vision"; then
+                    return 1
+                fi
             fi
-            if ! wizard_register_host worker "$node_name" "$node_camouflage" "$node_vision"; then
-                return 1
+            if (( ${#GOWAVE_PLAN_NODE_LABELS[@]} < i )); then
+                node_label=$(wizard_read_label "$(tf wizard.name.node_label "$i")") || return 1
+                wizard_register_label worker "$node_label"
             fi
-            local node_label
-            node_label=$(wizard_read_label "$(tf wizard.name.node_label "$i")") || return 1
-            wizard_register_label worker "$node_label"
+            draft_save_plan || true
         done
     fi
 
@@ -789,11 +1015,14 @@ wizard_collect_plan() {
     fi
 
     wizard_plan_summary
-    wizard_certificate_preflight || return 1
-    wizard_check_plan_names || return 1
+    wizard_authorize_plan || return 1
     # The review that follows is the confirmation: it shows the same plan again
     # and its start action re-runs these checks, so a [y/N] here would ask the
     # operator to approve one plan twice.
+    #
+    # The authorization is recorded against exactly these answers. An edit that
+    # follows is saved without it, so a corrected plan passes review again.
+    draft_save_plan --reviewed || true
     return 0
 }
 
@@ -805,6 +1034,8 @@ _wizard_review_value() {
         variant) printf '%s' "$GOWAVE_PLAN_VARIANT" ;;
         panel_domain) printf '%s' "$GOWAVE_PLAN_PANEL_NAME" ;;
         camouflage_domain) printf '%s' "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ;;
+        cover_domain) printf '%s' "$GOWAVE_PLAN_COVER_NAME" ;;
+        cover_www) printf '%s' "$GOWAVE_PLAN_COVER_WWW" ;;
         vision_domain) printf '%s' "${GOWAVE_PLAN_VISION_NAME:-}" ;;
         email) printf '%s' "$GOWAVE_PLAN_EMAIL" ;;
         shared_domain) printf '%s' "$GOWAVE_PLAN_SHARED_DOMAIN" ;;
@@ -829,6 +1060,8 @@ _wizard_review_label() {
         variant) t plan_review.field.variant ;;
         panel_domain) t plan_review.field.panel_domain ;;
         camouflage_domain) t plan_review.field.camouflage_domain ;;
+        cover_domain) t plan_review.field.cover_domain ;;
+        cover_www) t plan_review.field.cover_www ;;
         vision_domain) t plan_review.field.vision_domain ;;
         email) t plan_review.field.email ;;
         shared_domain) t plan_review.field.shared_domain ;;
@@ -845,14 +1078,62 @@ _wizard_review_label() {
 # nothing to change. An empty answer keeps the current value everywhere except a
 # Vision domain, where it removes Vision — the one field where empty is a value.
 _wizard_review_apply() {
-    local field="$1" new_value="$2" node_idx taken owner
+    local field="$1" new_value="$2" node_idx taken owner checkpoint="" state
+    if (( GOWAVE_DRAFT_RESUMED == 1 )); then
+        case "$field" in
+            variant | panel_domain | camouflage_domain | vision_domain | cover_domain | cover_www | local_node_label)
+                checkpoint=panel ;;
+            node_name_* | node_camouflage_* | node_vision_* | node_label_*)
+                checkpoint="node-$(( ${field##*_} + 1 ))" ;;
+        esac
+        if [[ -n "$checkpoint" ]]; then
+            state=$(draft_checkpoint_state "$checkpoint")
+            if [[ "$state" == verified || "$state" == indeterminate ]]; then
+                printf '%s\n' "$(t plan_review.completed_identity)" >&2
+                return 1
+            fi
+        fi
+    fi
     if [[ -z "$new_value" ]]; then
         case "$field" in
             vision_domain|node_vision_*) ;;
+            cover_domain) ;;
             *) return 2 ;;
         esac
     fi
     case "$field" in
+        cover_domain)
+            # Empty is a value here: it is how a plan that selected no cover
+            # apex stays without one, and how the operator removes an apex.
+            if [[ -n "$new_value" ]]; then
+                new_value=$(wizard_normalize_name "$new_value")
+                if ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    return 1
+                fi
+                if [[ "$new_value" != "$GOWAVE_PLAN_COVER_NAME" ]] \
+                    && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                    printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                    return 1
+                fi
+            fi
+            GOWAVE_PLAN_COVER_NAME="$new_value"
+            if [[ -z "$new_value" ]]; then
+                GOWAVE_PLAN_COVER_WWW="no"
+            fi
+            ;;
+        cover_www)
+            if [[ -z "$GOWAVE_PLAN_COVER_NAME" ]]; then
+                printf '%s\n' "$(t wizard.cover.needs_apex)" >&2
+                return 1
+            fi
+            case "${new_value,,}" in
+                y|yes|д|да) new_value="yes" ;;
+                n|no|н|нет) new_value="no" ;;
+                *) printf '%s\n' "$(t wizard.yes_no.invalid)" >&2; return 1 ;;
+            esac
+            GOWAVE_PLAN_COVER_WWW="$new_value"
+            ;;
         variant)
             case "${new_value,,}" in
                 1|all-in-one|all_in_one|aio) new_value="all-in-one" ;;
@@ -942,6 +1223,15 @@ _wizard_review_apply() {
                     wizard_register_label worker "$node_label"
                 done
             elif (( new_value < GOWAVE_PLAN_NODE_COUNT )); then
+                if (( GOWAVE_DRAFT_RESUMED == 1 )); then
+                    for ((node_idx = new_value + 1; node_idx <= GOWAVE_PLAN_NODE_COUNT; node_idx++)); do
+                        state=$(draft_checkpoint_state "node-$node_idx")
+                        if [[ "$state" == verified || "$state" == indeterminate ]]; then
+                            printf '%s\n' "$(t plan_review.completed_identity)" >&2
+                            return 1
+                        fi
+                    done
+                fi
                 GOWAVE_PLAN_NODE_NAMES=("${GOWAVE_PLAN_NODE_NAMES[@]:0:new_value}")
                 GOWAVE_PLAN_NODE_CAMOUFLAGE=("${GOWAVE_PLAN_NODE_CAMOUFLAGE[@]:0:new_value}")
                 GOWAVE_PLAN_NODE_VISION=("${GOWAVE_PLAN_NODE_VISION[@]:0:new_value}")
@@ -1012,18 +1302,23 @@ _wizard_review_apply() {
 
 # One field: show the current value, read one answer, apply it. A refused answer
 # leaves the plan as it was and the editor open, so the operator fixes the field
-# instead of retyping the card that answered it.
+# instead of retyping the card that answered it. A caller that re-runs the
+# checks itself passes `quiet`, so one failure is reported once instead of once
+# per nested check.
 _wizard_review_edit_field() {
-    local field="$1" label new_value rc=0
+    local field="$1" check="${2:-yes}" label new_value rc=0
     label=$(_wizard_review_label "$field")
     printf '%s\n' "$(tf plan_review.current_value "$(_wizard_review_value "$field")")"
     if [[ "$field" == vision_domain || "$field" == node_vision_* ]]; then
         new_value=$(_wizard_prompt_read "$(tf plan_review.enter_new_vision "$label")") || return 1
+    elif [[ "$field" == cover_domain ]]; then
+        new_value=$(_wizard_prompt_read "$(tf plan_review.enter_new_cover "$label")") || return 1
     else
         new_value=$(_wizard_prompt_read "$(tf plan_review.enter_new "$label")") || return 1
     fi
     _wizard_review_apply "$field" "$new_value" || rc=$?
-    if (( rc == 0 )) && wizard_certificate_preflight && wizard_check_plan_names; then
+    if (( rc == 0 )) && [[ "$check" == "yes" ]] \
+        && wizard_certificate_preflight && wizard_check_plan_names; then
         printf '%s\n' "$(t plan_review.updated)"
     fi
     return 0
@@ -1066,7 +1361,7 @@ wizard_review_plan() {
     if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
         panel_keys+=(local_node_label)
     fi
-    panel_keys+=(email shared_domain node_count)
+    panel_keys+=(email shared_domain node_count cover_domain cover_www)
     while true; do
         printf '\n%s\n' "$(t plan_review.title)"
         wizard_plan_summary
@@ -1079,13 +1374,21 @@ wizard_review_plan() {
         choice=$(_wizard_prompt_read "$(t plan_review.edit_field)") || return 1
         case "$choice" in
             1)
-                if wizard_certificate_preflight && wizard_check_plan_names; then
+                # Authorization is the plan's, not the screen's: every failure
+                # re-reads the field it names and nothing else, and only a plan
+                # that passes both checks leaves the review.
+                if wizard_authorize_plan; then
+                    draft_save_plan --reviewed || true
                     return 0
                 fi
                 ;;
             2)
                 _wizard_review_edit_group "$(t plan_review.panel_title)" \
                     "${panel_keys[@]}" || return 1
+                # The corrected plan is saved without the authorization the
+                # previous review gave: the answers changed, so the approval
+                # that named the old ones no longer covers these.
+                draft_save_plan || true
                 ;;
             0)
                 printf '%s\n' "$(t plan_review.cancelled)"
@@ -1097,6 +1400,7 @@ wizard_review_plan() {
                     _wizard_review_edit_group "$(tf plan_review.node_title "$((index + 1))")" \
                         "node_name_$index" "node_camouflage_$index" "node_vision_$index" \
                         "node_label_$index" || return 1
+                    draft_save_plan || true
                 else
                     printf '%s\n' "$(t plan_review.invalid_choice)" >&2
                 fi
@@ -1107,6 +1411,10 @@ wizard_review_plan() {
 # Hands the panel host to cmd_install exactly as the positional path would.
 wizard_apply_plan() {
     GOWAVE_INSTALL_POSITIONAL=()
+    # The cover apex reaches the install as documented non-interactive input;
+    # the positional contract keeps its three or four names.
+    GOWAVE_COVER_DOMAIN="$GOWAVE_PLAN_COVER_NAME"
+    GOWAVE_COVER_WWW="$GOWAVE_PLAN_COVER_WWW"
     case "$GOWAVE_PLAN_VARIANT" in
         panel-only)
             GOWAVE_INSTALL_MODE="panel-only"
@@ -1141,9 +1449,11 @@ wizard_panel_inventory_names() {
     if [[ "$panel_is_local" != "yes" && "$panel_address" != "127.0.0.1" && "$panel_address" != "localhost" ]]; then
         return 2
     fi
+    local -a association_args=("${@:3}")
     root=$(cd "$_wizard_dir/.." && pwd)
     PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" python3 - \
-        "${CREDENTIALS_FILE:-/root/gowave-credentials.txt}" <<'PY'
+        "${CREDENTIALS_FILE:-/root/gowave-credentials.txt}" "${association_args[@]}" <<'PY'
+import json
 import sys
 
 from modules.api_client import GoWaveAPIError, GoWaveClient
@@ -1163,9 +1473,22 @@ if not username or not password:
     raise SystemExit(1)
 client = GoWaveClient("http://127.0.0.1:3000")
 try:
+    if len(sys.argv) == 4:
+        with open(sys.argv[2], encoding="utf-8") as handle:
+            state = json.load(handle)
+        node_uuid = sys.argv[3]
+        candidates = [node for node in state["nodes"] if node.get("uuid") == node_uuid]
+        if len(candidates) != 1:
+            raise SystemExit(1)
+        node = candidates[0]
+        profile_uuid = node.get("profileUuid")
+        if node_uuid == state.get("localNodeUuid"):
+            profile_uuid = state.get("profileUuid")
+        client.login(username, password)
+        raise SystemExit(0 if client.verify_node_associations(node_uuid, profile_uuid, node.get("hostUuids")) else 1)
     client.login(username, password)
     nodes = client.list_nodes()
-except (GoWaveAPIError, OSError):
+except (GoWaveAPIError, OSError, ValueError, KeyError, AttributeError, TypeError):
     raise SystemExit(1)
 for node in nodes:
     if isinstance(node, dict) and node.get("name"):
@@ -1293,19 +1616,50 @@ wizard_local_exit_country() {
     country_confirm "$label" "$suggestion"
 }
 
+# Count a result list by state into the three counters the exit code reads.
+#
+# VERIFIED is a registration the Panel confirmed, UNVERIFIED one it could not
+# confirm from this host, and every other state is a failure. The counters are
+# globals because the caller prints the same records it counts and re-counts
+# them after a retry has rewritten some.
+#
+# Args: array_name
+_onboard_tally() {
+    local -n tally_results="$1"
+    local result state _
+    _ONBOARD_VERIFIED=0
+    _ONBOARD_UNVERIFIED=0
+    _ONBOARD_FAILED=0
+    for result in "${tally_results[@]}"; do
+        state=""
+        IFS=$'\t' read -r _ state _ _ <<< "$result"
+        case "$state" in
+            VERIFIED) _ONBOARD_VERIFIED=$((_ONBOARD_VERIFIED + 1)) ;;
+            UNVERIFIED) _ONBOARD_UNVERIFIED=$((_ONBOARD_UNVERIFIED + 1)) ;;
+            *) _ONBOARD_FAILED=$((_ONBOARD_FAILED + 1)) ;;
+        esac
+    done
+}
+
 # One worker at a time: the Panel host holds the mutation lock and the
 # temporary-access lifecycle is per host.
 #
+# The Panel is deployed and verified before this runs, so a failed node is
+# retried here rather than by repeating the installation. That is why the offer
+# is not limited to a mixed batch: with every node failed the alternative would
+# be a second Panel deployment over a Panel that is already serving.
+#
 # Args: [panel display] [panel address] [panel is local]
-# Returns 0 if every node registered, 1 if none did, 2 if some did.
+# Returns 0 when every planned node's registration and required cleanup were
+# verified, 2 when any node failed or could not be confirmed. 1 is the failed
+# Panel deployment, which ends the install before this function is reached.
 # Prints a per-node summary to stdout.
 wizard_onboard_nodes() {
     local panel_display="${1:-}"
     local panel_address="${2:-127.0.0.1}"
     local panel_is_local="${3:-yes}"
-    local i host camouflage vision label state
+    local i host camouflage vision label
     local -a node_results=()
-    local any_succeeded=0 any_failed=0
     local record=""
 
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
@@ -1315,39 +1669,48 @@ wizard_onboard_nodes() {
         label="${GOWAVE_PLAN_NODE_LABELS[$i]:-}"
 
         record=""
+        local identity_key="node-$((i + 1))" checkpoint_state
+        if (( GOWAVE_DRAFT_RESUMED == 1 )); then
+            checkpoint_state=$(draft_checkpoint_state "$identity_key")
+            case "$checkpoint_state" in
+                verified | indeterminate)
+                    _wizard_recheck_verified_node record "$host" "$panel_address" \
+                        "$panel_is_local" "$identity_key" "${label:-$host}" "$camouflage" "$vision"
+                    node_results+=("$record")
+                    continue
+                    ;;
+            esac
+        fi
         if ! _wizard_onboard_record record "$host" "$camouflage" "$vision" "$label" "" \
-            "$panel_address" "$panel_is_local"; then
+            "$panel_address" "$panel_is_local" "$identity_key"; then
             : # the record carries the outcome; the failing status is not needed here
         fi
-        state=""
-        IFS=$'\t' read -r _ state _ _ <<< "$record"
         node_results+=("$record")
-        if [[ "$state" == "FAILED" ]]; then
-            any_failed=1
-        else
-            any_succeeded=1
-        fi
     done
 
-    # Print detailed summary
+    if ! _store_node_results node_results; then
+        printf '%s\n' "$(t wizard.summary.persist_failed)" >&2
+        _print_onboarding_summary node_results "$panel_display"
+        return 2
+    fi
     _print_onboarding_summary node_results "$panel_display"
 
-    # Store node results for potential retry
-    _store_node_results node_results
-
-    # Offer the retry only for the partial case: with every node failed there is
-    # nothing a per-node retry can add over running the installation again.
-    if (( any_succeeded > 0 && any_failed > 0 )); then
-        _offer_selective_retry node_results "$panel_address" "$panel_is_local" "$panel_display"
+    _onboard_tally node_results
+    if (( _ONBOARD_FAILED > 0 )); then
+        _offer_selective_retry node_results "$panel_address" "$panel_is_local" "$panel_display" || return 2
+        # The exit code is read from the records the retry wrote, not from the
+        # first pass: a batch whose failures were all repaired ends clean, and
+        # one that still has a failed node keeps the partial-success code.
+        _onboard_tally node_results
     fi
 
-    if (( any_succeeded == 0 )); then
-        return 1  # all failed
-    elif (( any_failed == 0 )); then
-        return 0  # all succeeded
-    else
-        return 2  # partial success
+    if (( _ONBOARD_FAILED == 0 && _ONBOARD_UNVERIFIED == 0 )); then
+        return 0
     fi
+    # A ready Panel with any failed or unconfirmed node is a partial run, even
+    # when no node registered: the Panel's failure code belongs to a Panel that
+    # did not deploy, and this one is serving.
+    return 2
 }
 
 # Run one Worker's onboarding and read the registration back from the Panel.
@@ -1363,7 +1726,11 @@ wizard_onboard_nodes() {
 # port and uuid. UNVERIFIED means the Panel could not be read from this host,
 # so nothing about the node was disproved — a remote Panel's token is not this
 # host's to hold. FAILED with phase `verify` means the Panel was read and does
-# not hold what `node add` just claimed, so the claim lost.
+# not hold what `node add` just claimed, so the claim lost. FAILED at
+# `add_node`, `revoke` or `stop_agent` runs after the registration, so its
+# reason starts with the registration the Panel holds when the readback names
+# one: a node that is registered with its cleanup unfinished is not the same
+# state as one that was never registered.
 #
 # The record is data because the summary localizes it; the display keeps the
 # Worker's lines, with the machine markers that carried the identity stripped.
@@ -1375,6 +1742,7 @@ _wizard_onboard_record() {
     local -n record_out="$1"
     local host="$2" camouflage="$3" vision="${4:-}" label="${5:-}" node_ip="${6:-}"
     local panel_address="${7:-127.0.0.1}" panel_is_local="${8:-yes}"
+    local identity_key="${9:-}"
     local scratch stderr_file stdout_output stderr_output output result identity
     local node_name node_address node_port phase detail readback readback_rc
 
@@ -1404,15 +1772,42 @@ _wizard_onboard_record() {
 
     identity=$(printf '%s\n' "$stderr_output" | sed -n 's/^NODE-IDENTITY://p' | tail -1)
     output=$(printf '%s\n%s' "$stdout_output" "$stderr_output" \
-        | sed -e '/^PHASE:/d' -e '/^NODE-IDENTITY:/d')
+        | sed -e '/^PHASE:/d' -e '/^FAILED-PHASE:/d' -e '/^NODE-IDENTITY:/d')
     printf '%s\n' "$(_redact_secrets "$output")"
 
     if (( result != 0 )); then
-        phase=$(printf '%s\n' "$stderr_output" | grep '^PHASE:' | tail -1 | cut -d: -f2)
+        phase=$(printf '%s\n' "$stderr_output" | sed -nE 's/^FAILED-PHASE:(add_node|revoke)$/\1/p' | tail -1)
+        if [[ -z "$phase" ]]; then
+            phase=$(printf '%s\n' "$stderr_output" | sed -n 's/^PHASE://p' | tail -1)
+        fi
         [[ -n "$phase" ]] || phase="unknown"
         detail=$(printf '%s\n' "$output" | grep -v '^==' | grep -v '^PHASE:' | tail -1)
         [[ -n "$detail" ]] || detail="onboarding failed"
+        # The cleanup stages run after `node add`, so a failure here can leave a
+        # node the Panel already holds. The registration is read back and named
+        # in the reason: registered-with-a-cleanup-still-pending and never
+        # registered are different states, and only the first one makes a retry
+        # that would register the node a second time.
+        case "$phase" in
+            add_node | revoke | stop_agent)
+                node_name="${label:-$host}"
+                node_address=""
+                node_port=""
+                if [[ -n "$identity" ]]; then
+                    IFS=$'\t' read -r node_name node_address node_port <<< "$identity"
+                fi
+                readback=""
+                if readback=$(wizard_verify_node_registration "$node_name" "$node_address" \
+                        "$node_port" "$panel_address" "$panel_is_local"); then
+                    detail="$(tf wizard.summary.registered_before_failure "$readback" \
+                        "${node_address}:${node_port}"); $detail"
+                fi
+                ;;
+        esac
         record_out=$(printf '%s\t%s\t%s\t%s' "$host" "FAILED" "$phase" "$(_redact_secrets "$detail")")
+        if [[ -n "$identity_key" ]]; then
+            draft_checkpoint "$identity_key" failed "$phase" 1 || true
+        fi
         return 1
     fi
 
@@ -1430,11 +1825,17 @@ _wizard_onboard_record() {
         0)
             record_out=$(printf '%s\t%s\t%s\t%s' "$host" "VERIFIED" "$readback" \
                 "${node_address}:${node_port}")
+            if [[ -n "$identity_key" ]]; then
+                draft_checkpoint "$identity_key" verified complete 1 "$readback" || true
+            fi
             return 0
             ;;
         2)
             record_out=$(printf '%s\t%s\t%s\t%s' "$host" "UNVERIFIED" "unreadable" \
                 "${node_address}:${node_port}")
+            if [[ -n "$identity_key" ]]; then
+                draft_checkpoint "$identity_key" indeterminate verification 1 || true
+            fi
             return 0
             ;;
         *)
@@ -1448,7 +1849,42 @@ _wizard_onboard_record() {
         detail="missing"
     fi
     record_out=$(printf '%s\t%s\t%s\t%s' "$host" "FAILED" "verify" "$detail")
+    if [[ -n "$identity_key" ]]; then
+        draft_checkpoint "$identity_key" failed verification 1 || true
+    fi
     return 1
+}
+
+_wizard_recheck_verified_node() {
+    local -n recheck_out="$1"
+    local host="$2" panel_address="$3" panel_is_local="$4" identity_key="$5" registered_name="$6"
+    local camouflage="$7" vision="$8" domain
+    local readback="" rc=0 expected_uuid reason="identity"
+    expected_uuid=$(draft_checkpoint_field "$identity_key" node_uuid)
+    readback=$(wizard_verify_node_registration "$registered_name" "" "" "$panel_address" "$panel_is_local") || rc=$?
+    if (( rc == 0 )) && [[ "$expected_uuid" != "missing" && "$readback" == "$expected_uuid" ]] \
+        && wizard_panel_inventory_names "$panel_address" "$panel_is_local" "${STATE_FILE:-}" "$expected_uuid"; then
+        reason=""
+        for domain in "$host" "$camouflage" ${vision:+"$vision"}; do
+            if ! verify_public_tls_sni "$domain" "$host:443" 1; then
+                reason="tls"
+                break
+            fi
+        done
+        if [[ -z "$reason" ]] && ! verify_worker_security_readback "$host"; then
+            reason="security"
+        fi
+        if [[ -z "$reason" ]]; then
+            recheck_out=$(printf '%s\t%s\t%s\t%s' "$host" "VERIFIED" "$readback" "${host}:-")
+            draft_checkpoint "$identity_key" verified complete 1 || true
+            return 0
+        fi
+    fi
+    if (( rc == 2 )); then
+        reason="unreadable"
+    fi
+    recheck_out=$(printf '%s\t%s\t%s\t%s' "$host" "UNVERIFIED" "$reason" "${host}:-")
+    draft_checkpoint "$identity_key" indeterminate verification 1 || true
 }
 
 # The operator-facing reason for a FAILED record: a localized sentence when the
@@ -1499,7 +1935,7 @@ _print_onboarding_summary() {
     local -n results="$1"
     local panel_display="${2:-}"
     local result host state first second reason
-    local verified=0 failed=0 total=0
+    local verified=0 failed=0 total=0 unverified_registration=0
 
     printf '\n%s\n' "$(t wizard.summary.header)"
     if [[ -n "$panel_display" ]]; then
@@ -1514,7 +1950,15 @@ _print_onboarding_summary() {
                 printf '  %s: %s\n' "$host" "$(tf wizard.summary.success "$first")"
                 ;;
             UNVERIFIED)
-                printf '  %s: %s\n' "$host" "$(t wizard.summary.unverified)"
+                case "$first" in
+                    identity) printf '  %s: %s\n' "$host" "$(t wizard.summary.resume_identity)" ;;
+                    tls) printf '  %s: %s\n' "$host" "$(t wizard.summary.resume_tls)" ;;
+                    security) printf '  %s: %s\n' "$host" "$(t wizard.summary.resume_security)" ;;
+                    *)
+                        unverified_registration=1
+                        printf '  %s: %s\n' "$host" "$(t wizard.summary.unverified)"
+                        ;;
+                esac
                 ;;
             *)
                 failed=$((failed + 1))
@@ -1531,6 +1975,10 @@ _print_onboarding_summary() {
         else
             printf '%s\n' "$(t wizard.summary.next_all_failed)"
         fi
+    elif (( unverified_registration )); then
+        # Nothing failed, but a registration this host could not confirm is not
+        # readiness either: the exit code is nonzero, so the screen says why.
+        printf '%s\n' "$(t wizard.summary.next_unverified)"
     fi
 }
 
@@ -1538,28 +1986,90 @@ _print_onboarding_summary() {
 # Args: array_name (reference to array of results)
 _store_node_results() {
     local -n results="$1"
-    local state_file="${GOWAVE_STATE_DIR:-/opt/gowave}/wizard_node_results"
-    printf '%s\n' "${results[@]}" > "$state_file"
-    chmod 600 "$state_file"
+    local directory="${GOWAVE_STATE_DIR:-/opt/gowave}" temporary
+    temporary=$(mktemp "$directory/.wizard_node_results.XXXXXX") || return 1
+    if ! printf '%s\n' "${results[@]}" > "$temporary" || ! sync "$temporary" \
+        || ! mv -fT -- "$temporary" "$directory/wizard_node_results"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    sync "$directory"
+}
+
+# The registration a failed cleanup may have left behind.
+#
+# `node add` runs before the cleanup stages, so a node that failed at `revoke`
+# or `stop_agent` is already in the Panel. Registering it again is what a blind
+# retry would attempt; reading the Panel first is what lets the retry keep the
+# registration it finds. Only a Panel on this host answers — a remote Panel's
+# token is not this installer's to hold — and `node add` itself refuses a name
+# it already holds, so an unreadable inventory falls back to the onboarding,
+# which meets that refusal rather than creating a duplicate.
+#
+# Args: host, panel address, panel is local
+# Returns 0 and prints `uuid<TAB>address<TAB>port` when the Panel holds the
+# planned name; 1 when it does not hold it or cannot be read here.
+_retry_held_registration() {
+    local host="$1" panel_address="${2:-127.0.0.1}" panel_is_local="${3:-yes}"
+    local i name="" inventory rc=0 line held_name held_address held_port held_uuid
+    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        if [[ "${GOWAVE_PLAN_NODE_NAMES[$i]}" == "$host" ]]; then
+            name="${GOWAVE_PLAN_NODE_LABELS[$i]:-$host}"
+            break
+        fi
+    done
+    [[ -n "$name" ]] || name="$host"
+    inventory=$(wizard_panel_inventory_names "$panel_address" "$panel_is_local") || rc=$?
+    (( rc == 0 )) || return 1
+    line=$(printf '%s\n' "$inventory" | awk -F'\t' -v want="$name" \
+        'tolower($1) == tolower(want) { print; exit }')
+    [[ -n "$line" ]] || return 1
+    IFS=$'\t' read -r held_name held_address held_port held_uuid <<< "$line"
+    [[ -n "$held_uuid" && "$held_uuid" != "-" ]] || return 1
+    printf '%s\t%s\t%s' "$held_uuid" "$held_address" "$held_port"
 }
 
 # Retry a single failed node and put its new record back in the result list.
 #
 # Only the chosen node is onboarded again: the sibling's record, the Panel step
 # and everything the first pass completed are left where they are, and the row
-# that is replaced is this node's own.
+# that is replaced is this node's own. The one exception is a failure at a
+# stage that runs after `node add`: when the Panel already holds that node, the
+# retry keeps the registration instead of asking for a second node by the same
+# name, and the row stays failed because the cleanup is still unverified.
 #
 # Args: results array, host, panel address, panel is local
 _retry_single_node() {
     local -n retry_results="$1"
     local host="$2" panel_address="${3:-127.0.0.1}" panel_is_local="${4:-yes}"
-    local i j state record
+    local i j state phase held held_uuid held_address held_port record
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
         if [[ "${GOWAVE_PLAN_NODE_NAMES[$i]}" == "$host" ]]; then
+            # The record this retry would replace is read before it is
+            # rewritten: its stage is what says whether the failed attempt got
+            # as far as registering the node.
+            state=""
+            phase=""
+            for j in "${!retry_results[@]}"; do
+                if [[ "${retry_results[$j]%%$'\t'*}" == "$host" ]]; then
+                    IFS=$'\t' read -r _ state phase _ <<< "${retry_results[$j]}"
+                    break
+                fi
+            done
+            case "$phase" in
+                add_node | revoke | stop_agent)
+                    if held=$(_retry_held_registration "$host" "$panel_address" "$panel_is_local"); then
+                        IFS=$'\t' read -r held_uuid held_address held_port <<< "$held"
+                        printf '%s\n' "$(tf wizard.retry.held "$host" "$held_address" \
+                            "$held_port" "$held_uuid")"
+                        return 1
+                    fi
+                    ;;
+            esac
             record=""
             _wizard_onboard_record record "$host" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" \
                 "${GOWAVE_PLAN_NODE_VISION[$i]:-}" "${GOWAVE_PLAN_NODE_LABELS[$i]:-}" "" \
-                "$panel_address" "$panel_is_local" || true
+                "$panel_address" "$panel_is_local" "node-$((i + 1))" || true
             state=""
             IFS=$'\t' read -r _ state _ _ <<< "$record"
             for j in "${!retry_results[@]}"; do
@@ -1746,7 +2256,11 @@ _offer_selective_retry() {
             fi
             printf '%s\n' "$(tf wizard.retry.retrying "$retry_host")"
             _retry_single_node "$results_name" "$retry_host" "$panel_address" "$panel_is_local" || true
-            _store_node_results "$results_name"
+            if ! _store_node_results "$results_name"; then
+                printf '%s\n' "$(t wizard.summary.persist_failed)" >&2
+                _print_onboarding_summary "$results_name" "$panel_display"
+                return 2
+            fi
             _print_onboarding_summary "$results_name" "$panel_display"
 
             # The list and the screen would otherwise disagree: the menu is

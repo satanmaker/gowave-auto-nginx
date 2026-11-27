@@ -33,6 +33,7 @@ from . import (
     environment_gate,
     hook_ownership,
     ingress,
+    ingress_matrix,
     matrix,
     operator_access,
     ownership,
@@ -10418,6 +10419,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              lambda context: firewall_image.case_panel_firewall_policy_is_preserved(
                  product, context),
              timeout_seconds=300),
+        # The same rule set read as an ingress decision: the local Node's port is
+        # denied to every source, the operator's SSH ports stay public, the
+        # declaration matches what was applied, and both readings agree after the
+        # unit a reboot runs re-applies the files.
+        Case(ingress_matrix.AIO_CASE_ID, "aio",
+             lambda context: ingress_matrix.case_aio_ingress(product, context),
+             timeout_seconds=ingress_matrix.POLICY_TIMEOUT_SECONDS
+             + 2 * ingress_matrix.FACTS_TIMEOUT_SECONDS),
         # The paths this transaction writes: a pre-existing object comes back
         # from the before-image, a created one is removed only while the
         # ownership record still proves it, and anything else is preserved with

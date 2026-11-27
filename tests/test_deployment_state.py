@@ -3,6 +3,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -158,3 +160,108 @@ class TestDeploymentState(unittest.TestCase):
         for path in ('relative.json', '/tmp/../active.json'):
             with self.subTest(path=path), self.assertRaises(state.StateError):
                 state.DeploymentStore(path)
+
+
+class TestDeploymentDraftCli(unittest.TestCase):
+    """The wizard drives the draft through this command line, so the contract
+    under test is the process boundary: one JSON document in, one out."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / 'deployment' / 'active.json'
+        self.plan = {
+            'kind': 'install', 'topology': 'aio', 'language': 'ru',
+            'installer_revision': 'test-1',
+            'answers': {'primary_domain': 'panel.example.com', 'node_port': 3002},
+            'nodes': {'node-1': {'name': 'Worker 1', 'ssh_port': 2222}},
+        }
+
+    def run_cli(self, *arguments, stdin=''):
+        environment = dict(os.environ, PYTHONPATH=str(self.ROOT))
+        return subprocess.run(
+            [sys.executable, '-m', 'modules.deployment_state', '--path', str(self.path), *arguments],
+            input=stdin, text=True, capture_output=True, env=environment, check=False,
+        )
+
+    def plan_cli(self, plan, *arguments):
+        return self.run_cli('--plan', *arguments, stdin=json.dumps(plan))
+
+    def test_load_reports_an_absent_draft_without_a_traceback(self):
+        result = self.run_cli('--load')
+        self.assertEqual(result.returncode, state.EXIT_ABSENT)
+        self.assertEqual(result.stdout, '')
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_plan_is_restored_with_its_review_and_checkpoints(self):
+        created = self.plan_cli(self.plan, '--reviewed')
+        self.assertEqual(created.returncode, state.EXIT_OK, created.stderr)
+        document = json.loads(created.stdout)
+        self.assertEqual(document['revision'], 1)
+        self.assertEqual(document['reviewed_digest'], state.plan_digest(document))
+
+        marked = self.run_cli('--checkpoint', 'node-1', stdin=json.dumps(
+            {'state': 'verified', 'stage': 'complete', 'attempt': 1, 'node_uuid': '3d5c9a71-0000-4000-8000-000000000000'}))
+        self.assertEqual(marked.returncode, state.EXIT_OK, marked.stderr)
+
+        loaded = self.run_cli('--load')
+        self.assertEqual(loaded.returncode, state.EXIT_OK, loaded.stderr)
+        restored = json.loads(loaded.stdout)
+        self.assertEqual(restored['revision'], 2)
+        self.assertEqual(restored['checkpoints']['node-1']['state'], 'verified')
+        self.assertEqual(restored['answers'], self.plan['answers'])
+
+        corrected = dict(self.plan, answers=dict(self.plan['answers'], primary_domain='new.example.com'))
+        rewritten = self.plan_cli(corrected)
+        self.assertEqual(rewritten.returncode, state.EXIT_OK, rewritten.stderr)
+        edited = json.loads(rewritten.stdout)
+        self.assertIsNone(edited['reviewed_digest'])
+        self.assertEqual(edited['checkpoints']['node-1']['state'], 'verified')
+        self.assertEqual(edited['operation_id'], document['operation_id'])
+
+        reviewed = self.plan_cli(corrected, '--reviewed')
+        self.assertEqual(json.loads(reviewed.stdout)['reviewed_digest'], state.plan_digest(json.loads(reviewed.stdout)))
+
+    def test_a_plan_from_another_installer_revision_is_refused(self):
+        self.assertEqual(self.plan_cli(self.plan).returncode, state.EXIT_OK)
+        result = self.plan_cli(dict(self.plan, installer_revision='test-2'))
+        self.assertEqual(result.returncode, state.EXIT_CONFLICT)
+        self.assertIn('installer revision', result.stderr)
+
+    def test_checkpoint_without_a_draft_is_reported_as_absent(self):
+        result = self.run_cli('--checkpoint', 'panel', stdin=json.dumps({'state': 'running', 'stage': 'preflight', 'attempt': 1}))
+        self.assertEqual(result.returncode, state.EXIT_ABSENT)
+        self.assertFalse(self.path.exists())
+
+    def test_checkpoint_of_an_unplanned_identity_is_refused(self):
+        self.assertEqual(self.plan_cli(self.plan).returncode, state.EXIT_OK)
+        result = self.run_cli('--checkpoint', 'node-9', stdin=json.dumps({'state': 'running', 'stage': 'preflight', 'attempt': 1}))
+        self.assertEqual(result.returncode, state.EXIT_INVALID)
+        self.assertIn('unknown checkpoint identity', result.stderr)
+
+    def test_discard_is_idempotent_and_leaves_no_scratch_files(self):
+        self.assertEqual(self.plan_cli(self.plan).returncode, state.EXIT_OK)
+        self.assertEqual(self.run_cli('--discard').returncode, state.EXIT_OK)
+        self.assertEqual(self.run_cli('--discard').returncode, state.EXIT_OK)
+        self.assertEqual(self.run_cli('--load').returncode, state.EXIT_ABSENT)
+        self.assertEqual([entry.name for entry in self.path.parent.iterdir()], ['.lock'])
+
+    def test_save_needs_the_revision_it_read(self):
+        result = self.run_cli('--save', stdin=json.dumps({'schema_version': 1}))
+        self.assertEqual(result.returncode, state.EXIT_INVALID)
+        self.assertIn('--expected-revision', result.stderr)
+
+    def test_a_credential_in_the_plan_is_rejected_before_it_is_stored(self):
+        plan = copy.deepcopy(self.plan)
+        plan['answers']['password'] = 'not-a-place-for-this'
+        result = self.plan_cli(plan)
+        self.assertEqual(result.returncode, state.EXIT_INVALID)
+        self.assertEqual(result.stdout, '')
+        self.assertFalse(self.path.exists())
+
+    def test_an_owner_the_current_user_does_not_hold_is_refused(self):
+        result = self.run_cli('--load', '--owner-uid', str(os.geteuid() + 1))
+        self.assertEqual(result.returncode, state.EXIT_INVALID)
+        self.assertIn('current user', result.stderr)

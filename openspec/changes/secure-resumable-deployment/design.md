@@ -142,6 +142,18 @@ Required samples include all three topologies; all four supported distributions 
 
 Source guards and stubs do not prove effective host state. Read firewall and listener state on the relevant host, certificates and HTTP responses from actual clients, and Node identity from Panel. State the topology/distribution/options/commit and evidence files; no green verdict from incomplete/skipped required cases. Live-host reproduction remains separately consented and is not required to author this plan.
 
+### 9. Pinned NGINX package and fail-closed fallback
+
+Use official NGINX stable `1.30.8` first on Debian 12/13 and Ubuntu 24.04/26.04. Resolve an exact approved package revision per distribution and architecture from the vendor's signed APT metadata. Scope trust to the vendor repository via a dedicated `Signed-By` keyring, verify the signing key against the documented fingerprint, and verify the candidate's origin and exact version; do not use `latest`, a global trust key, or an unverified download. Apply an equivalent policy to provisioning on Master (both modes) and in the streamed Worker payload. Install a consistent Stream-capable package set without mixing incompatible modules.
+
+Use a distribution fallback only if the official approved package is unavailable and the distribution's signed metadata and published advisories establish an approved package revision with every required applicable fix, including CVE-2026-132779 where affected. Compare distribution revisions with Debian package-version semantics. No distribution fallback is approved merely by the older recorded revision floors. Missing evidence is not a pass. A repository signature failure is a trust error, not an ordinary package miss. Do not downgrade a newer existing installation or silently replace unrelated administrator-managed configuration. If no approved package can be installed and verified, fail before using NGINX for bootstrap or activating managed configuration; report source, expected and observed versions, and preserve existing service where present.
+
+### 10. Parallel distribution acceptance
+
+In GitHub Actions, use a four-distribution matrix for each of the five existing acceptance job types, preserving the event filters and stable required check names through aggregate jobs. An aggregate fails if any required matrix cell fails, is canceled, skipped or missing; `fail-fast: false` keeps sibling evidence. Use distinct artifact names per job type, distribution and run. The GitHub host OS is not the container OS.
+
+Locally, provide one entry point to start the four distributions concurrently for a selected suite and report each result and the aggregate exit status. Serialize only the Podman subnet discovery and reservation (through creation of both networks), not the suites; make the pool accommodate four isolated runs and release only resources owned by that run. Keep independent run directories and prove non-overlapping assigned subnets and separate cleanup. Exercise the real package selection in disposable hosts, plus targeted deterministic tests for fallback and refusal.
+
 ## Risks / Trade-offs
 
 - Existing permissive firewall environments can now fail preflight -> show exact conflict and preserve their rules; never reset them automatically.

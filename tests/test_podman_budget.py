@@ -39,7 +39,7 @@ class TestDeclaredBudget(unittest.TestCase):
 
     def test_each_topology_declares_its_own_deadline(self):
         self.assertEqual(matrix.runtime_budget_seconds(self.data, "aio"), 2700)
-        self.assertEqual(matrix.runtime_budget_seconds(self.data, "multi-node"), 4500)
+        self.assertEqual(matrix.runtime_budget_seconds(self.data, "multi-node"), 6300)
 
     def test_the_case_reads_the_same_declaration(self):
         for topology in run_podman_e2e.TOPOLOGIES:
@@ -55,8 +55,8 @@ class TestDeclaredBudget(unittest.TestCase):
             matrix.runtime_budget_seconds(doctored, "aio")
 
     def test_the_tier_totals_are_read_from_the_same_block(self):
-        self.assertEqual(matrix.tier_budget_seconds(self.data, "pre_push"), 7200)
-        self.assertEqual(matrix.tier_budget_seconds(self.data, "pr"), 9000)
+        self.assertEqual(matrix.tier_budget_seconds(self.data, "pre_push"), 9600)
+        self.assertEqual(matrix.tier_budget_seconds(self.data, "pr"), 12600)
         self.assertEqual(self.data["runtime_budget"]["on_exhaustion"], "INCOMPLETE")
 
     def test_the_pre_push_total_covers_every_gated_topology(self):
@@ -202,7 +202,7 @@ class TestEntrypointBudget(unittest.TestCase):
         return status, stdout.getvalue(), stderr.getvalue(), seen
 
     def test_the_deadline_is_the_one_the_manifest_declares(self):
-        for topology, declared in (("aio", 2700), ("multi-node", 4500)):
+        for topology, declared in (("aio", 2700), ("multi-node", 6300)):
             with self.subTest(topology=topology):
                 status, _out, _err, seen = self.main(["--topology", topology])
                 self.assertEqual(status, 0)

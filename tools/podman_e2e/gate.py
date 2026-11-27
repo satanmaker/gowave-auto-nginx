@@ -19,13 +19,10 @@ another edit; Panel-only entered it the same way when its job was added, and is
 judged there against the case list its suite declares, because a mode with no
 traffic plane owes no data-plane count.
 
-The aggregate is deliberately not a job. A job that runs one topology cannot
-hide another, since the ruleset requires one name per product check; a job that
-ran both would be exactly the aggregate the design forbids, so the audit refuses
-one. The proof that a skipped topology cannot read as PASS is therefore
-structural: the required set covers every topology at full width and the two
-shared by a recovery group at recovery width, and that set is what `--check` and
-`--live` keep in place.
+Each required check retains its own name and represents one topology and group.
+Its aggregate job accepts only success from that topology's distribution matrix.
+The audit checks both sides so losing a distribution or changing the aggregate
+condition cannot silently narrow the evidence behind a required check.
 """
 from __future__ import annotations
 
@@ -38,7 +35,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import yaml
 
-from tools.podman_e2e import groups, matrix, trace
+from tools.podman_e2e import groups, matrix, target_image, trace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CONTRACT_PATH = REPO_ROOT / "tests" / "cases" / "gates.yaml"
@@ -187,12 +184,58 @@ def contract_problems(
         else:
             problems.append(f"the contract requires {name!r} but lists no check for it")
 
+    jobs = document.get("jobs") or {}
     available = suite_jobs(document)
+    claimed = set()
+    for name in names:
+        aggregates = [job for job in jobs.values() if job.get("name") == name]
+        if len(aggregates) != 1:
+            continue
+        aggregate = aggregates[0]
+        dependency = aggregate.get("needs")
+        cell = jobs.get(dependency) if isinstance(dependency, str) else None
+        if not cell or SUITE_MODULE not in run_text(cell):
+            continue
+        cell_name = cell.get("name") or dependency
+        if cell_name in claimed:
+            problems.append(f"{name!r} shares a distribution matrix with another required check")
+        claimed.add(cell_name)
+        available.pop(cell_name, None)
+        available[name] = cell
+
+        expected_step = {
+            "env": {"MATRIX_RESULT": "${{ needs." + dependency + ".result }}"},
+            "run": 'test "$MATRIX_RESULT" = success',
+        }
+        if (aggregate.get("steps") != [expected_step] or aggregate.get("continue-on-error")
+                or aggregate.get("strategy")):
+            problems.append(f"{name!r} must require success from its complete matrix")
+        expected_condition = "always()"
+        if cell.get("if"):
+            expected_condition += f" && ({cell['if']})"
+        if aggregate.get("if") != expected_condition:
+            problems.append(f"{name!r} must check failed or skipped matrices on the same events")
+        strategy = cell.get("strategy") or {}
+        distribution = "${{ matrix.distribution }}"
+        axes = strategy.get("matrix") or {}
+        if (set(axes) != {"distribution"}
+                or sorted(axes.get("distribution") or []) != sorted(target_image.DISTRIBUTIONS)
+                or strategy.get("fail-fast") is not False or strategy.get("max-parallel") is not None
+                or cell.get("continue-on-error")):
+            problems.append(f"{name!r} must run all four distributions without masking failures")
+        if (f"--distribution '{distribution}'" not in run_text(cell)
+                or distribution not in upload_name(cell) or "${{ github.run_attempt }}" not in upload_name(cell)):
+            problems.append(f"{name!r} must select and identify each distribution in its artifacts")
+
     for name in sorted(set(available) - set(names)):
         problems.append(f"{document.get('name')}: the job {name!r} runs the acceptance suite "
                         "but the ruleset does not require it")
     for name in sorted(set(names) - set(available)):
         problems.append(f"{document.get('name')}: no job named {name!r} runs the acceptance suite")
+    for name in sorted(set(available).intersection(names) - {
+        job.get("name") for job in jobs.values() if job.get("needs")
+    }):
+        problems.append(f"{name!r} does not aggregate a distribution matrix")
 
     full = {check.get("topology") for check in checks if not check.get("group")}
     recovery = {check.get("topology") for check in checks if check.get("group")}

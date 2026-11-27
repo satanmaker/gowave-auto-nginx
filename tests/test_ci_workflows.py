@@ -82,7 +82,9 @@ class TestIndependentAcceptanceWorkflows(unittest.TestCase):
         old = load("systemd-acceptance.yml")
         new_names = {job["name"] for job in new["jobs"].values()}
         old_names = {job["name"] for job in old["jobs"].values()}
-        self.assertEqual(new_names, REQUIRED_CHECK_JOBS)
+        self.assertEqual(new_names, REQUIRED_CHECK_JOBS | {
+            f"{name} (${{{{ matrix.distribution }}}})" for name in REQUIRED_CHECK_JOBS
+        })
         self.assertEqual(
             new_names & old_names, set(),
             "a job name shared with the old workflow would mask which gate reported",
@@ -92,7 +94,8 @@ class TestIndependentAcceptanceWorkflows(unittest.TestCase):
 
     def test_every_required_job_is_a_real_job_with_a_runner(self):
         workflow = load("podman-acceptance.yml")
-        by_name = {job["name"]: job for job in workflow["jobs"].values()}
+        by_name = {job["name"]: job for job in workflow["jobs"].values()
+                   if "strategy" not in job}
         self.assertEqual(set(by_name), REQUIRED_CHECK_JOBS)
         for name, job in by_name.items():
             with self.subTest(job=name):

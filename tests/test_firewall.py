@@ -121,7 +121,9 @@ case "${1:-}" in
         fi
         rule+=" -j $target"
         insert "$rule" 4
-        [[ "$declaration" == "yes" ]] && insert "$rule" 6
+        if [[ "$declaration" == "yes" ]]; then
+            insert "${rule/ufw-user-input/ufw6-user-input}" 6
+        fi
         ;;
 esac
 exit 0
@@ -140,7 +142,7 @@ fi
 printf '*filter\n'
 printf ':INPUT %s [0:0]\n' "$(policy_target "$(cat "$state/incoming" 2>/dev/null || echo deny)")"
 printf ':OUTPUT %s [0:0]\n' "$(policy_target "$(cat "$state/outgoing" 2>/dev/null || echo allow)")"
-printf ':ufw-user-input - [0:0]\n'
+printf ':%s - [0:0]\n' "$([[ "$family" == 6 ]] && echo ufw6-user-input || echo ufw-user-input)"
 [[ -f "$state/body$family" ]] && cat "$state/body$family"
 printf 'COMMIT\n'
 '''
@@ -157,7 +159,7 @@ while IFS= read -r line; do
     case "$line" in
         ':INPUT '*) policy_word "${line#:INPUT }" | cut -d' ' -f1 > "$state/incoming" ;;
         ':OUTPUT '*) policy_word "${line#:OUTPUT }" | cut -d' ' -f1 > "$state/outgoing" ;;
-        '-A ufw-user-input '*) printf '%s\n' "$line" >> "$state/body$family" ;;
+        '-A ufw-user-input '*|'-A ufw6-user-input '*) printf '%s\n' "$line" >> "$state/body$family" ;;
     esac
 done
 exit 0
@@ -334,7 +336,7 @@ class FirewallImageTests(unittest.TestCase):
     def test_restore_reads_the_ipv6_ruleset_back(self):
         host = Host(ipv6=True)
         self.addCleanup(host.close)
-        host.add_existing_rule('-A ufw-user-input -p tcp -m tcp --dport 8443 -j ACCEPT', family=6)
+        host.add_existing_rule('-A ufw6-user-input -p tcp -m tcp --dport 8443 -j ACCEPT', family=6)
         captured = subprocess.run(
             ['python3', str(FIREWALL_IMAGE_PY), str(host.root), str(host.recovery / 'image'), 'capture'],
             capture_output=True, text=True, env=host.env(), timeout=120)
@@ -484,9 +486,10 @@ class FirewallEffectiveTests(unittest.TestCase):
         spec.loader.exec_module(self.managed)
         self.policy = self.managed.firewall_policy('aio', [22])
 
-    def ruleset(self, rules, input_policy='DROP', output_policy='ACCEPT'):
+    def ruleset(self, rules, input_policy='DROP', output_policy='ACCEPT', family=4):
+        chain = 'ufw6-user-input' if family == 6 else 'ufw-user-input'
         return (f'*filter\n:INPUT {input_policy} [0:0]\n:OUTPUT {output_policy} [0:0]\n'
-                ':ufw-user-input - [0:0]\n' + '\n'.join(rules) + '\nCOMMIT\n')
+                f':{chain} - [0:0]\n' + '\n'.join(rules) + '\nCOMMIT\n')
 
     def complete(self):
         rules = ['-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT',
@@ -551,10 +554,22 @@ class FirewallEffectiveTests(unittest.TestCase):
         dual = self.managed.firewall_policy('aio', [22], ipv6=True)
         with self.assertRaisesRegex(ValueError, 'IPv6 ruleset was not read'):
             self.managed.firewall_effective(dual, {4: self.complete()}, self.status(), 'IPV6=yes\n')
-        only_ssh = ['-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT']
+        only_ssh = ['-A ufw6-user-input -p tcp -m tcp --dport 22 -j ACCEPT']
         with self.assertRaisesRegex(ValueError, 'allow 443'):
             self.managed.firewall_effective(
-                dual, {4: self.complete(), 6: self.ruleset(only_ssh)}, self.status(), 'IPV6=yes\n')
+                dual, {4: self.complete(), 6: self.ruleset(only_ssh, family=6)}, self.status(), 'IPV6=yes\n')
+
+    def test_a_dual_stack_host_reads_its_ipv6_chain_back(self):
+        # ufw names the IPv6 chain `ufw6-user-input`. Reading it with the IPv4
+        # name made every IPv6 rule look absent in the live acceptance run, so a
+        # complete second family must verify here — a defect this test fails on
+        # when the parser is fixed at the IPv4 chain name.
+        dual = self.managed.firewall_policy('aio', [22], ipv6=True)
+        v6_rules = [rule.replace('ufw-user-input', 'ufw6-user-input')
+                    for rule in self.complete().splitlines()[4:-1]]
+        result = self.managed.firewall_effective(
+            dual, {4: self.complete(), 6: self.ruleset(v6_rules, family=6)}, self.status(), 'IPV6=yes\n')
+        self.assertEqual(result['status'], 'success')
 
     def test_a_worker_source_exception_is_required_and_accepted(self):
         worker = self.managed.firewall_policy('worker', [22], 3002, ['192.0.2.10'])

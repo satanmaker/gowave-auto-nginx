@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from tools.live_vps.versions import output_matches_expected_version, version_token
 
-from . import aio, topology
+from . import aio, ingress_matrix, topology
 from . import matrix as matrix_data
 from .runner import Case, CaseBlocked, require
 
@@ -932,6 +932,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
              timeout_seconds=INSTALL_TIMEOUT_SECONDS),
         Case(HOST_CASE_ID, "panel-only", lambda context: case_host_shape(product),
              timeout_seconds=PROBE_TIMEOUT_SECONDS),
+        # The host shape's firewall half, read as an ingress decision: no Node
+        # API rule and no listener on either the installed port or a port the
+        # product never uses, the operator's SSH ports still public, and the
+        # same answer after the unit a reboot runs re-applies the files.
+        Case(ingress_matrix.PANEL_ONLY_CASE_ID, "panel-only",
+             lambda context: ingress_matrix.case_panel_only_ingress(product, context),
+             timeout_seconds=2 * ingress_matrix.POLICY_TIMEOUT_SECONDS
+             + 2 * ingress_matrix.FACTS_TIMEOUT_SECONDS),
         Case(API_CASE_ID, "panel-only", lambda context: case_api_shape(product),
              timeout_seconds=PROBE_TIMEOUT_SECONDS),
         Case(SQUAD_CASE_ID, "panel-only", lambda context: case_squad(product),

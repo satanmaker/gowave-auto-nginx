@@ -1456,7 +1456,7 @@ def compatibility_matrix():
 
 
 def os_matrix_rows():
-    """alias -> the four cells of its row, in the page's column order."""
+    """Map each distribution alias to its remaining cells in column order."""
     rows = {}
     for line in os_matrix_section().splitlines():
         if not line.startswith("| `"):
@@ -1565,26 +1565,21 @@ class TestOsMatrixReconciliation(unittest.TestCase):
                          "the QEMU job now installs the product; the page's split is stale")
         self.assertIn("not an operator install", self.prose)
 
-    def test_the_product_acceptance_executes_only_the_default_distribution(self):
+    def test_the_product_acceptance_configures_every_distribution(self):
         workflow = yaml.safe_load(ACCEPTANCE_WORKFLOW.read_text(encoding="utf-8"))
-        commands = "\n".join(
-            step.get("run", "")
-            for job in workflow["jobs"].values()
-            for step in job["steps"]
-        )
-        self.assertNotIn("--distribution", commands,
-                         "a workflow selects a distribution; the page says none does")
-        default = run_podman_e2e.DEFAULT_DISTRIBUTION
-        executed = [alias for alias, cells in self.rows.items() if cells[1].startswith("executed")]
-        self.assertEqual(executed, ["ubuntu-24.04"])
-        self.assertIn(default, executed)
-        for alias, cells in self.rows.items():
-            if alias == default:
-                continue
-            with self.subTest(alias=alias):
-                self.assertEqual(cells[1], "selectable, not executed")
-        self.assertIn("--distribution", self.prose)
-        self.assertIn(default, self.prose)
+        configured = {
+            alias for alias, cells in self.rows.items() if cells[1] == "required CI matrix cell"
+        }
+        suites = [
+            job for job in workflow["jobs"].values()
+            if any("tools.run_podman_e2e" in step.get("run", "") for step in job["steps"])
+        ]
+        self.assertEqual(len(suites), 5)
+        self.assertEqual(configured, set(self.lock))
+        for job in suites:
+            self.assertEqual(set(job["strategy"]["matrix"]["distribution"]), configured)
+        self.assertIn("--all-distributions", self.prose)
+        self.assertIn(run_podman_e2e.DEFAULT_DISTRIBUTION, self.prose)
 
     def test_the_compatibility_matrix_claim_matches_the_execution(self):
         text = compatibility_matrix().read_text(encoding="utf-8")
@@ -1595,14 +1590,29 @@ class TestOsMatrixReconciliation(unittest.TestCase):
             cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
             if len(cells) >= 7 and cells[2] in self.lock.values():
                 statuses[next(alias for alias, ref in self.lock.items() if ref == cells[2])] = cells[6]
-        self.assertEqual(statuses, {"ubuntu-24.04": "PROJECT_PODMAN_EXECUTED",
+        self.assertEqual(statuses, {"ubuntu-24.04": "PROJECT_PODMAN_SELECTABLE",
                                     "ubuntu-26.04": "PROJECT_PODMAN_SELECTABLE",
                                     "debian-12": "PROJECT_PODMAN_SELECTABLE",
-                                    "debian-13": "PROJECT_PODMAN_SELECTABLE"})
+                                    "debian-13": "PROJECT_PODMAN_EXECUTED"})
         self.assertNotIn("NOT IMPLEMENTED / NOT EXECUTED", text,
                          "the matrix still says Multi-Node is unimplemented")
         self.assertIn("tools/run_podman_e2e.py --topology multi-node", text)
         self.assertIn("tests/multi_node_testbed.sh", text)
+
+    def test_archive_revisions_are_distinct_from_the_official_pin(self):
+        revisions = {
+            "debian-12": ("1.22.1-9+deb12u11", "Open"),
+            "debian-13": ("1.26.3-3+deb13u11", "Open"),
+            "ubuntu-24.04": ("1.24.0-2ubuntu7.21", "Needs evaluation"),
+            "ubuntu-26.04": ("1.28.3-2ubuntu1.14", "Needs evaluation"),
+        }
+        for alias, codename in product_codenames().items():
+            with self.subTest(alias=alias):
+                archive_branch, revision, cve_status, pin = self.rows[alias][3:]
+                self.assertEqual((revision, cve_status), revisions[alias])
+                self.assertEqual(revision.split("-")[0], NGINX_VERSION.search(archive_branch).group(1))
+                self.assertEqual(pin, f"1.30.8-1~{codename}` (modern)")
+        self.assertIn("None of these revisions is approved as a fallback", self.prose)
 
     def test_the_page_and_the_renderer_agree_on_the_two_listen_branches(self):
         renderer = shell_function("modules/os.sh", "render_nginx_listen_ssl_http2")
@@ -1807,8 +1817,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 252, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 238, "partial": 12, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 259, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 245, "partial": 12, "live-only": 2})
         self.assertIn(f"The catalog holds {len(catalog['cases'])} entries",
                       " ".join(boundary_section().split()),
                       "the page states a total the catalog does not have")
@@ -1945,7 +1955,7 @@ class TestPodmanE2EDocumentation(unittest.TestCase):
         for topology, entry in matrix["topologies"].items():
             with self.subTest(topology=topology):
                 self.assertIn(str(entry["runtime_budget_seconds"]), documented())
-        for tier, key in (("pre-push", "pre_push_total_seconds"), ("9000", "pr_total_seconds")):
+        for tier, key in (("pre-push", "pre_push_total_seconds"), ("pr", "pr_total_seconds")):
             with self.subTest(tier=tier):
                 self.assertIn(tier, documented())
                 self.assertIn(str(matrix["runtime_budget"][key]), documented())

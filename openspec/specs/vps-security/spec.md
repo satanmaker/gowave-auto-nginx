@@ -82,7 +82,7 @@ The security subsystem SHALL configure `unattended-upgrades` with OS-specific se
 #### Scenario: Distro-specific security updates configuration
 - **GIVEN** a target host running Ubuntu or Debian
 - **WHEN** automated updates are configured
-- **THEN** `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` is written with the appropriate distro security origin pattern, and `Unattended-Upgrade::Automatic-Reboot` is set to `"false"`.
+- **THEN** `/etc/apt/apt.conf.d/zz-gowave-auto-nginx` is written with the appropriate distro security origin pattern, and `Unattended-Upgrade::Automatic-Reboot` is set to `"false"`; the file name sorts after any distro or container-image drop-in that disables the schedule (for example `docker-disable-periodic-update`), so the managed policy is the one APT applies last.
 
 ### Requirement: Conditional Kernel BBR Congestion Control and MTU Probing
 The security subsystem SHALL enable BBR congestion control and path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via dedicated oneshot service `bbr-load.service` ordered before `systemd-sysctl` with graceful fallback on kernels lacking `tcp_bbr`.

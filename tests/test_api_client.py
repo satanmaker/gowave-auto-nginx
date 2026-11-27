@@ -1581,6 +1581,28 @@ class TestHostReconciliation(unittest.TestCase):
             known_host_uuids=known, country=country,
         )
 
+    def test_resume_associations_require_exact_profile_node_and_inbound_coverage(self):
+        client = GoWaveClient(self.base_url)
+        node = {
+            "uuid": "node-ams",
+            "configProfile": {"activeConfigProfileUuid": "profile-ams",
+                              "activeInbounds": [{"uuid": "inb-reality"}]},
+        }
+        host = self.legacy_reality_host()
+        client.list_nodes = lambda: [node]
+        def read_hosts(method, endpoint):
+            self.assertEqual((method, endpoint), ("GET", "/api/hosts"))
+            return {"response": {"hosts": [host]}}
+        client.request = read_hosts
+        self.assertTrue(client.verify_node_associations("node-ams", "profile-ams", ["host-legacy"]))
+        self.assertFalse(client.verify_node_associations("node-ams", "other", ["host-legacy"]))
+        self.assertFalse(client.verify_node_associations("node-ams", "profile-ams", ["missing"]))
+        host["nodes"] = ["node-ams", "node-other"]
+        self.assertFalse(client.verify_node_associations("node-ams", "profile-ams", ["host-legacy"]))
+        host["nodes"] = ["node-ams"]
+        node["configProfile"]["activeInbounds"].append({"uuid": "inb-ws"})
+        self.assertFalse(client.verify_node_associations("node-ams", "profile-ams", ["host-legacy"]))
+
     def legacy_reality_host(self, uuid="host-legacy", remark="VLESS-REALITY@ams-01", node="node-ams"):
         record = {
             "uuid": uuid,

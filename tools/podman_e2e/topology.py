@@ -20,6 +20,7 @@ operator is the same narrow, test-only path the installer already validates.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -41,7 +42,8 @@ from tools.podman_e2e import (
 # test-only override that refuses anything but a private address (so an operator
 # can never pass a public IP off as a NAT-ed host), and every fixture, both
 # probes, and the ACME directory live on it.
-CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24")
+NETWORK_RESERVATION_LOCK = Path("/run/lock/gowave-podman-e2e-networks.lock")
+CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24", "10.92.0.0/24")
 
 # The data network must carry real public addresses, because two independent
 # guards otherwise swallow the payload before it can prove egress:
@@ -62,7 +64,7 @@ CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24")
 # bytes look routable. Each candidate sits next to a documentation block so it is
 # easy to recognise in an evidence file, and the allocator skips any block the
 # workstation or another Podman network already claims.
-DATA_PREFIX_CANDIDATES = ("203.0.114.0/24", "198.51.101.0/24", "192.0.3.0/24")
+DATA_PREFIX_CANDIDATES = ("203.0.114.0/24", "198.51.101.0/24", "192.0.3.0/24", "203.0.115.0/24")
 
 DNS_OFFSET = 53
 TARGET_OFFSET = 10
@@ -424,7 +426,8 @@ class AioTopology:
         self.engine_client_name = self.context.resource_name("engines")
         self.payload_dir = self.context.secret_dir / "subscriptions"
         self._engine_image = ""
-        if self.plan is None:
+        self._select_plan_on_create = self.plan is None
+        if self._select_plan_on_create:
             self.plan = allocate_plan(self.podman.network_subnets())
         if self.egress_resolvers is None:
             self.egress_resolvers = egress_resolvers()
@@ -443,10 +446,15 @@ class AioTopology:
                 f"no egress resolver found in {consulted}; the disposable host could not install packages"
             )
         self.payload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
-        self.podman.network_create(
-            self.data_network, self.plan.data_subnet, disable_dns=True, internal=True,
-        )
+        lock_fd = os.open(NETWORK_RESERVATION_LOCK, os.O_CREAT | os.O_NOFOLLOW | os.O_RDONLY, 0o600)
+        with os.fdopen(lock_fd, "rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._select_plan_on_create:
+                self.plan = allocate_plan(self.podman.network_subnets())
+            self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
+            self.podman.network_create(
+                self.data_network, self.plan.data_subnet, disable_dns=True, internal=True,
+            )
         self._start_dns()
         self._start_acme()
         self._start_target()
@@ -1067,6 +1075,10 @@ class AioTopology:
             "GOWAVE_PANEL_VERSION": pins.get("panel_version", "latest"),
             "GOWAVE_NODE_VERSION": pins.get("node_version", "latest"),
             "XRAY_SERVER_VERSION": pins.get("xray_version", ""),
+            # The cover apex is the name the operator selects, so the installed
+            # host is given one explicitly instead of relying on a suffix guess.
+            "GOWAVE_COVER_DOMAIN": COVER_APEX,
+            "GOWAVE_COVER_WWW": "yes",
             "DEBIAN_FRONTEND": "noninteractive",
         }
 

@@ -2394,7 +2394,9 @@ class TestSubscriptionTopology(unittest.TestCase):
         patcher = mock.patch.object(acme_fixture.AcmeFixture, "wait_ready", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.instance.create()
+        lock = self.podman.context.secret_dir / "networks.lock"
+        with mock.patch.object(topology, "NETWORK_RESERVATION_LOCK", lock):
+            self.instance.create()
 
     def test_the_payload_directory_is_run_scoped_and_private(self):
         self.assertEqual(self.instance.payload_dir.parent, self.podman.context.secret_dir)

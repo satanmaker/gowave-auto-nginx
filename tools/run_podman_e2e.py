@@ -16,8 +16,12 @@ reported ``INCOMPLETE`` instead of being dropped from the report.
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from uuid import uuid4
 from typing import List, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +38,7 @@ TOPOLOGIES = ("aio", "multi-node", "panel-only")
 # The row every CI job installs on. Named here rather than inline because
 # `docs/PODMAN_E2E_DISCOVERY.md` §The OS matrix states which row executes, and a
 # test reads this constant back against that page and against the workflows.
-DEFAULT_DISTRIBUTION = "ubuntu-24.04"
+DEFAULT_DISTRIBUTION = "debian-13"
 
 
 def build_suite(
@@ -52,14 +56,50 @@ def build_suite(
     raise ValueError(f"unsupported topology: {topology!r}")
 
 
+def run_distribution_matrix(args: argparse.Namespace, budget: int) -> int:
+    root = args.artifact_root / f"matrix-{uuid4().hex}"
+    options = ["--topology", args.topology, "--budget-seconds", str(budget)]
+    if args.vision:
+        options.append("--vision")
+    if args.worker_vision:
+        options.append("--worker-vision")
+    if args.require_group:
+        options.extend(["--require-group", args.require_group])
+
+    def run(distribution: str) -> bool:
+        artifact_root = root / distribution
+        command = [sys.executable, str(Path(__file__).resolve()), *options,
+                   "--distribution", distribution, "--artifact-root", str(artifact_root)]
+        try:
+            status = subprocess.run(command, check=False, timeout=budget + 600).returncode
+            records = list(artifact_root.glob("*/result.json"))
+            passed = status == 0 and len(records) == 1 and json.loads(
+                records[0].read_text(encoding="utf-8")
+            )["overall"] == "PASS"
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError) as exc:
+            print(f"{distribution}: {exc}", file=sys.stderr, flush=True)
+            passed = False
+        print(f"{distribution}: {'PASS' if passed else 'NOT PASS'} ({artifact_root})", flush=True)
+        return passed
+
+    with ThreadPoolExecutor(max_workers=len(target_image.DISTRIBUTIONS)) as executor:
+        results = list(executor.map(run, sorted(target_image.DISTRIBUTIONS)))
+    return 0 if all(results) else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topology", choices=TOPOLOGIES, default="aio")
-    parser.add_argument(
+    distributions = parser.add_mutually_exclusive_group()
+    distributions.add_argument(
         "--distribution",
         choices=sorted(target_image.DISTRIBUTIONS),
         default=DEFAULT_DISTRIBUTION,
         help="Target distribution alias from tests/cases/images.lock.yaml",
+    )
+    distributions.add_argument(
+        "--all-distributions", action="store_true",
+        help="Run the selected suite concurrently on all four pinned distributions",
     )
     parser.add_argument(
         "--vision",
@@ -120,6 +160,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--budget-seconds {budget} exceeds the {ceiling}s tests/cases/matrix.yaml "
             f"declares for {args.topology}: an override may only tighten the deadline"
         )
+
+    if args.all_distributions:
+        return run_distribution_matrix(args, budget)
 
     context = RunContext(
         topology=args.topology,

@@ -315,6 +315,28 @@ rollback_channel_switch() {
     echo "Channel switch rolled back to the pre-switch state." >&2
 }
 
+recovery_require_settled_journal() {
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" <<'PY'
+import sys
+
+from modules.recovery import JournalValidationError, load_journal_file, validate_journal
+
+try:
+    journal = load_journal_file(sys.argv[1])
+    validate_journal(journal)
+except FileNotFoundError:
+    sys.exit(0)
+except (JournalValidationError, OSError, ValueError):
+    sys.exit(1)
+
+if not journal["state"].endswith(("COMMITTED", "ROLLED_BACK")):
+    sys.exit(1)
+sides = journal.get("rollback_sides", {})
+if not isinstance(sides, dict) or any(value != "ROLLED_BACK" for value in sides.values()):
+    sys.exit(1)
+PY
+}
+
 recover_boot_files() {
     acquire_mutation_lock || return 1
     if [[ ! -e "$JOURNAL_FILE" && ! -L "$JOURNAL_FILE" ]]; then

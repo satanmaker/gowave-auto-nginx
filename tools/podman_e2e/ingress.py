@@ -36,6 +36,8 @@ PROBE_SCRIPT = "/repo/tools/podman_e2e/ingress_probe.py"
 # The live controller gives each capture 45 s; a transfer's own budget is 30 s,
 # so this outlives the request it brackets without outliving a hung case.
 CAPTURE_WINDOW_SECONDS = 45
+# The stream router's own access log: SNI, protocol, client address, port.
+EDGE_LOG = "/var/log/nginx/gowave-edge-access.log"
 # How long a probe may take to print its readiness line. A container that has to
 # start a Python interpreter is the slow case; a missing script exits at once.
 READY_TIMEOUT_SECONDS = 20
@@ -316,7 +318,20 @@ def _peer(backend: Backend, host: Host, identity_port: int, remote_port: int) ->
 
 
 def _capture(backend: Backend, host: Host, port: int, window: int,
-             probe_script: str = PROBE_SCRIPT) -> Session:
+             probe_script: str = PROBE_SCRIPT) -> Any:
+    """The host's own edge log when it exists, the packet probe otherwise.
+
+    The log is what an operator reads in production and it is written by the
+    product's own stream router, so a line naming the SNI is a statement about
+    the routing decision itself. A raw packet capture is a laboratory
+    instrument: inside an unprivileged container namespace it can observe
+    nothing at all, which is why an empty capture alone must not decide a case.
+    """
+    present = backend.run(
+        host.container, ["test", "-f", EDGE_LOG], timeout=IDENTITY_TIMEOUT_SECONDS,
+    )
+    if getattr(present, "returncode", 1) == 0:
+        return LogWitness(backend, host, port)
     session = backend.spawn_probe(
         host.container,
         ["python3", "-u", probe_script, "--scope", "packets",
@@ -334,6 +349,51 @@ def _capture(backend: Backend, host: Host, port: int, window: int,
             f"{host.role}: the capture printed {message!r} instead of its readiness line",
         )
     return session
+
+
+class LogWitness:
+    """The lines the host's stream router appends while the request runs."""
+
+    def __init__(self, backend: Backend, host: Host, port: int, path: str = EDGE_LOG):
+        self.backend = backend
+        self.host = host
+        self.port = port
+        self.path = path
+        self.started = time.monotonic()
+        result = backend.run(
+            host.container, ["wc", "-l", path], timeout=IDENTITY_TIMEOUT_SECONDS,
+        )
+        try:
+            self.baseline = int((result.stdout or "0").split()[0])
+        except (IndexError, ValueError):
+            self.baseline = 0
+
+    def finish(self) -> Dict[str, Any]:
+        result = self.backend.run(
+            self.host.container,
+            ["tail", "-n", f"+{self.baseline + 1}", self.path],
+            timeout=IDENTITY_TIMEOUT_SECONDS,
+        )
+        counts: Dict[str, int] = {}
+        snis: Dict[str, int] = {}
+        for line in (result.stdout or "").splitlines():
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != str(self.port):
+                continue
+            snis[fields[0]] = snis.get(fields[0], 0) + 1
+            counts[fields[2]] = counts.get(fields[2], 0) + 1
+        return {
+            "captured": sum(counts.values()),
+            "sources": counts,
+            "snis": snis,
+            "port": self.port,
+            "seconds": round(time.monotonic() - self.started, 3),
+            "stopped_by": "harness",
+            "witness": "edge-log",
+        }
+
+    def abandon(self) -> None:
+        """Nothing to stop: the witness only reads the file when it finishes."""
 
 
 @dataclass
@@ -429,24 +489,33 @@ def measure(
     return measurement
 
 
-def _summary_facts(summary: Dict[str, Any]) -> Tuple[int, Dict[str, int], str]:
-    """The captured count, the per-source counts, and why the summary is unusable."""
+def _summary_facts(summary: Dict[str, Any]) -> Tuple[int, Dict[str, int], Dict[str, int], str]:
+    """The captured count, per-source counts, per-SNI counts, and why unusable.
+
+    A packet capture carries no SNI, so its ``snis`` is empty and the verdict
+    falls back to matching the client address. The edge log carries both, and
+    the SNI is what decides which host a connection belongs to: the client's
+    address differs between the control and data networks, so an address match
+    alone would call a correct routing decision invisible.
+    """
     captured = summary.get("captured")
     sources = summary.get("sources")
+    snis = summary.get("snis") or {}
     if not isinstance(captured, int) or not isinstance(sources, dict):
-        return 0, {}, "the capture printed no counts"
+        return 0, {}, {}, "the capture printed no counts"
     if summary.get("stopped_by") != "harness":
-        return captured, {}, (
+        return captured, {}, {}, (
             "the capture ended on its own window instead of being stopped by the harness, so it "
             "may have closed before the request"
         )
     if int(summary.get("drops") or 0) > 0:
-        return captured, {}, (
+        return captured, {}, {}, (
             f"the kernel dropped {summary.get('drops')} segment(s) before the capture read them, "
             "so the account is incomplete"
         )
     counts = {str(address): int(count) for address, count in sources.items() if int(count) > 0}
-    return captured, counts, ""
+    named = {str(name): int(count) for name, count in snis.items() if int(count) > 0}
+    return captured, counts, named, ""
 
 
 def evaluate(measurement: Measurement) -> Dict[str, Any]:
@@ -464,6 +533,7 @@ def evaluate(measurement: Measurement) -> Dict[str, Any]:
     # the host whose account would have decided, so dropping it from the roles
     # would let the other host's empty capture answer for both.
     roles = sorted(set(measurement.captures) | set(measurement.capture_errors))
+    expected_sni = str((measurement.request or {}).get("sni") or "")
     others = [role for role in roles if role != measurement.intended]
     captured: Dict[str, int] = {}
     foreign: Dict[str, int] = {}
@@ -476,14 +546,21 @@ def evaluate(measurement: Measurement) -> Dict[str, Any]:
             captured[role] = 0
             matched[role] = 0
             continue
-        count, sources, unusable = _summary_facts(measurement.captures[role])
+        count, sources, named, unusable = _summary_facts(measurement.captures[role])
         captured[role] = count
-        matched[role] = sources.get(measurement.client, 0) if measurement.client else 0
+        # The SNI is the routing decision itself and travels the request's path;
+        # the client's address is reported as it is, but only decides when the
+        # witness has no names to compare.
+        matched[role] = (
+            named.get(expected_sni, 0) if named
+            else (sources.get(measurement.client, 0) if measurement.client else 0)
+        )
         if unusable:
             reasons.append(f"{role}: {unusable}")
-        for address, packets in sources.items():
-            if address != measurement.client:
-                foreign[address] = foreign.get(address, 0) + packets
+        if not named:
+            for address, packets in sources.items():
+                if address != measurement.client:
+                    foreign[address] = foreign.get(address, 0) + packets
 
     recorded_foreign = ", ".join(
         f"{address}:{packets}"
@@ -514,6 +591,11 @@ def evaluate(measurement: Measurement) -> Dict[str, Any]:
             reasons.append(
                 f"every one of the {intended_captured} segment(s) the {measurement.intended} host "
                 "captured came from an address other than the client's"
+            )
+        elif (measurement.captures.get(measurement.intended) or {}).get("witness") == "edge-log":
+            reasons.append(
+                f"the {measurement.intended} host's edge log holds no line for "
+                f"{expected_sni or 'the request'} on port {measurement.port}"
             )
         else:
             reasons.append(

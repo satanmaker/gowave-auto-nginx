@@ -44,6 +44,7 @@ source "$SCRIPT_DIR/modules/firewall.sh"
 source "$SCRIPT_DIR/modules/panel.sh"
 source "$SCRIPT_DIR/modules/node.sh"
 source "$SCRIPT_DIR/modules/nginx.sh"
+source "$SCRIPT_DIR/modules/migration.sh"
 source "$SCRIPT_DIR/modules/recovery.sh"
 
 reload_nginx_strict() {
@@ -321,6 +322,36 @@ cmd_install() {
     # fails for a product reason rather than a missing interpreter.
     CURRENT_STEP="install: input contract"
     preflight_require_inputs install "$panel_domain" "$reality_domain" "$admin_email" "$vision_domain" || return $?
+
+    if (( GOWAVE_DRAFT_RESUMED == 1 )); then
+        CURRENT_STEP="resume: transaction recovery"
+        wizard_resume_require_recovery || return 1
+    fi
+
+    # An installed host is migrated, never re-derived. The identity its own
+    # managed configuration serves is read back, an ambiguity is named instead
+    # of resolved, and nothing is written until the operator confirms it: a host
+    # that predates the explicit ownership record keeps serving what it serves.
+    CURRENT_STEP="install: existing-state inspection"
+    local migration_rc=0
+    migration_confirm_existing "$STATE_FILE" || migration_rc=$?
+    case "$migration_rc" in
+        0) ;;
+        3)
+            echo "Existing deployment left unchanged."
+            return 0
+            ;;
+        *) return "$migration_rc" ;;
+    esac
+
+    # A failed readback cannot authorize rebuilding a previously verified Panel.
+    local resume_finish=0
+    if resume_recorded_panel resume_finish "$panel_domain" "$install_mode"; then
+        return "$resume_finish"
+    fi
+
+    draft_checkpoint panel running preflight 1 || true
+
     preflight_require_direct_dns "$panel_domain" "$reality_domain" "$vision_domain" || return 1
     bootstrap_early_tools || return 1
 
@@ -358,16 +389,30 @@ cmd_install() {
     fi
     record_certificate_lineages "$STATE_FILE" "$panel_live" "$reality_live" "$vision_live" || return 1
 
-    # The camouflage site lives on the registrable apex of the panel domain so
-    # that a browser reaching for the bare domain lands on a plausible static
-    # site. ACME validates it over port 80 on this host, so it is only enabled
-    # when both the apex and www already resolve here; the decision names its
-    # own refusal, including a panel domain that has no apex to derive.
-    local cover_domain="" cover_server_ip=""
-    if [[ -n "$(derive_cover_domain "$panel_domain")" ]]; then
-        cover_server_ip=$(resolve_panel_ipv4) || return 1
+    # The camouflage apex is an owned name the operator selected through
+    # GOWAVE_COVER_DOMAIN -- documented non-interactive input, and what the
+    # wizard's reviewed plan sets. It is never derived from the Panel domain's
+    # suffix: the old last-two-label guess asked for a certificate for whatever
+    # zone the Panel happened to sit in. A deployment that selects no cover
+    # apex serves no cover site, and says so instead of guessing one.
+    local cover_domain="" cover_server_ip="" cover_server_ipv6="" cover_names=""
+    # A host that predates the explicit record keeps the cover apex its own decoy
+    # vhost serves: the migration preview named it and the operator confirmed it.
+    # Only an unselected input is filled -- a run that chooses a cover, including
+    # the reviewed plan that chooses none, is never overridden.
+    if [[ -z "${GOWAVE_COVER_DOMAIN+set}" ]]; then
+        GOWAVE_COVER_DOMAIN=$(migration_adopted_cover "$STATE_FILE") || return 1
     fi
-    cover_domain=$(cover_domain_for "$panel_domain" "$cover_server_ip")
+    if [[ -n "${GOWAVE_COVER_DOMAIN:-}" ]]; then
+        cover_server_ip=$(resolve_panel_ipv4) || return 1
+        cover_server_ipv6=$(resolve_panel_ipv6) || return 1
+    fi
+    cover_domain=$(cover_domain_for "$panel_domain" "$cover_server_ip" "$cover_server_ipv6") || return 1
+    if [[ -n "$cover_domain" ]]; then
+        cover_names=$(cover_site_names "$cover_domain") || return 1
+    fi
+    record_domain_ownership "$STATE_FILE" master "$panel_domain" "$reality_domain" \
+        "$vision_domain" "$cover_domain" "${GOWAVE_COVER_WWW:-no}" || return 1
 
     if [[ "$install_mode" == "panel-only" ]]; then
         echo "==> Starting GoWave Auto NGINX Panel-only Deployment..."
@@ -386,9 +431,9 @@ cmd_install() {
         echo "Vision Domain:  Disabled (default 4-inbound configuration)"
     fi
     if [[ -n "$cover_domain" ]]; then
-        echo "Cover Site:     $cover_domain (+ www) — camouflage website on the apex"
+        echo "Cover Site:     ${cover_names//$'\n'/, } — camouflage website on the selected apex"
     else
-        echo "Cover Site:     Disabled"
+        echo "Cover Site:     Disabled (no cover apex selected)"
     fi
 
     # Step 1: Preflight Environment Inspection
@@ -413,6 +458,8 @@ cmd_install() {
     # Step 3: Host Security Hardening
     CURRENT_STEP="install: host security"
     configure_ssh_and_fail2ban
+    configure_unattended_upgrades
+    configure_dot
     configure_swap
     configure_bbr_and_mtu "$STATE_FILE"
     configure_log_rotation
@@ -497,12 +544,17 @@ cmd_install() {
     fi
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($reality_domain)..."
-    # The camouflage certificate also covers the apex website, so one lineage
-    # serves both the probe fallback and the plain-domain landing page.
+    # The camouflage certificate also covers the cover names the operator
+    # selected, so one lineage serves both the probe fallback and the landing
+    # page. The alias join is a choice recorded in the plan, not an assumption.
     local reality_cert_args=(-d "$reality_domain")
     local reality_cert_flags=()
     if [[ -n "$cover_domain" ]]; then
-        reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        local cover_name
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            reality_cert_args+=(-d "$cover_name")
+        done <<< "$cover_names"
         reality_cert_flags+=(--expand)
     fi
     if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
@@ -527,9 +579,18 @@ cmd_install() {
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
 
     # Verify certificates cryptographically (refuse to proceed with invalid or missing certificates)
+    local cover_verified=1 cover_name
+    if [[ -n "$cover_domain" ]]; then
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            if ! verify_acme_certificate "$cover_name" "$reality_live"; then
+                cover_verified=0
+            fi
+        done <<< "$cover_names"
+    fi
     if ! verify_acme_certificate "$panel_domain" "$panel_live" || \
        ! verify_acme_certificate "$reality_domain" "$reality_live" || \
-       { [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "$reality_live"; } || \
+       (( cover_verified == 0 )) || \
        { [[ -n "$vision_domain" ]] && ! verify_acme_certificate "$vision_domain" "$vision_live"; }; then
         rollback_acme_lineages
         return 1
@@ -548,6 +609,20 @@ cmd_install() {
     configure_certbot_deploy_hook "$acme_tx_id"
 
     reload_nginx_strict
+
+    # A renewal path nobody exercised is an assumption: the production vhost is
+    # what answers the next HTTP-01 challenge, and the recorded authenticator and
+    # the deploy hook only run when a renewal does. The dry run revalidates each
+    # lineage this install owns through that path while NGINX serves the
+    # production configuration, and it stores no certificate.
+    CURRENT_STEP="install: renewal dry run"
+    local owned_lineage
+    for owned_lineage in "$panel_lineage" "$reality_lineage" ${vision_lineage:+"$vision_lineage"}; do
+        if ! verify_renewal_dry_run "$owned_lineage" "${certbot_extra_args[@]}"; then
+            echo "Error: the renewal dry run for $owned_lineage failed; a certificate this run installed would not renew." >&2
+            return 1
+        fi
+    done
 
     # Step 6: GoWave Panel Native Installation
     CURRENT_STEP="install: panel"
@@ -570,14 +645,29 @@ cmd_install() {
     if [[ "$install_mode" == "all-in-one" ]]; then
         local secret_key
         secret_key=$(extract_secret_key "$GOWAVE_DIR")
+        draft_checkpoint local-node running deployment 1 || true
         install_local_node "$secret_key" 3002
         verify_node_mtls_health "$secret_key" 3002
+        # The handshake that just completed is the local node's evidence: the
+        # checkpoint records the verdict, and a resumed run re-runs this same
+        # handshake instead of reinstalling the node.
+        draft_checkpoint local-node verified complete 1 || true
         # Asked only once this node serves: the answer is about the route its
         # traffic leaves from, and a node that never came up has no such route.
         local_country=$(wizard_local_exit_country "$local_node_name") || local_country=""
         configure_ufw false "" 3002
     else
         configure_ufw false ""
+    fi
+
+    # The report is written once every control it covers has been applied and
+    # read back. It re-verifies each of them here, so its verdict is about this
+    # host now, not about what a step printed earlier.
+    CURRENT_STEP="install: security report"
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        write_security_report aio 3002 "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || return 1
+    else
+        write_security_report panel-only "" "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || return 1
     fi
 
     # Step 9: REST API Provisioning
@@ -708,7 +798,21 @@ if mode == "panel-only":
     save_credentials(admin_user, admin_password, f"https://{panel_domain}",
                      token_info["token"], credentials_path)
 
-    state = {
+    # This write owns the provisioning fields, not the whole document: an earlier
+    # step recorded domain ownership (and certificate lineages) here, and a fresh
+    # dict dropped them. Without them the next install reads the host as a legacy
+    # deployment it must not touch without a terminal, so a rerun of this very
+    # version stops at the migration gate.
+    state = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as handle:
+                recorded = json.load(handle)
+            if isinstance(recorded, dict):
+                state = recorded
+        except (OSError, ValueError):
+            state = {}
+    state.update({
         "schemaVersion": 2,
         "installationMode": "panel-only",
         "panelDomain": panel_domain,
@@ -716,7 +820,7 @@ if mode == "panel-only":
         "congestionControl": existing_cc,
         "defaultUserShortUuid": short_uuid,
         "nodes": [],
-    }
+    })
     atomic_write_state(state, state_path)
 
     journal["state"] = "PROVISION_COMMITTED"
@@ -788,7 +892,20 @@ if host_uuids:
     # first, so a label that moved does not turn into a second set of Hosts.
     local_node_entry["hostUuids"] = list(host_uuids)
 
-state = {
+# Keep what an earlier step recorded (domain ownership, certificate lineages):
+# this write owns the provisioning fields, not the whole document. A fresh dict
+# here dropped `domainOwnership`, and the next install then read the host as a
+# legacy deployment it refuses to touch without a terminal.
+state = {}
+if os.path.exists(state_path):
+    try:
+        with open(state_path, encoding="utf-8") as handle:
+            recorded = json.load(handle)
+        if isinstance(recorded, dict):
+            state = recorded
+    except (OSError, ValueError):
+        state = {}
+state.update({
     "schemaVersion": 2,
     "installationMode": "all-in-one",
     "panelDomain": panel_domain,
@@ -800,7 +917,7 @@ state = {
     "squadUuid": squad_uuid,
     "defaultUserShortUuid": short_uuid,
     "nodes": [local_node_entry],
-}
+})
 atomic_write_state(state, state_path)
 
 journal["state"] = "PROVISION_COMMITTED"
@@ -831,12 +948,27 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     # the image its compensation restored from.
     firewall_commit_transaction
 
+    # The Panel answered its own health check, its public SNI and its API, so
+    # this is the moment the draft may call it verified. A checkpoint records a
+    # verdict reached here, never a command that merely exited 0.
+    draft_checkpoint panel verified complete 1 || true
+    install_finish "$panel_domain" "$admin_user"
+}
+
+# Announce the Panel and finish whatever nodes the plan still holds.
+#
+# 0 when the Panel is serving and every planned node is verified, 2 when the
+# Panel is serving and a node failed or could not be confirmed, and a node
+# batch's own code otherwise. It never returns 1: that code belongs to a Panel
+# that did not deploy, which ends the run before this function is reached.
+install_finish() {
+    local panel_domain="$1" admin_user="$2"
+    local nodes_planned=0 onboard_rc=0
     # A plan that still has nodes to onboard has not finished installing: the
     # Panel reaches a serving state first, and "Installation Complete" over it
     # was the banner an operator read while the run was still waiting on SSH.
     # The Panel therefore gets its own line, and the completion banner below is
     # reached only when nothing remains.
-    local nodes_planned=0
     case "${GOWAVE_PLAN_VARIANT:-}" in
         multi-node | panel-only) nodes_planned=1 ;;
     esac
@@ -850,18 +982,21 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         cmd_user_links default-user
         echo ""
         echo "Onboarding the planned remote nodes..."
-        local onboard_rc=0
         wizard_onboard_nodes "https://$panel_domain" "127.0.0.1" "yes" || onboard_rc=$?
-        # Return code 2 means partial success (some nodes succeeded, some failed).
-        # The Panel deployment and the successful nodes are kept: this is not a
-        # rollback. The command still exits with that code so an operator, and
-        # anything driving the install, can tell it apart from a clean install
-        # (0) and from a failed Panel deployment (1). The summary above already
-        # names the failed stages and what to do next.
+        # Return code 2 means a ready Panel with at least one node that did not
+        # reach verified registration and cleanup — including when no node
+        # registered at all. The Panel deployment and the successful nodes are
+        # kept: this is not a rollback. The command exits with that code so an
+        # operator, and anything driving the install, can tell it apart from a
+        # clean install (0) and from a failed Panel deployment (1). The summary
+        # above already names the failed stages and what to do next.
         if (( onboard_rc != 0 )); then
             return "$onboard_rc"
         fi
         echo ""
+        # Aggregate Worker security reports onto the Master
+        echo "Aggregating security reports from Workers..."
+        aggregate_worker_security_reports || echo "Warning: security report aggregation had issues; see above." >&2
     fi
 
     echo "================================================================================"
@@ -874,6 +1009,115 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         echo ""
         cmd_user_links default-user
     fi
+    return 0
+}
+
+# The administrative login this host's credentials file records.
+panel_admin_user() {
+    local user=""
+    if [[ -r "$CREDENTIALS_FILE" ]]; then
+        user=$(grep -s '^ADMIN_USERNAME=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
+    fi
+    printf '%s' "${user:-admin}"
+}
+
+# Re-establish a Panel that an interrupted run recorded as verified.
+#
+# A checkpoint is a verdict about a moment. This runs the same readbacks that
+# produced it and nothing that changes the host: the service is active, the
+# Panel answers its own health check, the public SNI is served, the local node
+# completes its mTLS handshake, the stored credentials still read the API, and
+# the security report re-verifies every control it covers.
+#
+# 0 — every readback agrees, so the Panel needs no second install
+# 1 — a readback disagrees or cannot run; operator reconciliation is required
+#
+# Args: panel domain, install mode, local node name
+resume_verify_panel() {
+    local panel_domain="$1" install_mode="$2"
+    local secret_key="" inventory="" name address port uuid local_uuid="" recorded_uuid local_count=0
+    local expected_name="${GOWAVE_PLAN_LOCAL_LABEL:-local-node}"
+
+    CURRENT_STEP="resume: Panel verification"
+    preflight_require_direct_dns "$panel_domain" || return 1
+    bootstrap_early_tools || return 1
+    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet gowave.service; then
+            echo "Resume: gowave.service is not active on this host." >&2
+            return 1
+        fi
+    fi
+    verify_panel_startup 127.0.0.1 3000 30 || return 1
+    verify_public_tls_sni "$panel_domain" || return 1
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        secret_key=$(extract_secret_key "$GOWAVE_DIR") || return 1
+        verify_node_mtls_health "$secret_key" 3002 || return 1
+    fi
+    # The credentials in this host's file are the ones the Panel accepts; a
+    # Panel that refuses them has drifted from what the checkpoint recorded.
+    inventory=$(wizard_panel_inventory_names "127.0.0.1" "yes") || return 1
+    if [[ "$install_mode" == "all-in-one" && -z "$inventory" ]]; then
+        echo "Resume: the Panel answered its node list with no nodes." >&2
+        return 1
+    fi
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        while IFS=$'\t' read -r name address port uuid; do
+            [[ "${name,,}" == "${expected_name,,}" ]] || continue
+            if [[ "$address" != "127.0.0.1" || "$port" != "3002" || ! "$uuid" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]]; then
+                echo "Resume: the planned local node has an unexpected address, port or UUID." >&2
+                return 1
+            fi
+            local_uuid="$uuid"
+            local_count=$((local_count + 1))
+        done <<< "$inventory"
+        if (( local_count != 1 )); then
+            echo "Resume: the Panel inventory does not identify exactly one planned local node." >&2
+            return 1
+        fi
+        recorded_uuid=$(draft_checkpoint_field local-node node_uuid)
+        if [[ "$recorded_uuid" != "missing" && "$recorded_uuid" != "$local_uuid" ]] || \
+            ! wizard_panel_inventory_names "127.0.0.1" yes "$STATE_FILE" "$local_uuid"; then
+            echo "Resume: the planned local node's UUID, profile or Host associations could not be confirmed." >&2
+            return 1
+        fi
+        write_security_report aio 3002 "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || return 1
+        draft_checkpoint local-node verified complete 1 "$local_uuid" || true
+    else
+        write_security_report panel-only "" "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || return 1
+    fi
+    echo "Resume: the Panel this host serves is the one the saved plan recorded."
+    return 0
+}
+
+# Continue a run from a recorded Panel, or say the Panel is pending work.
+#
+# The decision is one place because the install's first step after the migration
+# gate is either "verify and finish" or "install": a resumed run that quietly
+# fell through would rebuild a Panel it had just proved was serving, and one that
+# returned early on a disagreement would report a Panel nothing was serving.
+#
+# Args: result variable (the finish code when the run ends here), panel domain,
+# install mode
+# Returns 0 when resume handled a verified Panel checkpoint, with the exit
+# code in the named variable, and 1 when there is no verified checkpoint.
+resume_recorded_panel() {
+    local -n finish_out="$1"
+    local panel_domain="$2" install_mode="$3"
+
+    if (( GOWAVE_DRAFT_RESUMED != 1 )) || [[ "$(draft_checkpoint_state panel)" != "verified" ]]; then
+        return 1
+    fi
+    if ! resume_verify_panel "$panel_domain" "$install_mode"; then
+        wizard_resume_panel_unverified
+        finish_out=1
+        return 0
+    fi
+    draft_checkpoint panel verified complete 1 || true
+    # `install_finish` returns 2 when the Panel serves and a node still has
+    # work; that is this run's answer, not a reason to install the Panel again.
+    finish_out=0
+    install_finish "$panel_domain" "$(panel_admin_user)" || finish_out=$?
+    return 0
 }
 
 # Compensate a failed `node add` on both sides and record what each one reached.
@@ -1079,6 +1323,9 @@ PY
             # 2. Register the node using argv for data and FD 3 for the password.
             # User-controlled values are never interpolated into Python source.
             local register_rc=0
+            if [[ -n "${worker_progress_host:-}" ]]; then
+                ssh_bootstrap_phase_notice registration "$worker_progress_host"
+            fi
             PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
@@ -1251,6 +1498,7 @@ node_entry = {
     "workerDomain": worker_domain,
     "realityDomain": reality_domain,
     "uuid": node_uuid,
+    "profileUuid": profile_uuid,
 }
 if vision_domain:
     node_entry["visionDomain"] = vision_domain
@@ -1296,12 +1544,20 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
 
 
             # 4. Dispatch remote deployment strictly via SSH stdin
+            if [[ -n "${worker_progress_host:-}" ]]; then
+                ssh_bootstrap_phase_notice deployment "$worker_progress_host"
+            fi
             local acme_test_ca_b64=""
             if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
                 validate_acme_test_ca || return 1
                 acme_test_ca_b64=$(base64 -w 0 "$GOWAVE_ACME_TEST_CA_FILE")
             fi
-            if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+            local remote_rc=0 interactive_deployment=0
+            if [[ -n "${worker_progress_host:-}" ]]; then
+                interactive_deployment=1
+            fi
+            GOWAVE_WORKER_INTERACTIVE_DEPLOYMENT="$interactive_deployment" \
+                ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
                 GOWAVE_ACME_TEST_MODE="${GOWAVE_ACME_TEST_MODE:-0}" \
@@ -1313,7 +1569,12 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
                 GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
                 VISION_DOMAIN="$vision_domain" \
                 GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
-                SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+                SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user" \
+                | ssh_bootstrap_worker_progress "${worker_progress_host:-}" || remote_rc=$?
+            if (( remote_rc != 0 )); then
+                if (( interactive_deployment )) && (( remote_rc == 124 || remote_rc == 137 )); then
+                    printf 'Worker %s: SSH deployment exceeded the 60-minute budget; remote completion is unconfirmed.\n' "$name" >&2
+                fi
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
                 finalize_failed_node_add "$name" "$ip" "$ssh_port" \
                     "$worker_domain" "$reality_domain" "$ssh_user" "$acme_tx_id" || true
@@ -1509,6 +1770,19 @@ PY
                 acme_test_ca_b64=$(base64 -w 0 "$GOWAVE_ACME_TEST_CA_FILE")
             fi
 
+            # A re-apply rewrites this host's edge routes and certificate
+            # references. The Panel registration, node UUID, profile and Host
+            # records are reused, but the rewrite on the host is the operator's
+            # to confirm -- and a declined preview opens no SSH at all.
+            local migrate_rc=0
+            node_confirm_edge_migration "$name" "$worker_domain" "$reality_domain" \
+                "$vision_domain" "$node_port" || migrate_rc=$?
+            if (( migrate_rc == 3 )); then
+                return 0
+            elif (( migrate_rc != 0 )); then
+                return "$migrate_rc"
+            fi
+
             # The payload is streamed again instead of rebuilt: the Worker keeps
             # no copy of it, so this is the only path that reconverges a host
             # that is already installed.
@@ -1525,6 +1799,7 @@ PY
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
                 GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
                 VISION_DOMAIN="$vision_domain" \
+                GOWAVE_MIGRATE_EXISTING=yes \
                 GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Error: re-applying Worker '$name' failed; its Panel registration is unchanged." >&2
@@ -1590,8 +1865,27 @@ PY
     check_acme_lineage "$new_panel_domain" "$effective_acme_server" || return 1
     check_acme_lineage "$new_reality_domain" "$effective_acme_server" || return 1
 
-    local cover_domain=""
-    cover_domain=$(cover_domain_for "$new_panel_domain" "$srv_ip")
+    # A domain change repoints the Panel and REALITY names. The cover apex is
+    # not re-derived: it stays the name recorded at install time (or the one this
+    # invocation selects), because it may be the only owned name the deployment
+    # has and a rename must not quietly drop the certificate that proves it.
+    local cover_domain="" cover_names="" recorded_names="" recorded_cover="" alias_choice="no"
+    if [[ -z "${GOWAVE_COVER_DOMAIN:-}" ]]; then
+        recorded_names=$(recorded_domain_names "$STATE_FILE")
+        if [[ -n "$recorded_names" ]]; then
+            IFS=$'\t' read -r _ _ _ recorded_cover alias_choice <<< "$recorded_names"
+            if [[ -n "$recorded_cover" ]]; then
+                GOWAVE_COVER_DOMAIN="$recorded_cover"
+                GOWAVE_COVER_WWW="$alias_choice"
+            fi
+        fi
+    fi
+    local srv_ipv6
+    srv_ipv6=$(resolve_panel_ipv6) || return 1
+    cover_domain=$(cover_domain_for "$new_panel_domain" "$srv_ip" "$srv_ipv6") || return 1
+    if [[ -n "$cover_domain" ]]; then
+        cover_names=$(cover_site_names "$cover_domain") || return 1
+    fi
 
     local snap_dir
     snap_dir=$(prepare_update_snapshot "domain-change")
@@ -1639,8 +1933,12 @@ PY
     fi
     local new_reality_cert_args=(-d "$new_reality_domain")
     local new_reality_cert_flags=()
+    local cover_name
     if [[ -n "$cover_domain" ]]; then
-        new_reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            new_reality_cert_args+=(-d "$cover_name")
+        done <<< "$cover_names"
         new_reality_cert_flags+=(--expand)
     fi
     if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" "${new_reality_cert_args[@]}" "${new_reality_cert_flags[@]}" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
@@ -1648,8 +1946,13 @@ PY
     fi
     verify_acme_certificate "$new_panel_domain" || { rollback_domain_change "invalid panel certificate"; return 1; }
     verify_acme_certificate "$new_reality_domain" || { rollback_domain_change "invalid REALITY certificate"; return 1; }
-    if [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "/etc/letsencrypt/live/$new_reality_domain"; then
-        rollback_domain_change "REALITY certificate does not cover the camouflage apex"; return 1
+    if [[ -n "$cover_domain" ]]; then
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            if ! verify_acme_certificate "$cover_name" "/etc/letsencrypt/live/$new_reality_domain"; then
+                rollback_domain_change "REALITY certificate does not cover $cover_name"; return 1
+            fi
+        done <<< "$cover_names"
     fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
@@ -1657,6 +1960,12 @@ PY
     generate_production_http_vhost "$new_panel_domain" "$new_reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "" "$cover_domain"
     generate_panel_https_vhost "$new_panel_domain"
     generate_decoy_vhost "$new_reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
+    # The ownership record follows the rename: the same cover apex, the new
+    # Panel and REALITY names. Vision is not part of this path and is not
+    # claimed here either.
+    record_domain_ownership "$STATE_FILE" master "$new_panel_domain" "$new_reality_domain" \
+        "" "$cover_domain" "${GOWAVE_COVER_WWW:-no}" \
+        || { rollback_domain_change "recording domain ownership failed"; return 1; }
     sed -i "s/^PANEL_DOMAIN=.*/PANEL_DOMAIN=$new_panel_domain/" "$GOWAVE_DIR/.env"
     sed -i "s|^SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$new_panel_domain/api/sub|" "$GOWAVE_DIR/.env"
 
@@ -1938,9 +2247,27 @@ menu_pause() {
 # cancelled plan or a refused step would take the language choice and every
 # answer with it, which is the dead end this menu exists to avoid. The positional
 # CLI is untouched and still exits with the step's own code.
+#
+# The action must keep its own strictness, though. A function called from an
+# OR-list inherits errexit switched off, so a mandatory step that failed inside
+# it would let the steps behind it run against a half-provisioned host. The
+# action therefore runs in a subshell that re-arms `set -Eeuo pipefail` — and the
+# parent's own failure trap is laid down for the call and put back afterwards,
+# because that trap is what turns a failure into a fatal error for the process,
+# and here the failure belongs to the wrapper. The options this function needs in
+# order to survive it are its own (`local -`), so the menu's -e is intact again
+# the moment the action returns.
 menu_action() {
-    local code=0
-    "$@" || code=$?
+    local -
+    local code=0 err_trap
+    err_trap=$(trap -p ERR)
+    trap - ERR
+    set +e
+    # The action keeps the trap inside its own subshell, where the handler
+    # already exits quietly instead of reporting a phase the wrapper owns.
+    ( eval "${err_trap:-trap - ERR}"; set -Eeuo pipefail; "$@" )
+    code=$?
+    eval "${err_trap:-trap - ERR}"
     if (( code != 0 )); then
         printf '%s\n' "$(tf menu.action.failed "$code")" >&2
     fi

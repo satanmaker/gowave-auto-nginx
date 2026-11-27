@@ -67,6 +67,31 @@ def readiness(report, *, now=None, max_age=300):
     return 'ready-with-warnings' if warning else 'ready'
 
 
+def dot_control(result):
+    """Map the DNS-over-TLS helper's report onto one control entry.
+
+    The helper answers three separate questions: which policy was requested,
+    whether it took effect, and whether the host was put back. The report keeps
+    them apart, so a failed policy whose rollback was proven is `failed` with
+    `recovery == 'verified'` — never `verified`, which the validator reserves
+    for a control that needed no recovery at all.
+    """
+    policy = result.get('policy') or result.get('dot')
+    if policy not in {'off', 'best-effort', 'required'}:
+        raise StateError('invalid DNS-over-TLS policy in helper report')
+    if result.get('status') == 'configured':
+        status, reason = ('skipped', 'DOT_DISABLED') if policy == 'off' else ('verified', 'DOT_APPLIED')
+        recovery = 'not-needed'
+    elif result.get('status') == 'failed_rolled_back':
+        status, reason, recovery = 'failed', 'DOT_NOT_APPLIED', 'verified'
+    elif result.get('status') == 'failed_unverified':
+        status, reason, recovery = 'failed', 'DOT_RESTORE_UNPROVEN', 'failed'
+    else:
+        raise StateError('unknown DNS-over-TLS helper status: ' + str(result.get('status')))
+    return {'policy': policy, 'status': status, 'reason_code': reason,
+            'recovery': recovery, 'evidence_codes': ['DOT_HELPER']}
+
+
 def final_exit(panel, nodes):
     def complete(component):
         _fields(component, {'registration', 'readiness', 'cleanup', 'recovery'})

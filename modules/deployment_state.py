@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Versioned, private deployment drafts; resource rollback journals remain separate."""
+"""Versioned, private deployment drafts; resource rollback journals remain separate.
+
+The wizard drives this module through its command line, because a draft that
+only one process could reach would not survive the restart it exists for. Every
+mode reads one JSON document from standard input and answers with JSON on
+standard output, so no secret and no answer travels through `argv`:
+
+    --load                     print the draft; exit 3 when there is none
+    --save --expected-revision print the draft that replaced revision N
+    --plan [--reviewed]        write an accepted plan, keeping checkpoints
+    --checkpoint IDENTITY      merge one checkpoint and print it
+    --discard                  forget the draft; absent draft is still success
+
+Exit codes are the same in every mode: 0 success, 1 rejected input, 3 no
+draft, 4 a concurrent writer, a stale revision or another operation. A crash
+between two calls leaves a draft the next invocation can load, which is the
+whole point; nothing here compensates a deployment.
+"""
+import argparse
 import copy
 from contextlib import contextmanager
 import fcntl
@@ -10,8 +28,15 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 
 DEFAULT_PATH = Path('/var/lib/gowave-auto-nginx/deployment/active.json')
+EXIT_OK = 0
+EXIT_INVALID = 1
+EXIT_ABSENT = 3
+EXIT_CONFLICT = 4
+MAX_DOCUMENT = 1024 * 1024
+PLAN_FIELDS = {'kind', 'topology', 'language', 'answers', 'nodes', 'installer_revision'}
 ANSWER_FIELDS = {
     'name', 'address', 'ssh_user', 'ssh_port', 'node_port', 'primary_domain',
     'reality_domain', 'vision_domain', 'cover_domain', 'cover_www', 'country',
@@ -178,49 +203,187 @@ class DeploymentStore:
             return None
         with os.fdopen(descriptor, 'r', encoding='utf-8') as stream:
             self._private(stream.fileno())
-            raw = stream.read(1024 * 1024 + 1)
-            if len(raw) > 1024 * 1024:
+            raw = stream.read(MAX_DOCUMENT + 1)
+            if len(raw) > MAX_DOCUMENT:
                 raise StateError('deployment document too large')
             return validate(json.loads(raw))
+
+    @contextmanager
+    def _lock(self, directory):
+        descriptor = os.open('.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+        try:
+            self._private(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise StateConflict('deployment writer is busy') from exc
+            yield
+        finally:
+            os.close(descriptor)
 
     def load(self):
         with self._directory() as directory:
             return self._read(directory)
+
+    def discard(self):
+        # Removing the draft is how an operator abandons it: the deployment it
+        # described stays exactly as it is, so nothing here compensates.
+        with self._directory() as directory, self._lock(directory):
+            try:
+                os.unlink(self.path.name, dir_fd=directory)
+            except FileNotFoundError:
+                return False
+            os.fsync(directory)
+            return True
 
     def save(self, document, *, expected_revision):
         candidate = copy.deepcopy(document)
         candidate['revision'] = expected_revision + 1
         validate(candidate)
         payload = json.dumps(candidate, sort_keys=True, ensure_ascii=True).encode() + b'\n'
-        if len(payload) > 1024 * 1024:
+        if len(payload) > MAX_DOCUMENT:
             raise StateError('deployment document too large')
-        with self._directory() as directory:
-            lock = os.open('.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+        with self._directory() as directory, self._lock(directory):
+            current = self._read(directory)
+            if (current['revision'] if current else 0) != expected_revision:
+                raise StateConflict('deployment revision changed')
+            if current and current['operation_id'] != candidate['operation_id']:
+                raise StateConflict('another deployment is active')
+            temporary = f'.{self.path.name}.{secrets.token_hex(12)}.tmp'
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
             try:
-                self._private(lock)
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise StateConflict('deployment writer is busy') from exc
-                current = self._read(directory)
-                if (current['revision'] if current else 0) != expected_revision:
-                    raise StateConflict('deployment revision changed')
-                if current and current['operation_id'] != candidate['operation_id']:
-                    raise StateConflict('another deployment is active')
-                temporary = f'.{self.path.name}.{secrets.token_hex(12)}.tmp'
-                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-                try:
-                    with os.fdopen(descriptor, 'wb') as stream:
-                        stream.write(payload)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
-                    os.fsync(directory)
-                finally:
-                    try:
-                        os.unlink(temporary, dir_fd=directory)
-                    except FileNotFoundError:
-                        pass
+                with os.fdopen(descriptor, 'wb') as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
             finally:
-                os.close(lock)
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
         return candidate
+
+
+def _read_document():
+    raw = sys.stdin.read(MAX_DOCUMENT + 1)
+    if len(raw) > MAX_DOCUMENT:
+        raise StateError('deployment document too large')
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        raise StateError('deployment document is not JSON') from exc
+    if not isinstance(document, dict):
+        raise StateError('deployment document must be an object')
+    return document
+
+
+def _write_document(document):
+    sys.stdout.write(json.dumps(document, sort_keys=True, ensure_ascii=True) + '\n')
+    sys.stdout.flush()
+
+
+def _plan_fields(document, stored):
+    # Only the accepted answers and the reviewed plan come from the wizard;
+    # the operation identity belongs to the draft, and a plan that arrives
+    # under another installer revision is not the plan this draft recorded.
+    _fields(document, PLAN_FIELDS, ('operation_id',))
+    if stored and stored['installer_revision'] != document['installer_revision']:
+        raise StateConflict('draft belongs to another installer revision')
+    operation_id = document.get('operation_id') or (stored['operation_id'] if stored else secrets.token_hex(16))
+    _text(operation_id, r'[a-zA-Z0-9_-]+', 64)
+    if stored and operation_id != stored['operation_id']:
+        raise StateConflict('another deployment is active')
+    nodes = document['nodes']
+    if not isinstance(nodes, dict):
+        raise StateError('invalid node collection')
+    checkpoints = {} if stored is None else {
+        identity: checkpoint for identity, checkpoint in stored['checkpoints'].items()
+        if identity in {'panel', 'local-node'} | nodes.keys()
+    }
+    return {
+        'schema_version': 1,
+        'revision': stored['revision'] if stored else 0,
+        'installer_revision': document['installer_revision'],
+        'operation_id': operation_id,
+        'kind': document['kind'],
+        'topology': document['topology'],
+        'language': document['language'],
+        'answers': document['answers'],
+        'nodes': nodes,
+        'reviewed_digest': None,
+        'checkpoints': checkpoints,
+    }
+
+
+def _checkpoint_update(stored, identity, update):
+    if stored is None:
+        raise FileNotFoundError('no deployment draft to checkpoint')
+    if not isinstance(update, dict) or set(update) - CHECKPOINT_FIELDS:
+        raise StateError('invalid checkpoint fields')
+    if identity not in {'panel', 'local-node'} | stored['nodes'].keys():
+        raise StateError('unknown checkpoint identity')
+    checkpoint = dict(stored['checkpoints'].get(identity, {'state': 'pending', 'stage': 'pending', 'attempt': 0}))
+    checkpoint.update(update)
+    document = copy.deepcopy(stored)
+    document['checkpoints'][identity] = checkpoint
+    return document
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Read and write the private deployment draft.')
+    parser.add_argument('--path', type=Path, default=DEFAULT_PATH, help='draft path (default: the system draft)')
+    parser.add_argument('--owner-uid', type=int, default=os.geteuid(), help='expected owner; must be the current user')
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument('--load', action='store_true', help='print the stored draft')
+    modes.add_argument('--save', action='store_true', help='replace the draft with the document on stdin')
+    modes.add_argument('--plan', action='store_true', help='write the plan document on stdin as the draft')
+    modes.add_argument('--checkpoint', metavar='IDENTITY', help='merge the checkpoint on stdin')
+    modes.add_argument('--discard', action='store_true', help='remove the draft')
+    parser.add_argument('--expected-revision', type=int, default=None, help='revision the caller last read')
+    parser.add_argument('--reviewed', action='store_true', help='mark the plan as authorized by the operator')
+    arguments = parser.parse_args(argv)
+
+    try:
+        if arguments.owner_uid != os.geteuid():
+            raise StateError('draft owner must be the current user')
+        store = DeploymentStore(arguments.path, owner_uid=arguments.owner_uid)
+        if arguments.load:
+            document = store.load()
+            if document is None:
+                return EXIT_ABSENT
+            _write_document(document)
+        elif arguments.save:
+            if arguments.expected_revision is None:
+                raise StateError('--save needs --expected-revision')
+            _write_document(store.save(_read_document(), expected_revision=arguments.expected_revision))
+        elif arguments.plan:
+            stored = store.load()
+            document = _plan_fields(_read_document(), stored)
+            if arguments.reviewed:
+                document['reviewed_digest'] = plan_digest(document)
+            _write_document(store.save(document, expected_revision=document['revision']))
+        elif arguments.checkpoint is not None:
+            stored = store.load()
+            document = _checkpoint_update(stored, arguments.checkpoint, _read_document())
+            _write_document(store.save(document, expected_revision=stored['revision']))
+        else:
+            store.discard()
+    except FileNotFoundError as exc:
+        print(f'deployment_state: {exc}', file=sys.stderr)
+        return EXIT_ABSENT
+    except StateConflict as exc:
+        print(f'deployment_state: {exc}', file=sys.stderr)
+        return EXIT_CONFLICT
+    except StateError as exc:
+        print(f'deployment_state: {exc}', file=sys.stderr)
+        return EXIT_INVALID
+    except OSError as exc:
+        print(f'deployment_state: {exc.strerror or exc}', file=sys.stderr)
+        return EXIT_INVALID
+    return EXIT_OK
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

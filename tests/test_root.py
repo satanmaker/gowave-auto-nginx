@@ -4,6 +4,7 @@ zero-leak secrets, strict umask 077 backups, journal schema validation, and sequ
 Must run with EUID 0 (root).
 """
 import json
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -241,6 +243,89 @@ Environment="GOMEMLIMIT=250MiB"
         self.assertEqual(state["nodes"][2]["name"], "worker-2")
 
 
+class TestFail2banJailOnAHost(unittest.TestCase):
+    """The jail is read from the daemon, not from the file this run wrote.
+
+    These cases run where Fail2ban is a real package and sshd a real daemon: the
+    privileged container installs both, so the jail's settings and ports are
+    read back with `fail2ban-client`. A missing jail behind an active service
+    must fail the step and undo the file; a pre-existing jail must come back
+    byte for byte. Socket-activated discovery is proven with a disposable fake
+    host in `tests/test_fail2ban.py`, because this host's sshd cannot be
+    switched to socket activation without breaking the session running the
+    suite.
+    """
+
+    JAIL = Path("/etc/fail2ban/jail.d/90-gowave-auto-nginx.local")
+    MANAGED = REPO_ROOT / "assets" / "security" / "managed.py"
+
+    def setUp(self):
+        if os.geteuid() != 0:
+            self.skipTest("Suite root requires root privileges (EUID 0)")
+        if shutil.which("fail2ban-client") is None:
+            self.skipTest("Fail2ban is not installed on this host")
+        self.previous = self.JAIL.read_bytes() if self.JAIL.is_file() else None
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        if self.previous is None:
+            self.JAIL.unlink(missing_ok=True)
+        else:
+            self.JAIL.write_bytes(self.previous)
+        subprocess.run(["systemctl", "restart", "fail2ban"], capture_output=True, check=False)
+
+    def configure(self, client_dir=None):
+        env = dict(os.environ)
+        if client_dir is not None:
+            env["PATH"] = f"{client_dir}:{env['PATH']}"
+        return subprocess.run(
+            ["python3", str(self.MANAGED), "--configure-fail2ban"],
+            capture_output=True, text=True, env=env, timeout=600, check=False,
+        )
+
+    def failing_client(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        stub = directory / "fail2ban-client"
+        stub.write_text("#!/bin/sh\nexit 255\n", encoding="utf-8")
+        stub.chmod(0o755)
+        return directory
+
+    def test_the_active_jail_names_the_discovered_ports_and_settings(self):
+        result = self.configure()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "configured")
+        self.assertTrue(payload["ports"])
+        dump = subprocess.run(["fail2ban-client", "-d"], capture_output=True, text=True,
+                              check=False)
+        self.assertEqual(dump.returncode, 0, dump.stderr)
+        for port in payload["ports"]:
+            self.assertIn(str(port), dump.stdout)
+        self.assertIn("backend = systemd", dump.stdout)
+        self.assertIn("_COMM=sshd-session", dump.stdout)
+        for key, value in (("maxretry", "5"), ("findtime", "1800"), ("bantime", "3600")):
+            got = subprocess.run(["fail2ban-client", "get", "sshd", key],
+                                 capture_output=True, text=True, check=False)
+            self.assertEqual(got.stdout.strip(), value, key)
+
+    def test_an_active_service_without_the_jail_is_not_verified(self):
+        result = self.configure(client_dir=self.failing_client())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "failed_rolled_back")
+        self.assertIn("status sshd", json.dumps(payload))
+        self.assertFalse(self.JAIL.exists())
+
+    def test_a_failed_readback_restores_the_jail_that_was_there(self):
+        previous = b"# Managed by GoWave Auto NGINX: VPS Security\n[sshd]\nenabled = true\n"
+        self.JAIL.parent.mkdir(parents=True, exist_ok=True)
+        self.JAIL.write_bytes(previous)
+        result = self.configure(client_dir=self.failing_client())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.JAIL.read_bytes(), previous)
+
+
 class TestChannelSwitchRollback(unittest.TestCase):
     """Tasks 7.4/7.5: a channel switch is a transaction whose failure is undone.
 
@@ -453,6 +538,120 @@ class TestChannelSwitchRollback(unittest.TestCase):
         self.assertEqual(body.count("systemctl restart"), 1, body)
         self.assertIn("if ! systemctl restart --no-ask-password gowave.service", body)
         self.assertIn("rollback_channel_switch", body)
+
+
+class TestDotPolicyOnAHost(unittest.TestCase):
+    """Task 3.3: a rerun and an `off` switch over a root-owned document.
+
+    `preflight` requires root-owned project configuration, which a nonroot fake
+    host cannot fabricate, so the cases that start from an existing drop-in run
+    in the privileged container. Policy parsing, mode verification, rollback and
+    the shell wrapper are proven with a disposable fake host in
+    `tests/test_dot_policy.py`; here the file is genuinely owned by root.
+    """
+
+    DROPIN = "etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf"
+    SERVERS = ("1.1.1.1#one.one.one.one 1.0.0.1#one.one.one.one "
+               "8.8.8.8#dns.google 8.8.4.4#dns.google")
+
+    def setUp(self):
+        if os.geteuid() != 0:
+            self.skipTest("Suite root requires root privileges (EUID 0)")
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.root = Path(holder.name)
+        (self.root / "etc").mkdir()
+        (self.root / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
+        self.resolv = self.root / "etc/resolv.conf"
+        self.resolv.write_text('nameserver 192.0.2.53\n', encoding="utf-8")
+
+    def managed(self):
+        spec = importlib.util.spec_from_file_location(
+            "managed_root_dot", str(REPO_ROOT / "assets" / "security" / "managed.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def fake_host(self, mode='s "opportunistic"'):
+        calls = []
+
+        def fake(*args, check=True):
+            calls.append(args)
+            name = args[0]
+            if name == 'busctl':
+                return mode
+            if name == 'resolvectl':
+                return f"Global: {self.SERVERS}\n" if args[1:2] == ('dns',) else ''
+            if name in {'getent', 'apt-get'}:
+                return ''
+            if name == 'systemctl':
+                if args[1:2] == ('is-active',):
+                    return 'active' if '--quiet' not in args else 'inactive'
+                return 'enabled' if args[1:2] == ('is-enabled',) else ''
+            raise AssertionError(f"unexpected command: {args}")
+
+        return fake, calls
+
+    def prepare(self, managed, policy, host, state=None):
+        with mock.patch.object(managed, "command", host):
+            return managed.prepare_dns(root=self.root, state=state, policy=policy)
+
+    def test_a_rerun_over_the_existing_document_and_package_succeeds(self):
+        managed = self.managed()
+        host, calls = self.fake_host()
+        first = self.prepare(managed, 'best-effort', host)
+        self.assertEqual(first['status'], 'configured', first)
+        self.assertTrue((self.root / self.DROPIN).is_file())
+
+        second = self.prepare(managed, 'best-effort', host)
+        self.assertEqual(second['status'], 'configured', second)
+        self.assertIn(('apt-get', '-o', 'DPkg::Lock::Timeout=300', '-o', 'Dpkg::Options::=--force-confdef',
+                       '-o', 'Dpkg::Options::=--force-confold', '--no-remove',
+                       '--no-install-recommends', '-y', 'install', 'systemd-resolved'), calls)
+
+    def test_off_removes_the_previous_managed_document(self):
+        managed = self.managed()
+        host, calls = self.fake_host()
+        self.assertEqual(self.prepare(managed, 'best-effort', host)['status'], 'configured')
+
+        result = self.prepare(managed, 'off', host)
+        self.assertEqual(result['status'], 'configured', result)
+        self.assertEqual(result['dot'], 'off')
+        self.assertFalse((self.root / self.DROPIN).exists())
+        self.assertTrue(self.resolv.is_symlink())
+
+    def test_the_checkpoint_accepts_a_document_written_under_another_policy(self):
+        managed = self.managed()
+        host, _ = self.fake_host()
+        checkpoint = self.root / "checkpoint"
+        self.assertEqual(self.prepare(managed, 'best-effort', host, state=checkpoint)['status'],
+                         'configured')
+        # A later run under a different policy rewrote the document; the
+        # checkpoint must still recognise it as its own and restore the original.
+        (self.root / self.DROPIN).write_text(managed.dot_content('required'), encoding="utf-8")
+
+        with mock.patch.object(managed, "command", host):
+            result = managed.rollback_dns_checkpoint(checkpoint, root=self.root)
+        self.assertEqual(result['status'], 'failed_rolled_back', result)
+        self.assertFalse((self.root / self.DROPIN).exists())
+        self.assertFalse(self.resolv.is_symlink())
+        self.assertEqual(self.resolv.read_text(encoding="utf-8"), 'nameserver 192.0.2.53\n')
+
+    def test_the_checkpoint_accepts_an_off_run_that_left_no_document(self):
+        managed = self.managed()
+        host, _ = self.fake_host()
+        dropin = self.root / self.DROPIN
+        dropin.parent.mkdir(parents=True)
+        dropin.write_text(managed.dot_content('best-effort'), encoding="utf-8")
+        checkpoint = self.root / "checkpoint"
+        self.assertEqual(self.prepare(managed, 'off', host, state=checkpoint)['status'], 'configured')
+        self.assertFalse(dropin.exists())
+
+        with mock.patch.object(managed, "command", host):
+            result = managed.rollback_dns_checkpoint(checkpoint, root=self.root)
+        self.assertEqual(result['status'], 'failed_rolled_back', result)
+        self.assertIn('DNSOverTLS=opportunistic', dropin.read_text(encoding="utf-8"))
+        self.assertEqual(self.resolv.read_text(encoding="utf-8"), 'nameserver 192.0.2.53\n')
 
 
 if __name__ == "__main__":

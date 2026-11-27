@@ -2,6 +2,12 @@
 # modules/os.sh - Base OS, package inventory, and environment detection
 set -Eeuo pipefail
 
+# The approved NGINX package policy ships beside this module and is sourced once
+# here so `install_prerequisites` never has to re-source it (a re-source would
+# replace a caller's stub and make the step untestable).
+# shellcheck source=modules/nginx_package.sh
+source "$(dirname "${BASH_SOURCE[0]}")/nginx_package.sh"
+
 # detect_arch - print the architecture the pinned artifacts are keyed by, or
 # refuse an architecture this product ships nothing for.
 detect_arch() {
@@ -177,7 +183,7 @@ configure_debian_security_apt() {
     if [[ "$OS_ID" == "debian" ]]; then
         local codename="${OS_CODENAME:-bookworm}"
         mkdir -p "$apt_conf_dir"
-        local conf_file="${apt_conf_dir}/99zz-gowave-auto-nginx"
+        local conf_file="${apt_conf_dir}/zz-gowave-auto-nginx"
         cat > "$conf_file" <<EOF
 // Managed by GoWave Auto NGINX
 Unattended-Upgrade::Allowed-Origins {
@@ -188,7 +194,7 @@ EOF
         chmod 0644 "$conf_file"
     elif [[ "$OS_ID" == "ubuntu" ]]; then
         mkdir -p "$apt_conf_dir"
-        local conf_file="${apt_conf_dir}/99zz-gowave-auto-nginx"
+        local conf_file="${apt_conf_dir}/zz-gowave-auto-nginx"
         cat > "$conf_file" <<EOF
 // Managed by GoWave Auto NGINX
 Unattended-Upgrade::Automatic-Reboot "false";
@@ -231,13 +237,16 @@ EOF
 }
 
 get_required_packages() {
+    # NGINX is deliberately absent: the approved official package replaces the
+    # distribution's nginx-full/nginx-common, so requiring either here would
+    # reinstall the distribution build on the next run and then refuse the
+    # downgrade. `install_pinned_nginx` owns the package and verifies it.
     cat <<'EOF'
-nginx-full
-libnginx-mod-stream
 certbot
 python3
 python3-systemd
 sqlite3
+gnupg
 curl
 tar
 gzip
@@ -305,12 +314,15 @@ install_prerequisites() {
 
     if [[ ${#missing[@]} -eq 0 ]]; then
         echo "All prerequisites are satisfied."
-        return 0
+    else
+        echo "Installing missing prerequisites: ${missing[*]}..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
     fi
-
-    echo "Installing missing prerequisites: ${missing[*]}..."
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+    # The NGINX package is owned by the pin, not by `check_prerequisites`: it is
+    # verified on every run, including a rerun whose other packages are present.
+    detect_os || return 1
+    install_pinned_nginx "$OS_ID" "$OS_CODENAME" || return 1
     ensure_systemd_resolved
     return 0
 }

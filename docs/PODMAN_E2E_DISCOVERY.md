@@ -101,22 +101,48 @@ rather than three opinions.
 What differs between the rows is what executes, and that is the part a reader
 has to be able to check rather than assume:
 
-| Distribution | Pinned base | Product acceptance | QEMU cold boot | NGINX `listen` branch |
-| --- | --- | --- | --- | --- |
-| `ubuntu-24.04` | `docker.io/library/ubuntu:24.04` | executed by every `podman-acceptance.yml` job | `qemu-cold-boot` matrix | legacy, `1.24.0 < 1.25.1` |
-| `ubuntu-26.04` | `docker.io/library/ubuntu:26.04` | selectable, not executed | `qemu-cold-boot` matrix | modern, `1.26+ >= 1.25.1` |
-| `debian-12` | `docker.io/library/debian:12` | selectable, not executed | `qemu-cold-boot` matrix | legacy, `1.22.1 < 1.25.1` |
-| `debian-13` | `docker.io/library/debian:13` | selectable, not executed | `qemu-cold-boot` matrix | modern, `1.26.3 >= 1.25.1` |
+| Distribution | Pinned base | Product acceptance | QEMU cold boot | Distribution NGINX (`listen` branch) | Revision covering checked backports | CVE-2026-132779 (distribution) | Approved official NGINX pin (`listen` branch) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `ubuntu-24.04` | `docker.io/library/ubuntu:24.04` | required CI matrix cell | `qemu-cold-boot` matrix | legacy, `1.24.0 < 1.25.1` | `1.24.0-2ubuntu7.21` | Needs evaluation | `1.30.8-1~noble` (modern) |
+| `ubuntu-26.04` | `docker.io/library/ubuntu:26.04` | required CI matrix cell | `qemu-cold-boot` matrix | modern, `1.28.3 >= 1.25.1` | `1.28.3-2ubuntu1.14` | Needs evaluation | `1.30.8-1~resolute` (modern) |
+| `debian-12` | `docker.io/library/debian:12` | required CI matrix cell | `qemu-cold-boot` matrix | legacy, `1.22.1 < 1.25.1` | `1.22.1-9+deb12u11` | Open | `1.30.8-1~bookworm` (modern) |
+| `debian-13` | `docker.io/library/debian:13` | required CI matrix cell | `qemu-cold-boot` matrix | modern, `1.26.3 >= 1.25.1` | `1.26.3-3+deb13u11` | Open | `1.30.8-1~trixie` (modern) |
 
-**Only one row is executed against the product.** `--distribution` defaults to
-`ubuntu-24.04` and no workflow passes the flag, so all four acceptance jobs —
-the two topologies and their two recovery runs — install on the same
-distribution. The other three rows are pinned and runnable
-(`sudo python3 -m tools.run_podman_e2e --topology aio --distribution debian-13`),
-but no CI job has run them: that is a coverage gap of this suite, not a
-compatibility claim. The compatibility matrix's component tables are what say a
-row is supported, and this suite adds product-level evidence only where it
-executed.
+Security snapshot, 2026-11-27: the listed distribution revisions cover the
+checked Stream SNI, HTTP/2 and resolver backports. The full revision matters;
+the upstream number alone does not describe the backports. None of these
+revisions is approved as a fallback by this table: the fix for CVE-2026-132779
+is not confirmed for them. Sources: [Debian Security Tracker](https://security-tracker.debian.org/tracker/source-package/nginx),
+Ubuntu Security ([Stream fix](https://ubuntu.com/security/CVE-2026-123640),
+[revision 1.14](https://ubuntu.com/security/CVE-2026-125283),
+[remaining evaluation](https://ubuntu.com/security/CVE-2026-132779)).
+
+**All four rows are configured for product acceptance.** Each applicable GitHub
+Actions job explicitly selects its distribution in a parallel matrix. The five
+required check names remain stable: each aggregates only its own four cells.
+The runner OS (`runs-on`) is not the container OS. This is a coverage contract,
+not a claim that a particular revision passed all cells.
+
+Locally, `sudo python3 -m tools.run_podman_e2e --topology multi-node --all-distributions`
+starts all four cells concurrently. Each writes under its own distribution
+subdirectory of a new `matrix-*` run directory. Network selection and creation
+are serialized; the suites are not. For a single run, `--distribution` defaults
+to `debian-13`.
+
+```bash
+sudo python3 -m tools.run_podman_e2e --topology multi-node --all-distributions
+sudo python3 -m tools.run_podman_e2e --topology aio --distribution ubuntu-24.04
+```
+
+**Deadlines.** One `runtime_budget_seconds` per topology, applied per runner and
+never raised by the runner itself: `aio` 2700 s, `multi-node` 6300 s and
+`panel-only` 4500 s. `runtime_budget.pre_push_total_seconds` is 9600 s and
+`runtime_budget.pr_total_seconds` is 12600 s. `--budget-seconds` may only
+tighten a deadline, never raise it past the declared value, and a suite that
+reaches its deadline reports what it did not reach as `INCOMPLETE` instead of a
+pass. The multi-node figure covers the four-cell concurrent mode, where the
+slowest cell finished its case list at 62-70 minutes and the tail was owed as
+`INCOMPLETE` under the previous 4500 s deadline.
 
 **The QEMU matrix is a different claim.** The `qemu-cold-boot` job in
 `.github/workflows/systemd-acceptance.yml` boots all four images through
@@ -129,13 +155,14 @@ systemd contracts hold.
 
 **The two `listen` branches.** `render_nginx_listen_ssl_http2` in
 `modules/os.sh` reads `nginx -v` and prints `listen … ssl http2 …;` below
-1.25.1 and `listen … ssl …; http2 on;` from 1.25.1 up, which is the split the
-compatibility matrix records per distribution. The version that lands is
-whatever the distribution archive holds when the operator installs, so the
-branch is decided at run time by the probe rather than recorded in a manifest,
-and the numbers in the table are the expected values rather than assertions.
-The executed row therefore proves the legacy branch; the modern branch has no
-executed product run yet.
+1.25.1 and `listen … ssl …; http2 on;` from 1.25.1 up. The archive column shows
+the base upstream versions shipped by the distributions; it does not describe
+the package the product intends to select. The official pin column records the
+approved target for the installer change, not an already verified result. That
+pin uses the modern branch on all four distributions. The renderer still
+checks the installed binary at runtime so any approved distribution fallback
+uses the matching syntax. Only completed run artifacts prove the installed
+version and the branch exercised.
 
 **The legacy scripts identify by tag, the suite by digest.**
 `tests/podman_testbed.sh` and `tests/systemd/boot.sh` take
@@ -181,9 +208,9 @@ creating a second one.
 | --- | --- | --- | --- |
 | authentication | `POST /api/auth/register` | `internal/server/server.go:514` | `modules/api_client.py:425` `register_initial_admin` |
 | authentication | `POST /api/auth/login` | `internal/server/server.go:513` | `modules/api_client.py:437` `login` |
-| authentication | `POST /api/tokens` | `internal/server/server.go:534` | `modules/api_client.py:962` `issue_api_token` |
-| authentication | `GET /api/tokens` | `internal/server/server.go:533` | `modules/api_client.py:986` `ensure_api_token` |
-| authentication | `DELETE /api/tokens/{uuid}` | `internal/server/server.go:535` | `modules/api_client.py:971` `delete_token` |
+| authentication | `POST /api/tokens` | `internal/server/server.go:534` | `modules/api_client.py:998` `issue_api_token` |
+| authentication | `GET /api/tokens` | `internal/server/server.go:533` | `modules/api_client.py:1022` `ensure_api_token` |
+| authentication | `DELETE /api/tokens/{uuid}` | `internal/server/server.go:535` | `modules/api_client.py:1007` `delete_token` |
 
 **Node registration.** The node record and its REALITY key material are made
 through the Panel, which is why `AIO-INSTALL`, `AIO-IDEMPOTENT` and `MN-INSTALL`
@@ -194,10 +221,10 @@ provisions the Worker.
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
 | node registration | `GET /api/system/tools/x25519/generate` | `internal/stubs/stubs.go:218` | `modules/api_client.py:448` `generate_x25519` |
-| node registration | `GET /api/nodes` | `internal/server/server.go:590` | `modules/api_client.py:680` `associate_node` |
-| node registration | `POST /api/nodes` | `internal/server/server.go:593` | `modules/api_client.py:731` `associate_node` |
-| node registration | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:688` `associate_node` |
-| node registration | `DELETE /api/nodes/{uuid}` | `internal/server/server.go:600` | `modules/api_client.py:1024` `delete_node` |
+| node registration | `GET /api/nodes` | `internal/server/server.go:590` | `modules/api_client.py:716` `associate_node` |
+| node registration | `POST /api/nodes` | `internal/server/server.go:593` | `modules/api_client.py:767` `associate_node` |
+| node registration | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:724` `associate_node` |
+| node registration | `DELETE /api/nodes/{uuid}` | `internal/server/server.go:600` | `modules/api_client.py:1060` `delete_node` |
 
 **Provisioning.** Hosts, internal squads and config profiles are the Panel
 objects an install creates before a client can be served: the host record links
@@ -209,18 +236,18 @@ through `rollback_provisioning`.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| provisioning | `GET /api/hosts` | `internal/server/server.go:612` | `modules/api_client.py:773` `provision_hosts` |
-| provisioning | `POST /api/hosts` | `internal/server/server.go:613` | `modules/api_client.py:838` `provision_hosts` |
-| provisioning | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:835` `provision_hosts` |
-| provisioning | `DELETE /api/hosts/{uuid}` | `internal/server/server.go:616` | `modules/api_client.py:1008` `delete_host` |
-| provisioning | `GET /api/internal-squads` | `internal/server/server.go:638` | `modules/api_client.py:740` `provision_internal_squad` |
-| provisioning | `POST /api/internal-squads` | `internal/server/server.go:639` | `modules/api_client.py:759` `provision_internal_squad` |
-| provisioning | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:756` `provision_internal_squad` |
-| provisioning | `DELETE /api/internal-squads/{uuid}` | `internal/server/server.go:642` | `modules/api_client.py:1016` `delete_internal_squad` |
+| provisioning | `GET /api/hosts` | `internal/server/server.go:612` | `modules/api_client.py:809` `provision_hosts` |
+| provisioning | `POST /api/hosts` | `internal/server/server.go:613` | `modules/api_client.py:874` `provision_hosts` |
+| provisioning | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:871` `provision_hosts` |
+| provisioning | `DELETE /api/hosts/{uuid}` | `internal/server/server.go:616` | `modules/api_client.py:1044` `delete_host` |
+| provisioning | `GET /api/internal-squads` | `internal/server/server.go:638` | `modules/api_client.py:776` `provision_internal_squad` |
+| provisioning | `POST /api/internal-squads` | `internal/server/server.go:639` | `modules/api_client.py:795` `provision_internal_squad` |
+| provisioning | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:792` `provision_internal_squad` |
+| provisioning | `DELETE /api/internal-squads/{uuid}` | `internal/server/server.go:642` | `modules/api_client.py:1052` `delete_internal_squad` |
 | provisioning | `GET /api/config-profiles` | `internal/server/server.go:628` | `modules/api_client.py:604` `provision_config_profile` |
 | provisioning | `POST /api/config-profiles` | `internal/server/server.go:629` | `modules/api_client.py:626` `provision_config_profile` |
 | provisioning | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:622` `provision_config_profile` |
-| provisioning | `DELETE /api/config-profiles/{uuid}` | `internal/server/server.go:633` | `modules/api_client.py:1032` `delete_config_profile` |
+| provisioning | `DELETE /api/config-profiles/{uuid}` | `internal/server/server.go:633` | `modules/api_client.py:1068` `delete_config_profile` |
 | provisioning | `GET /api/config-profiles/{uuid}/inbounds` | `internal/server/server.go:635` | `modules/api_client.py:649` `provision_config_profile` |
 | provisioning | `GET /api/config-profiles/{uuid}/computed-config` | `internal/server/server.go:636` | `modules/api_client.py:632` `provision_config_profile` |
 
@@ -232,9 +259,9 @@ duplicating it.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| client lifecycle | `POST /api/users` | `internal/server/server.go:554` | `modules/api_client.py:905` `provision_user` |
-| client lifecycle | `GET /api/users/by-username/{username}` | `internal/server/server.go:581` | `modules/api_client.py:884` `provision_user` |
-| client lifecycle | `DELETE /api/users/{userId}` | `internal/server/server.go:579` | `modules/api_client.py:1000` `delete_user` |
+| client lifecycle | `POST /api/users` | `internal/server/server.go:554` | `modules/api_client.py:941` `provision_user` |
+| client lifecycle | `GET /api/users/by-username/{username}` | `internal/server/server.go:581` | `modules/api_client.py:920` `provision_user` |
+| client lifecycle | `DELETE /api/users/{userId}` | `internal/server/server.go:579` | `modules/api_client.py:1036` `delete_user` |
 
 **Update operations.** The pinned Panel exposes an update for every object an
 install creates, and the suite drives the configuration one: the journal writes
@@ -245,12 +272,12 @@ API-04's `configuration update` is that path.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| update | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:1344` `rollback_provisioning` |
-| update | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:1346` `rollback_provisioning` |
-| update | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:1348` `rollback_provisioning` |
-| update | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:1350` `rollback_provisioning` |
+| update | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:1380` `rollback_provisioning` |
+| update | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:1382` `rollback_provisioning` |
+| update | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:1384` `rollback_provisioning` |
+| update | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:1386` `rollback_provisioning` |
 | update | `PATCH /api/users` | `internal/server/server.go:555` | none — coverage gap, not `NOT_APPLICABLE` |
-| update | `PATCH /api/users/{userId}` | `internal/server/server.go:578` | `modules/api_client.py:944` `attach_squad_to_user`, `modules/api_client.py:1352` `rollback_provisioning` |
+| update | `PATCH /api/users/{userId}` | `internal/server/server.go:578` | `modules/api_client.py:980` `attach_squad_to_user`, `modules/api_client.py:1388` `rollback_provisioning` |
 
 **Subscription contracts.** A subscription is fetched without a token, by short
 UUID, so the route is the contract: one path per representation, the
@@ -875,16 +902,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 252 entries:
+than a sentence in a document. The catalog holds 259 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 238 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 245 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 12 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run prints both as justified exclusions and records them in `result.json` as `environment.justified_exclusions`, each carrying the catalog's own limitation; `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here, or that leaves one without a written reason. |
 
 Of the 125 live scenarios projected into this catalog, 111 are container, 12 are
-partial and 2 are live-only; the other 127 entries are Podman-first cases with a
+partial and 2 are live-only; the other 134 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately. That file also
 answers per scenario rather than per group: one row names the live scenario, the
 catalog case that covers it, the environment classification and the gate that

@@ -274,7 +274,7 @@ class TestWorkerJournalCase(unittest.TestCase):
                       "    configure_host_security </dev/null\n",
                       "    configure_firewall </dev/null\n",
                       "    unpack_cover_reality </dev/null\n",
-                      "    configure_edge_nginx </dev/null\n",
+                      "    configure_edge_nginx \"$_WORKER_LIVE_DIR\" \"$_REALITY_LIVE_DIR\" \"${_VISION_LIVE_DIR:-}\" </dev/null\n",
                       "    SECRET_KEY=\"$_NODE_SECRET_KEY\" run_upstream_node_installer </dev/null\n"):
             with self.subTest(mutation=later):
                 self.assertLess(written, body.index(later))

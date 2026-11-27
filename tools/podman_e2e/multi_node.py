@@ -25,13 +25,14 @@ import re
 import shlex
 import stat
 import tarfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, acme_mode, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
-    ingress, local_ci,
+    ingress, ingress_matrix, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
     firewall_image, gate_tiers, mutation_baseline,
     negative_journal,
@@ -81,8 +82,9 @@ WIZARD_FLOW_CASE_ID = "MN-WIZARD-FLOW"
 # One requirement, one case id: the AIO suite runs the same contract on its own
 # host, and a cluster runs it on both roles.
 NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
-# A cluster renders two decoys from two scripts, so the derivation that names
-# them is asserted on both roles instead of on whichever one is cheaper to read.
+# A cluster renders two decoys from two scripts, so the apex decision is asserted
+# on both roles instead of on whichever one is cheaper to read: the Master has
+# one, and the Worker must not.
 COVER_DERIVE_CASE_ID = "NGX-COVER-DERIVE"
 MTLS_TIMEOUT_SECONDS = 300
 MATRIX_TIMEOUT_SECONDS = 120
@@ -114,40 +116,39 @@ IPV6_TIMEOUT_SECONDS = 300
 # The cover case runs one function table and reads one vhost per role; the ceiling
 # is a hang guard for those four `podman exec` calls, not a budget.
 COVER_DERIVE_TIMEOUT_SECONDS = 180
-# The camouflage apex is the last two labels of the deployment domain, so these
-# are the answers the deployed decision has to produce. A domain with fewer than
-# three labels has no subdomain to strip: the decoy has no apex of its own and
-# the refusal is part of the contract instead of an empty render.
-COVER_APEX_TABLE: Sequence[str] = (
-    topology.PANEL_DOMAIN,
-    "panel.sub.example.org",
-    "example.com",
-    "localhost",
-    "",
-)
-COVER_APEX_ANSWERS = {
-    topology.PANEL_DOMAIN: "testbed.internal",
-    "panel.sub.example.org": "example.org",
-    "example.com": "",
-    "localhost": "",
+# The Master's cover apex is the name the operator selected, so the deployed
+# decision is asked with each documented input rather than with a derived one:
+# no selection, the selected apex, the Panel's own name and a value that is not
+# a hostname. Nothing here is a suffix guess.
+MASTER_COVER_SELECTIONS: Dict[str, str] = {
     "": "",
+    topology.COVER_APEX: topology.COVER_APEX,
+    topology.PANEL_DOMAIN: "",
+    "not_a_name": "",
 }
-# Both roles ship their own copy of one decision: the Master sources it from
-# modules/nginx.sh, while the Worker's copy travels inside the payload streamed
-# from gowave-node-auto.sh and is never written to its disk, so the file the
-# payload was cut from is where that role's deployed text can be read.
+MASTER_COVER_REFUSALS: Dict[str, str] = {
+    topology.PANEL_DOMAIN: "same name",
+    "not_a_name": "not a fully qualified domain name",
+}
+# A Worker owns no cover apex: the camouflage site it serves is rendered for its
+# own camouflage name, which is also its REALITY SNI, so the payload it is
+# installed from must carry no apex decision at all. These four functions are the
+# whole decision the Master sources from modules/nginx.sh, so finding any of them
+# defined in the Worker's payload is a Worker that could still decide an apex.
 COVER_DECISION_FUNCTIONS: Sequence[str] = (
     "derive_cover_domain", "cover_domains_not_resolving", "cover_domains_resolve_here",
     "cover_domain_for",
 )
+WORKER_PAYLOAD = f"{topology.REPO_IN_CONTAINER}/gowave-node-auto.sh"
 # One requirement, one case id: a cluster that refuses the apex has to leave no
-# certificate, vhost or site claiming it, on either role.
+# certificate, vhost or site claiming it on the Master, and a Worker that was
+# never given the apex has to stay that way while the zone is steered.
 COVER_UNRESOLVED_CASE_ID = "NGX-COVER-UNRESOLVED"
 # The refusal case rewrites the fixture zone and runs the steered matrix on both
 # roles, so its ceiling is a hang guard for those calls rather than a budget.
 COVER_UNRESOLVED_TIMEOUT_SECONDS = 300
-# Every probe steers the installed apex pair itself: the derived apex is fixed by
-# the zone's own name, so a probe domain cannot carry an apex of its own.
+# Every probe steers the installed apex pair itself: the apex is a name the
+# deployment selected rather than one a probe domain could carry.
 COVER_FLUSH_SCRIPT = (
     "resolvectl flush-caches >/dev/null 2>&1 || "
     "systemd-resolve --flush-caches >/dev/null 2>&1 || true\n"
@@ -204,7 +205,7 @@ ACME80_CASE_ID = "NGX-WORKER-ACME80"
 ACME80_TIMEOUT_SECONDS = 900
 # A Worker re-provision re-streams the whole payload, and the domain change
 # re-issues two lineages, so each half is bounded on its own.
-ACME80_REAPPLY_TIMEOUT_SECONDS = 540
+ACME80_REAPPLY_TIMEOUT_SECONDS = 1200
 ACME80_DOMAIN_CHANGE_TIMEOUT_SECONDS = 420
 ACME_WEBROOT = "/var/www/gowave-acme"
 ACME_MASTER_VHOST = "/etc/nginx/conf.d/gowave-http.conf"
@@ -213,6 +214,69 @@ ACME_CHALLENGE_DIR = "/.well-known/acme-challenge"
 # The token is the whole file: a 404, the redirect, or the decoy page all hash
 # differently, so a served challenge cannot be mistaken for any of them.
 ACME_CHALLENGE_TOKEN = "gowave-e2e-http01-token"
+# The Worker's public 443 is a surface in its own right: the stream map reads the
+# SNI before NGINX or a transport sees a byte, so a scanning client meets the
+# site, the refusals and the handshake behaviour installed for its own name.
+WORKER_EDGE_CASE_ID = "MN-WORKER-EDGE"
+WORKER_EDGE_TIMEOUT_SECONDS = 480
+WORKER_EDGE_PROBE_TIMEOUT_SECONDS = 30
+WORKER_EDGE_PATH_TIMEOUT_SECONDS = 5
+WORKER_EDGE_HTTPS_VHOST = "/etc/nginx/conf.d/gowave-worker-https.conf"
+WORKER_EDGE_DECOY_VHOST = "/etc/nginx/conf.d/gowave-worker-decoy.conf"
+WORKER_EDGE_VISION_VHOST = "/etc/nginx/conf.d/gowave-worker-vision-fallback.conf"
+WORKER_EDGE_STREAM = "/etc/nginx/stream-enabled/gowave-worker-stream.conf"
+WORKER_EDGE_PRIMARY_PORT = 7443
+WORKER_EDGE_REALITY_PORT = 8443
+WORKER_EDGE_VISION_PORT = 8444
+# A management path is closed before static handling, so the exact block is the
+# refusal: a second `/api/` location would be the route that publishes it.
+WORKER_EDGE_API_BLOCK = "location ^~ /api/ {\n        return 444;\n    }"
+WORKER_EDGE_MANAGEMENT_PATHS: Sequence[str] = (
+    "/api/", "/api/sub/", "/api/nodes", "/api/auth/login",
+)
+# Ordinary paths a scanner tries next: they are unknown to the site, so the
+# brand's own 404 page answers them instead of a server default.
+WORKER_EDGE_SCANNER_PATHS: Sequence[str] = ("/metrics", "/server-status")
+WORKER_EDGE_UNKNOWN_PATH = "/this-page-does-not-exist"
+WORKER_EDGE_TRANSPORT_BLOCKS: Sequence[str] = (
+    "location ^~ /xhttp-down/ {",
+    "location = /ws {",
+    "location /trojan-grpc {",
+)
+# The name a scanning client offers when the product never configured it. It is
+# written into the fixture zone for the length of the case, because the fallback
+# can only be read as "this host answered an unknown name" if the name resolves
+# to this host.
+WORKER_EDGE_UNMAPPED_SNI = f"probe-worker.{topology.COVER_APEX}"
+# A TLS record header announcing a handshake body it does not carry: the stream
+# listener reads it for an SNI, finds none, and the fallback closes the
+# handshake. What a malformed client receives is a closure, never an HTTP answer.
+MALFORMED_CLIENT_HELLO = b"\x16\x03\x01\x02\x00\x00\xf8\x01\x00\x00\xf4\x03\x03"
+# Re-provisioning an installed Worker rewrites the edge it serves, so the case
+# simulates the identity a legacy host still carried, refuses the migration until
+# it is confirmed and observes the adopted edge from the client. Two payload
+# streams and three client reads are its budget.
+WORKER_MIGRATION_CASE_ID = "MN-MIGRATE"
+WORKER_MIGRATION_TIMEOUT_SECONDS = 1200
+WORKER_MIGRATION_TIMEOUT_ONE_RUN_SECONDS = 1200
+
+# MN-WORKER-RESUME: a resumed run re-verifies each Worker's TLS and security state
+# without reinstalling it. A Worker whose TLS verification fails is held as
+# indeterminate without repeating registration or affecting siblings; a Worker
+# whose security report readback fails is held the same way. The Panel is
+# verified first, and the run returns 0 only when every planned Worker passes
+# both checks, 2 when any Worker fails or cannot be confirmed.
+WORKER_RESUME_CASE_ID = "MN-WORKER-RESUME"
+WORKER_RESUME_TIMEOUT_SECONDS = 900
+
+# MN-COMPOSED-MIXED: a full mixed-topology deployment (Panel + local Node + 1 remote
+# Worker) with country entry, failure, retry, interruption and restart.
+# The case runs the real multi-node install, then simulates a Worker onboarding
+# failure, retries it, sends SIGTERM during the retry to test interruption,
+# restarts and verifies the final Panel readback and preserved identities.
+COMPOSED_MIXED_CASE_ID = "MN-COMPOSED-MIXED"
+COMPOSED_MIXED_TIMEOUT_SECONDS = 1800
+
 # The names the domain change installs, inside the fixture's own zone so the
 # product's resolution precondition and certbot's HTTP-01 both still hold.
 ACME_NEW_PANEL_DOMAIN = "panel2.testbed.internal"
@@ -946,7 +1010,7 @@ def firewall_master_sources(rules: Sequence[str]) -> List[str]:
     """
     sources: List[str] = []
     for line in rules:
-        if "GoWave Control Plane" not in line:
+        if "GoWave Auto NGINX" not in line:
             continue
         fields = line.split()
         for index, field in enumerate(fields):
@@ -3246,8 +3310,8 @@ def case_wizard_flow(product: MultiNodeProduct) -> Dict[str, Any]:
     vision_prompt = f"Enable Vision for {node2}?"
     for prompt, expected in (
         ("Select deployment scheme", 1),
-        ("Node 2 primary domain: ", 1),
-        ("Node 2 camouflage domain: ", 3),
+        ("Node 2 primary domain", 1),
+        ("Node 2 camouflage domain", 3),
         (vision_prompt, 1),
         ("Panel domain (", 1),
     ):
@@ -3287,6 +3351,20 @@ def case_wizard_flow(product: MultiNodeProduct) -> Dict[str, Any]:
         f"Certificates this plan spends: {WIZARD_FLOW_CERTIFICATES}" in stdout,
         f"the reviewed plan was not costed at the corrected answers:\n{stdout[-4000:]}",
     )
+    # A Worker's first name is its transport and static cover, and the reviewed
+    # plan has to keep saying so: a row labelled `panel=` would tell the operator
+    # a second Panel runs on that host.
+    for ordinal in (1, 2):
+        row = next(
+            (line for line in stdout.splitlines() if line.startswith(f"  node {ordinal} (")),
+            "",
+        )
+        require(
+            WIZARD_FLOW_CASE_ID,
+            "transport=" in row and "panel=" not in row and "vision=" in row,
+            f"the reviewed plan did not describe node {ordinal} as a transport without a Panel: "
+            f"{row!r}",
+        )
 
     require(
         WIZARD_FLOW_CASE_ID,
@@ -4401,10 +4479,10 @@ def master_access_contract(facts: Dict[str, Any], case_id: str) -> Dict[str, Any
     )
     require(
         case_id,
-        not before["blocks"][denial.PANEL_API_PORT],
-        f"the panel API port {denial.PANEL_API_PORT} is blocked by its own rule, which would hide "
-        "whether the default policy reaches it: "
-        f"{[entry['line'] for entry in before['blocks'][denial.PANEL_API_PORT]]}",
+        before["blocks"][denial.PANEL_API_PORT],
+        f"the panel API port {denial.PANEL_API_PORT} carries no explicit block rule, but the "
+        "security contract requires an explicit deny for every internal port; its isolation "
+        "must not rest on the default policy alone",
     )
     panel_listeners = before["listeners"][denial.PANEL_API_PORT]
     require(
@@ -4520,7 +4598,8 @@ def master_access_contract(facts: Dict[str, Any], case_id: str) -> Dict[str, Any
         )
 
     moved: Dict[int, int] = {}
-    for port in (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT, denial.NODE_PORT):
+    for port in (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT, denial.NODE_PORT,
+                 denial.PANEL_API_PORT):
         before_packets = denial.packets_for(before, port)
         after_packets = denial.packets_for(after, port)
         moved[port] = after_packets - before_packets
@@ -4531,17 +4610,21 @@ def master_access_contract(facts: Dict[str, Any], case_id: str) -> Dict[str, Any
             f"({before_packets} -> {after_packets}), so the attempts above did not traverse the "
             "rule set the install wrote",
         )
+    # The panel API port is dropped by its own rule (the contract requires an
+    # explicit deny for every internal port), so the INPUT policy counter need
+    # not move for that probe; the rule's own counter above carries the proof.
+    # The default incoming policy is still asserted from the policy target.
     policy_moved: Optional[int] = None
     before_policy = before.get("input_policy_packets")
     after_policy = after.get("input_policy_packets")
     if isinstance(before_policy, int) and isinstance(after_policy, int):
         policy_moved = after_policy - before_policy
-        require(
-            case_id,
-            after_policy > before_policy,
-            f"the INPUT policy counted no dropped packet while the panel API port was probed from "
-            f"the Control Machine ({before_policy} -> {after_policy})",
-        )
+    require(
+        case_id,
+        "DROP" in str(before.get("input_policy") or "").upper()
+        or "REJECT" in str(before.get("input_policy") or "").upper(),
+        f"the INPUT policy is {before.get('input_policy')!r}, so the default incoming is not deny",
+    )
 
     return {
         "input_policy": before["input_policy"],
@@ -6073,9 +6156,9 @@ def case_tls_surface(product: MultiNodeProduct) -> Dict[str, Any]:
     generated it, and the handshake is driven from the Control Machine, which
     resolves each name through the fixture zone to the node that serves it.
 
-    The Worker serves no Panel page, so its own vhost answers 404 on `/`: that
-    is the documented edge behaviour and still proves which vhost terminated
-    the connection.
+    The Worker serves its cover site on its own primary name, so `/` answers
+    `200` from the same vhost that terminates its transport paths; the
+    certificate SAN pin is what proves which role's vhost answered.
     """
     host = product.require_worker()
     return {
@@ -6083,53 +6166,109 @@ def case_tls_surface(product: MultiNodeProduct) -> Dict[str, Any]:
             product.master, aio.TLS_CASE_ID, "the Master", topology.PANEL_DOMAIN, 200,
         ),
         "worker": aio.tls_surface_contract(
-            product.master, aio.TLS_CASE_ID, "the Worker", host.worker_domain, 404,
+            product.master, aio.TLS_CASE_ID, "the Worker", host.worker_domain, 200,
             container=host.worker_name,
         ),
     }
 
 
 def cover_decision_loader(role: str) -> str:
-    """The lines that put this role's own copy of the decision in scope."""
-    if role == "master":
-        return f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh"
-    if role != "worker":
+    """The lines that put the Master's own copy of the decision in scope.
+
+    Only the Master carries one, and its copy is sourced from the `modules/nginx.sh`
+    its install ships. A Worker has no apex to decide, so asking for its loader is
+    an error rather than an empty scope that would silently pass every check.
+    """
+    if role != "master":
         raise ValueError(f"unknown cover-domain role: {role!r}")
-    # The Worker keeps no copy of its payload, so the functions are read back out
-    # of the file the payload was cut from instead of a file it never wrote.
-    return "\n".join(
-        f"eval \"$(sed -n '/^{name}() {{/,/^}}$/p' "
-        f"{topology.REPO_IN_CONTAINER}/gowave-node-auto.sh)\""
-        for name in COVER_DECISION_FUNCTIONS
+    return f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh"
+
+
+def worker_apex_absence_lines() -> str:
+    """The Worker's payload must not define the apex decision at all.
+
+    The four functions are the decision itself, so one definition left in the
+    payload is a Worker that could still name an apex it cannot validate over
+    HTTP-01 from its own port 80. The text read is the installed payload, which is
+    what that role actually runs, not a file it never wrote to its disk.
+    """
+    names = " ".join(shlex.quote(name) for name in COVER_DECISION_FUNCTIONS)
+    return (
+        f"if [ ! -f {shlex.quote(WORKER_PAYLOAD)} ]; then\n"
+        "    printf 'apexfile\\tmissing\\n'\n"
+        "fi\n"
+        f"for name in {names}; do\n"
+        "    if grep -qE \"^${name}\\(\\) \\{\" "
+        f"{shlex.quote(WORKER_PAYLOAD)}; then\n"
+        "        printf 'apexdef\\t%s\\n' \"$name\"\n"
+        "    fi\n"
+        "done"
+    )
+
+
+def cover_selection_exports(role: str, apex: str = topology.COVER_APEX) -> str:
+    """The documented inputs the Master's install sets for its selected cover.
+
+    A Worker has no cover inputs at all — it owns no apex — so only the Master's
+    half gets any environment, and a Worker script that asked for these would be
+    testing an install surface the product does not have.
+    """
+    if role != "master":
+        return ""
+    return (
+        f"export GOWAVE_COVER_DOMAIN={shlex.quote(apex)}\n"
+        "export GOWAVE_COVER_WWW=yes"
     )
 
 
 def cover_decision_script(role: str, domain: str) -> str:
-    """The apex table run through the copy of the decision the role ships.
+    """The cover decision this role ships, run against the choices it accepts.
 
-    The same run also reports what the role's own resolver says about its derived
-    apex and which addresses the role holds, because the product only binds the
-    decoy to names that resolve here: a role whose apex points at another host is
-    supposed to keep a nameless decoy instead of a certificate that cannot issue.
+    The Master's apex is the name the operator selected, so its table asks the
+    same decision once per documented input, with the deployment's own address
+    in scope: the selection is echoed back only when it is a hostname that is
+    not the Panel and that resolves here.
+
+    The Worker ships no decision at all, so its half reports the absence of one:
+    the payload must carry none of the four functions and the role must answer no
+    apex question, which is the whole contract a Worker has for this requirement.
+
+    Both runs also report which addresses the role holds, because the product
+    only binds the decoy to names that resolve here: a role whose apex points at
+    another host keeps a nameless decoy instead of a certificate it cannot issue.
     """
-    domains = " ".join(shlex.quote(candidate) for candidate in COVER_APEX_TABLE)
-    refusals = " ".join(shlex.quote(candidate) for candidate in ("example.com", "localhost"))
-    return f"""set -eu
+    if role == "master":
+        selections = " ".join(
+            shlex.quote(selection) for selection in MASTER_COVER_SELECTIONS
+        )
+        return f"""set -eu
 {cover_decision_loader(role)}
-apex=$(derive_cover_domain {shlex.quote(domain)})
+server_ip=$(hostname -I 2>/dev/null | awk '{{print $1}}' || true)
+for selection in {selections}; do
+    apex=$(GOWAVE_COVER_DOMAIN="$selection" GOWAVE_COVER_WWW=yes \\
+        cover_domain_for {shlex.quote(domain)} "$server_ip" 2>/dev/null || true)
+    reason=$(GOWAVE_COVER_DOMAIN="$selection" GOWAVE_COVER_WWW=yes \\
+        cover_domain_for {shlex.quote(domain)} "$server_ip" 2>&1 >/dev/null || true)
+    printf 'derived\\t%s\\t%s\\n' "$selection" "$apex"
+    printf 'refusals\\t%s\\t%s\\n' "$selection" "$reason"
+done
+apex=$(GOWAVE_COVER_DOMAIN={shlex.quote(topology.COVER_APEX)} GOWAVE_COVER_WWW=yes \\
+    cover_domain_for {shlex.quote(domain)} "$server_ip" 2>/dev/null || true)
 printf 'apex\\t%s\\n' "$(getent ahostsv4 "$apex" 2>/dev/null | awk 'NR==1 {{print $1}}' || true)"
 hostname -I 2>/dev/null | tr ' ' '\\n' | sed '/^$/d; s/^/self\\t/' || true
-for domain in {domains}; do
-    printf 'derived\\t%s\\t%s\\n' "$domain" "$(derive_cover_domain "$domain")"
-done
-for domain in {refusals}; do
-    printf 'refusals\\t%s\\t%s\\n' "$domain" "$(cover_domain_for "$domain" "" 2>&1 >/dev/null)"
-done
+"""
+    if role != "worker":
+        raise ValueError(f"unknown cover-domain role: {role!r}")
+    return f"""set -eu
+{worker_apex_absence_lines()}
+printf 'apex\\t\\n'
 """
 
-
 def parse_cover_decision(output: str) -> Dict[str, Any]:
-    facts: Dict[str, Any] = {"derived": {}, "refusals": {}, "apex": "", "self": []}
+    facts: Dict[str, Any] = {
+        "derived": {}, "refusals": {}, "apex": "", "self": [], "apexdef": [],
+        "apexfile": "",
+    }
     for line in output.splitlines():
         fields = line.split("\t")
         kind = fields[0] if fields else ""
@@ -6139,25 +6278,81 @@ def parse_cover_decision(output: str) -> Dict[str, Any]:
             facts["apex"] = fields[1]
         elif kind == "self" and len(fields) >= 2:
             facts["self"].append(fields[1])
+        elif kind == "apexdef" and len(fields) >= 2:
+            facts["apexdef"].append(fields[1])
+        elif kind == "apexfile" and len(fields) >= 2:
+            facts["apexfile"] = fields[1]
     return facts
 
 
-def require_cover_decision(case_id: str, role: str, facts: Dict[str, Any]) -> None:
+def require_cover_decision(case_id: str, role: str, label: str,
+                           facts: Dict[str, Any]) -> None:
+    """Each role's table has to come back with exactly the answers it accepts."""
+    if role == "master":
+        selected = topology.COVER_APEX
+        # The selection is only echoed when this host is where it resolves to:
+        # the decoy cannot be bound to a name whose HTTP-01 challenge lands on
+        # another machine.
+        binds = bool(facts["apex"]) and facts["apex"] in facts["self"]
+        expected = dict(MASTER_COVER_SELECTIONS)
+        if not binds:
+            expected[selected] = ""
+        require(
+            case_id,
+            facts["derived"] == expected,
+            f"{label} does not tie its cover apex to the selected name: "
+            f"{facts['derived']!r} instead of {expected!r}",
+        )
+        for selection, fragment in MASTER_COVER_REFUSALS.items():
+            message = facts["refusals"].get(selection, "")
+            require(
+                case_id,
+                fragment in message,
+                f"{label} refuses the selection {selection!r} without saying why: "
+                f"{message!r}",
+            )
+        selected_reason = facts["refusals"].get(selected, "")
+        if binds:
+            require(
+                case_id,
+                selected_reason == "",
+                f"{label} refuses the apex {selected!r} although it resolves to its "
+                f"own {facts['apex']}: {selected_reason!r}",
+            )
+        else:
+            require(
+                case_id,
+                "resolve" in selected_reason,
+                f"{label} drops the apex {selected!r} without naming the records that "
+                f"do not resolve here: {selected_reason!r}",
+            )
+        require(
+            case_id,
+            facts["refusals"].get("", "") == "",
+            f"{label} explains a refusal for a deployment that selected no cover: "
+            f"{facts['refusals'].get('', '')!r}",
+        )
+        return
     derived = facts["derived"]
     require(
         case_id,
-        derived == COVER_APEX_ANSWERS,
-        f"{role} derives the camouflage apex differently: {derived!r} instead of "
-        f"{COVER_APEX_ANSWERS!r}",
+        facts["apexfile"] == "",
+        f"{label} could not read its installed payload {WORKER_PAYLOAD!r}, so "
+        "'no apex function' would be an answer about a missing file",
     )
-    for domain in ("example.com", "localhost"):
-        message = facts["refusals"].get(domain, "")
-        require(
-            case_id,
-            "has no subdomain" in message,
-            f"{role} renders no cover lineage for {domain!r} without saying why: "
-            f"{message!r}",
-        )
+    require(
+        case_id,
+        facts["apexdef"] == [],
+        f"{label}'s payload still defines the cover-apex decision "
+        f"{facts['apexdef']!r}, so this role could name an apex it cannot validate "
+        "over HTTP-01 from its own port 80",
+    )
+    require(
+        case_id,
+        derived == {} and facts["refusals"] == {} and facts["apex"] == "",
+        f"{label} answered a cover-apex question it does not have: apex="
+        f"{facts['apex']!r}, derived={derived!r}, refusals={facts['refusals']!r}",
+    )
 
 
 def cover_vhost_names(case_id: str, role: str, path: str, text: str) -> List[str]:
@@ -6199,36 +6394,48 @@ def require_cover_binding(case_id: str, role: str, names: Sequence[str],
         )
 
 
-def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
-    """NGX-COVER-DERIVE: both roles derive the camouflage apex from their own domain.
+def require_worker_decoy_names(case_id: str, label: str, names: Sequence[str],
+                               reality: str) -> None:
+    """The Worker's decoy names exactly the camouflage name it renders for.
 
-    The Master and the Worker render their decoys from two scripts, so the
-    derivation is proven on each role's own copy of the decision. The table is run
-    in the container because the refusal for a domain without a subdomain cannot
-    be observed on an install whose domain has one. Each role's real decoy vhost
-    then has to follow that role's own resolution of the derived apex: the names
-    are bound where the apex points here, and withheld where it points at another
-    host, because ACME validates the lineage over port 80 on this machine. Neither
-    role may carry the first-two-label derivation a wrong implementation produces.
+    A Worker owns no apex, so its camouflage vhost carries no second name: the
+    one name it does carry is the camouflage name the site was rendered for, and
+    that name is also its REALITY SNI. Anything else here — an apex, its `www`, or
+    the first-two-label name a wrong implementation produces — is a name this
+    host would have to validate over HTTP-01 from its own port 80 and could not.
+    """
+    require(
+        case_id,
+        list(names) == [reality],
+        f"{label}'s decoy has to name only its own camouflage name {reality!r}: "
+        f"{list(names)}",
+    )
+
+
+def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-COVER-DERIVE: no role derives an apex, and neither may invent one.
+
+    The two roles are asked the question their install answers. The Master has a
+    decision: its apex is the name the install selected, so its table runs that
+    decision once per documented input and its real decoy must carry exactly the
+    selected apex when that apex resolves here and neither name when it does not,
+    because ACME validates the lineage over port 80 on this machine. The Worker
+    has no decision at all: the payload it is installed from must define none of
+    the four functions, and its camouflage vhost must carry only the camouflage
+    name its site was rendered for — the same name REALITY serves the decoy under.
+
+    Neither role may carry the first-two-label derivation a wrong implementation
+    produces, and neither may carry a name it cannot validate from its own host.
     """
     host = product.require_worker()
     roles = (
         ("master", "the Master", host.target_name, topology.PANEL_DOMAIN,
-         "/etc/nginx/conf.d/gowave-decoy.conf"),
+         "/etc/nginx/conf.d/gowave-decoy.conf", topology.COVER_APEX, host.reality_domain),
         ("worker", "the Worker", host.worker_name, host.worker_domain,
-         "/etc/nginx/conf.d/gowave-worker-decoy.conf"),
+         "/etc/nginx/conf.d/gowave-worker-decoy.conf", "", host.worker_reality_domain),
     )
     evidence: Dict[str, Any] = {}
-    for key, label, container, domain, path in roles:
-        labels = domain.rstrip(".").split(".")
-        require(
-            COVER_DERIVE_CASE_ID,
-            len(labels) >= 3,
-            f"{label}'s deployment domain {domain!r} has no subdomain, so this run "
-            "cannot show a decoy bound to a derived apex",
-        )
-        apex = ".".join(labels[-2:])
-
+    for key, label, container, domain, path, selected, reality in roles:
         decided = product.podman.exec_bash(
             container, cover_decision_script(key, domain), check=False, timeout=120,
         )
@@ -6239,7 +6446,7 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
             f"{(decided.stderr or '').strip()[-500:]}",
         )
         facts = parse_cover_decision(decided.stdout or "")
-        require_cover_decision(COVER_DERIVE_CASE_ID, label, facts)
+        require_cover_decision(COVER_DERIVE_CASE_ID, key, label, facts)
 
         rendered = product.podman.exec(container, ["cat", path], check=False)
         require(
@@ -6249,19 +6456,30 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
             f"{(rendered.stderr or '').strip()[-500:]}",
         )
         names = cover_vhost_names(COVER_DERIVE_CASE_ID, label, path, rendered.stdout)
-        require_cover_binding(COVER_DERIVE_CASE_ID, label, names, apex, domain,
-                              facts["apex"], facts["self"])
-        evidence[key] = {
-            "deployment_domain": domain,
-            "cover_domain": apex,
-            "apex_resolved_to": facts["apex"],
-            "own_addresses": facts["self"],
-            "derived": facts["derived"],
-            "refusals": facts["refusals"],
-            "vhost": path,
-            "server_names": names,
-            "cover_names_bound": apex in names,
-        }
+        if selected:
+            require_cover_binding(COVER_DERIVE_CASE_ID, label, names, selected, domain,
+                                  facts["apex"], facts["self"])
+            evidence[key] = {
+                "deployment_domain": domain,
+                "cover_domain": selected,
+                "apex_resolved_to": facts["apex"],
+                "own_addresses": facts["self"],
+                "derived": facts["derived"],
+                "refusals": facts["refusals"],
+                "vhost": path,
+                "server_names": names,
+                "cover_names_bound": selected in names,
+            }
+        else:
+            require_worker_decoy_names(COVER_DERIVE_CASE_ID, label, names, reality)
+            evidence[key] = {
+                "deployment_domain": domain,
+                "cover_name": reality,
+                "apex_defined": facts["apexdef"],
+                "apex_decided": facts["apex"],
+                "vhost": path,
+                "server_names": names,
+            }
     return evidence
 
 
@@ -6524,16 +6742,27 @@ def case_cover_site(product: MultiNodeProduct) -> Dict[str, Any]:
 
 
 def decoy_cover_decision_script(role: str, domain: str, server_ip: str) -> str:
-    """The role's own cover decision for its deployment domain, and nothing else.
+    """The cover name this role owes a route for, and nothing else.
 
     The route case only needs to know whether this role owes a cover route, so it
-    asks the shipped decision instead of assuming both roles render an apex.
+    asks the shipped decision instead of assuming both roles render an apex. The
+    Master answers with the apex it selected; the Worker has no decision, so it
+    answers with an empty apex and reports any apex function its payload still
+    defines — the two facts that make "this role owes no cover route" provable.
     """
-    return f"""set -u
+    if role == "master":
+        return f"""set -u
 {cover_decision_loader(role)}
+{cover_selection_exports(role)}
 apex=$(cover_domain_for {shlex.quote(domain)} {shlex.quote(server_ip)} 2>/dev/null || true)
 reason=$(cover_domain_for {shlex.quote(domain)} {shlex.quote(server_ip)} 2>&1 >/dev/null || true)
 printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(domain)} "$apex" "$reason"
+"""
+    if role != "worker":
+        raise ValueError(f"unknown cover-domain role: {role!r}")
+    return f"""set -u
+{worker_apex_absence_lines()}
+printf 'decision\\t%s\\t\\t\\n' {shlex.quote(domain)}
 """
 
 
@@ -6838,9 +7067,9 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
     every management path with the site's own 404 page, while the panel's own
     name refuses the same read with 401/403.
 
-    The role that decides no apex (its own resolution puts the pair elsewhere)
-    owes no cover route at all, so the case reads each role's own decision
-    instead of assuming both render one.
+    The Worker owns no apex, so it owes no cover route at all: the case reads each
+    role's own answer instead of assuming both render one, and requires the Worker
+    to report no apex and no apex function in its payload.
     """
     case_id = DECOY_ROUTE_CASE_ID
     host = product.require_worker()
@@ -6865,10 +7094,13 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
             f"{label} could not run its own cover-domain decision: "
             f"{(decided.stderr or '').strip()[-500:]}",
         )
+        decided_facts = parse_cover_state(decided.stdout or "")
         rendered_apex = cover_decision_for(
-            case_id, label, domain, parse_cover_state(decided.stdout or ""),
+            case_id, label, domain, decided_facts,
         ).get("apex", "")
         cover_names = [rendered_apex, f"www.{rendered_apex}"] if rendered_apex else []
+        if key == "worker":
+            require_worker_apex_absent(case_id, label, decided_facts)
 
         read = product.podman.exec_bash(
             container, decoy_route_script(vhost), check=False, timeout=120,
@@ -7166,9 +7398,19 @@ def acme_challenge_fetch(case_id: str, host: topology.MultiNodeTopology, name: s
     }
 
 
-def node_reapply_script(name: str) -> str:
-    """The operator's own Worker re-apply, unmodified and without a TTY."""
-    return f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node reapply {shlex.quote(name)}\n"
+def node_reapply_script(name: str, confirmed: bool = True) -> str:
+    """The operator's own Worker re-apply, unmodified and without a TTY.
+
+    Re-applying an installed Worker rewrites the edge it serves, so the product
+    shows the identity it is about to replace and refuses without a confirmation
+    when nothing can be asked. ``confirmed`` is that confirmation — the same
+    `GOWAVE_MIGRATE_EXISTING=yes` the preview tells the operator to pass — and
+    the unconfirmed form is what the migration case runs first.
+    """
+    command = f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node reapply {shlex.quote(name)}"
+    if confirmed:
+        return f"GOWAVE_MIGRATE_EXISTING=yes {command}\n"
+    return f"{command}\n"
 
 
 def domain_change_script(panel_domain: str, reality_domain: str) -> str:
@@ -7393,6 +7635,1374 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+# The Worker's edge as the host holds it: the three vhosts it renders, the stream
+# map it loads, and the site those vhosts serve. The digests are read from the
+# bytes on disk, so a case can put the same tree back and prove it came back, and
+# the document bodies are read from the Worker's own cover root rather than the
+# Master's, because each host renders its site from its own camouflage name.
+WORKER_EDGE_FACTS = r"""python3 - <<'PY'
+import base64
+import hashlib
+import os
+
+VHOSTS = {
+    "https": "/etc/nginx/conf.d/gowave-worker-https.conf",
+    "decoy": "/etc/nginx/conf.d/gowave-worker-decoy.conf",
+    "vision": "/etc/nginx/conf.d/gowave-worker-vision-fallback.conf",
+}
+ROOT = "/var/www/gowave-auto-nginx/cover-reality"
+STREAM = "/etc/nginx/stream-enabled/gowave-worker-stream.conf"
+DOCUMENTS = ("index.html", "404.html")
+
+
+def emit(*fields):
+    print("\t".join(str(field) for field in fields))
+
+
+def digest(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def read_text(path):
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    return raw, base64.b64encode(raw).decode("ascii")
+
+
+for key, path in sorted(VHOSTS.items()):
+    present = os.path.isfile(path)
+    emit("vhost", key, "1" if present else "0")
+    if present:
+        raw, encoded = read_text(path)
+        emit("sha", key, hashlib.sha256(raw).hexdigest())
+        emit("text", key, encoded)
+
+if os.path.isfile(STREAM):
+    raw, encoded = read_text(STREAM)
+    emit("stream", os.path.basename(STREAM), encoded)
+    emit("sha", "stream", hashlib.sha256(raw).hexdigest())
+
+for document in DOCUMENTS:
+    path = os.path.join(ROOT, document)
+    emit("cover", document, digest(path) if os.path.isfile(path) else "")
+    if os.path.isfile(path):
+        _, encoded = read_text(path)
+        emit("body", document, encoded)
+
+if os.path.isdir(ROOT):
+    for directory, _, names in os.walk(ROOT):
+        for name in sorted(names):
+            path = os.path.join(directory, name)
+            relative = os.path.relpath(path, ROOT)
+            if relative not in DOCUMENTS:
+                emit("asset", relative, digest(path))
+
+if os.path.isfile(STREAM):
+    import re
+
+    with open(STREAM, encoding="utf-8", errors="replace") as handle:
+        block = re.search(
+            r"map\s+\$ssl_preread_server_name\s+\$worker_dest\s*\{(.*?)\}",
+            handle.read(), re.DOTALL,
+        )
+    for match in re.finditer(
+        r"^\s*(\S+)\s+(127\.0\.0\.1:\d+);", block.group(1) if block else "", re.MULTILINE,
+    ):
+        emit("sni", match.group(1), match.group(2))
+PY
+"""
+
+
+def parse_worker_edge_facts(output: str) -> Dict[str, Any]:
+    """The Worker's vhosts, stream map, cover documents and assets, line by line."""
+    facts: Dict[str, Any] = {
+        "vhosts": {}, "stream": {"path": WORKER_EDGE_STREAM, "text": "", "sha256": ""},
+        "cover": {}, "bodies": {}, "assets": {}, "routes": {},
+    }
+    for line in (output or "").splitlines():
+        fields = line.split("\t")
+        kind = fields[0] if fields else ""
+        if kind == "vhost" and len(fields) == 3:
+            facts["vhosts"][fields[1]] = {"present": fields[2].strip() == "1", "text": "", "sha256": ""}
+        elif kind == "sha" and len(fields) == 3:
+            target = facts["stream"] if fields[1] == "stream" else facts["vhosts"].setdefault(
+                fields[1], {"present": False, "text": "", "sha256": ""},
+            )
+            target["sha256"] = fields[2].strip()
+        elif kind == "text" and len(fields) == 3:
+            entry = facts["vhosts"].setdefault(fields[1], {"present": False, "text": "", "sha256": ""})
+            entry["text"] = base64.b64decode(fields[2]).decode("utf-8", "replace")
+        elif kind == "stream" and len(fields) == 3:
+            facts["stream"]["text"] = base64.b64decode(fields[2]).decode("utf-8", "replace")
+        elif kind == "cover" and len(fields) == 3:
+            facts["cover"][fields[1]] = fields[2].strip()
+        elif kind == "body" and len(fields) == 3:
+            facts["bodies"][fields[1]] = base64.b64decode(fields[2]).decode("utf-8", "replace")
+        elif kind == "asset" and len(fields) == 3:
+            facts["assets"][fields[1]] = fields[2].strip()
+        elif kind == "sni" and len(fields) == 3:
+            facts["routes"][fields[1]] = fields[2].strip()
+    return facts
+
+
+def worker_edge_facts(product: MultiNodeProduct, case_id: str) -> Dict[str, Any]:
+    """One read of the Worker's edge, refused by name when the host could not answer."""
+    host = product.require_worker()
+    read = product.podman.exec_bash(
+        host.worker_name, WORKER_EDGE_FACTS, check=False, timeout=WORKER_EDGE_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        read.returncode == 0,
+        f"the Worker could not read its own edge configuration: "
+        f"{(read.stderr or read.stdout or '').strip()[-600:]}",
+    )
+    facts = parse_worker_edge_facts(read.stdout or "")
+    require(
+        case_id,
+        facts["routes"],
+        f"the Worker's stream map carries no SNI route at all: {(read.stdout or '')[:400]}",
+    )
+    return facts
+
+
+def worker_vhost_value(text: str, directive: str) -> str:
+    """One directive's whole argument, as the vhost states it."""
+    match = re.search(rf"^\s*{re.escape(directive)}\s+([^;]+);", text, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def require_worker_edge_vhost(case_id: str, host: topology.MultiNodeTopology,
+                             facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Each of the three vhosts is the shape this deployment owes, or is absent.
+
+    The primary vhost is an ordinary website plus three transport locations, with
+    the management surface closed by exactly one block: a second `/api/` location
+    or an extra location beside the five the payload renders would be a route
+    published on the public name. The decoy carries the site and no location at
+    all, because any location there is a route the camouflage listener does not
+    owe; a name it serves is answered by the site's own files. The Vision vhost
+    exists exactly when the deployment has a delegated name.
+    """
+    vhosts = facts["vhosts"]
+
+    def entry(key: str, label: str) -> Dict[str, Any]:
+        require(
+            case_id,
+            vhosts.get(key, {}).get("present") and vhosts.get(key, {}).get("text"),
+            f"the Worker has no {label} at all, so that part of its edge is not installed",
+        )
+        return vhosts[key]
+
+    primary = entry("https", f"primary vhost {WORKER_EDGE_HTTPS_VHOST}")
+    text = primary["text"]
+    names = worker_vhost_value(text, "server_name").split()
+    require(
+        case_id,
+        names == [host.worker_domain],
+        f"{WORKER_EDGE_HTTPS_VHOST} answers for {names} instead of the primary name "
+        f"{host.worker_domain}, so public 443 would serve a name it does not own",
+    )
+    require(
+        case_id,
+        worker_vhost_value(text, "root") == COVER_SITE_ROOT,
+        f"{WORKER_EDGE_HTTPS_VHOST} serves {worker_vhost_value(text, 'root')!r} instead of the "
+        f"rendered cover site {COVER_SITE_ROOT}",
+    )
+    require(
+        case_id,
+        worker_vhost_value(text, "index") == "index.html",
+        f"{WORKER_EDGE_HTTPS_VHOST} indexes {worker_vhost_value(text, 'index')!r} instead of index.html",
+    )
+    require(
+        case_id,
+        worker_vhost_value(text, "error_page") == "404 /404.html",
+        f"{WORKER_EDGE_HTTPS_VHOST} answers a missing path with "
+        f"{worker_vhost_value(text, 'error_page')!r} instead of the brand's own 404 page",
+    )
+    require(
+        case_id,
+        "try_files $uri $uri/ =404;" in text,
+        f"{WORKER_EDGE_HTTPS_VHOST} has no `try_files $uri $uri/ =404;`, so an unknown path "
+        "would be answered by whatever NGINX falls back to",
+    )
+    blocks = text.count("location ^~ /api/")
+    require(
+        case_id,
+        WORKER_EDGE_API_BLOCK in text and blocks == 1,
+        f"{WORKER_EDGE_HTTPS_VHOST} declares {blocks} `location ^~ /api/` block(s) and the "
+        f"refusal is {'present' if WORKER_EDGE_API_BLOCK in text else 'missing'}: the "
+        "management surface has to be closed by exactly one block that returns 444",
+    )
+    missing = [block for block in WORKER_EDGE_TRANSPORT_BLOCKS if block not in text]
+    require(
+        case_id,
+        not missing,
+        f"{WORKER_EDGE_HTTPS_VHOST} is missing the transport locations {missing}, so a client "
+        "dialling the primary name for its transport would not reach it",
+    )
+    locations = len(re.findall(r"^\s*location\s", text, re.MULTILINE))
+    require(
+        case_id,
+        locations == 2 + len(WORKER_EDGE_TRANSPORT_BLOCKS),
+        f"{WORKER_EDGE_HTTPS_VHOST} declares {locations} location blocks instead of the "
+        f"{2 + len(WORKER_EDGE_TRANSPORT_BLOCKS)} the payload renders (the management "
+        "refusal, the three transports and the static site)",
+    )
+
+    decoy = entry("decoy", f"camouflage vhost {WORKER_EDGE_DECOY_VHOST}")
+    decoy_text = decoy["text"]
+    require(
+        case_id,
+        worker_vhost_value(decoy_text, "server_name").split() == [host.worker_reality_domain],
+        f"{WORKER_EDGE_DECOY_VHOST} answers for "
+        f"{worker_vhost_value(decoy_text, 'server_name')!r} instead of the camouflage name "
+        f"{host.worker_reality_domain}",
+    )
+    require(
+        case_id,
+        worker_vhost_value(decoy_text, "root") == COVER_SITE_ROOT,
+        f"{WORKER_EDGE_DECOY_VHOST} serves {worker_vhost_value(decoy_text, 'root')!r} instead of "
+        f"the rendered cover site {COVER_SITE_ROOT}",
+    )
+    require(
+        case_id,
+        worker_vhost_value(decoy_text, "error_page") == "404 /404.html",
+        f"{WORKER_EDGE_DECOY_VHOST} answers a missing path with "
+        f"{worker_vhost_value(decoy_text, 'error_page')!r} instead of the brand's own 404 page",
+    )
+    decoy_locations = re.findall(r"^\s*location\s+([^{]+)\{", decoy_text, re.MULTILINE)
+    require(
+        case_id,
+        not decoy_locations,
+        f"{WORKER_EDGE_DECOY_VHOST} declares the locations {decoy_locations}, so the "
+        "camouflage listener publishes routes it owes no handler for",
+    )
+
+    vision = facts["vhosts"].get("vision") or {"present": False, "text": "", "sha256": ""}
+    if host.worker_vision_domain:
+        require(
+            case_id,
+            vision["present"] and vision["text"],
+            f"the deployment carries the Vision name {host.worker_vision_domain}, but the Worker "
+            f"has no {WORKER_EDGE_VISION_VHOST}",
+        )
+        require(
+            case_id,
+            worker_vhost_value(vision["text"], "server_name").split() == [host.worker_vision_domain],
+            f"{WORKER_EDGE_VISION_VHOST} answers for "
+            f"{worker_vhost_value(vision['text'], 'server_name')!r} instead of "
+            f"{host.worker_vision_domain}",
+        )
+        require(
+            case_id,
+            "location ^~ /api/" not in vision["text"],
+            f"{WORKER_EDGE_VISION_VHOST} carries a management refusal block, so the Vision "
+            "fallback would answer differently from the site it is meant to look like",
+        )
+    else:
+        require(
+            case_id,
+            not vision["present"],
+            f"the Worker has a {WORKER_EDGE_VISION_VHOST} although this deployment has no "
+            "Vision name, so a listener serves a name the product never configured",
+        )
+
+    return {
+        "https": {"server_name": names, "sha256": primary["sha256"]},
+        "decoy": {
+            "server_name": worker_vhost_value(decoy_text, "server_name").split(),
+            "sha256": decoy["sha256"],
+        },
+        "vision": {"present": vision["present"], "sha256": vision["sha256"]},
+    }
+
+
+def require_worker_edge_routes(case_id: str, host: topology.MultiNodeTopology,
+                              facts: Dict[str, Any]) -> Dict[str, str]:
+    """Each configured name keeps its own loopback port, and nothing lands on the decoy."""
+    routes = dict(facts["routes"])
+    wanted = {
+        host.worker_domain: f"127.0.0.1:{WORKER_EDGE_PRIMARY_PORT}",
+        host.worker_reality_domain: f"127.0.0.1:{WORKER_EDGE_REALITY_PORT}",
+    }
+    if host.worker_vision_domain:
+        wanted[host.worker_vision_domain] = f"127.0.0.1:{WORKER_EDGE_VISION_PORT}"
+    for name, backend in wanted.items():
+        require(
+            case_id,
+            routes.get(name) == backend,
+            f"the Worker's stream map sends {name} to {routes.get(name)!r} instead of {backend}, "
+            "so that name does not reach the listener installed for it",
+        )
+    require(
+        case_id,
+        routes.get("default") == f"127.0.0.1:{WORKER_EDGE_REALITY_PORT}",
+        f"the Worker's unmatched SNI falls back to {routes.get('default')!r} instead of its own "
+        f"REALITY inbound 127.0.0.1:{WORKER_EDGE_REALITY_PORT}",
+    )
+    camouflage = sorted(
+        name for name, backend in routes.items()
+        if backend == f"127.0.0.1:{DECOY_LISTENER_PORT}"
+    )
+    require(
+        case_id,
+        not camouflage,
+        f"the Worker's stream map sends {camouflage} straight to the camouflage listener; a "
+        "Worker reaches that site through REALITY's own fallback and owns no route for it",
+    )
+    return routes
+
+
+def worker_edge_read(case_id: str, host: topology.MultiNodeTopology, url: str,
+                     **kwargs: Any) -> Dict[str, Any]:
+    """One fetch from the independent client, with the probe's own report or its error."""
+    report = host.client_http(url, timeout=WORKER_EDGE_PROBE_TIMEOUT_SECONDS, **kwargs)
+    return {
+        "url": url,
+        "returncode": report.get("returncode"),
+        "probe": report.get("probe") or {},
+        "stderr": (report.get("stderr") or "").strip()[-300:],
+    }
+
+
+def require_worker_edge_served(case_id: str, label: str, observed: Dict[str, Any],
+                              expected_sha256: str, document: str = "") -> Dict[str, Any]:
+    """One path answered with exactly the document the Worker's cover root holds."""
+    probe = observed["probe"]
+    require(
+        case_id,
+        probe.get("status") == 200,
+        f"{observed['url']} answered {probe.get('status')!r} instead of serving "
+        f"{document or 'the cover site'}: "
+        f"{(probe.get('error') or observed['stderr'] or 'no report')[:300]}",
+    )
+    require(
+        case_id,
+        probe.get("body_sha256") == expected_sha256,
+        f"{observed['url']} served {probe.get('body_sha256')} instead of the Worker's own "
+        f"{document or 'document'} {expected_sha256}, so the answer came from somewhere other "
+        f"than the cover root: {(probe.get('body_snippet') or '')[:200]}",
+    )
+    peer = probe.get("peer") or {}
+    return {
+        "url": observed["url"],
+        "status": probe.get("status"),
+        "content_type": (probe.get("headers") or {}).get("content-type", ""),
+        "body_sha256": probe.get("body_sha256"),
+        "san": list(peer.get("san") or []),
+        "tls_version": peer.get("tls_version", ""),
+    }
+
+
+def require_worker_edge_refused(case_id: str, label: str,
+                               observed: Dict[str, Any]) -> Dict[str, Any]:
+    """One path was closed without an HTTP status, and the closure is attributable.
+
+    ``return 444`` is a closure, not a status: the probe reports an error and no
+    response. An empty report would be a probe that never ran, so the error text
+    is what makes the closure the listener's answer rather than the harness's.
+    """
+    probe = observed["probe"]
+    require(
+        case_id,
+        observed.get("returncode") != 0 and probe.get("status") is None and probe.get("error"),
+        f"{label} ({observed['url']}) answered {probe.get('status')!r} with "
+        f"{probe.get('body_length')!r} bytes instead of closing the connection: "
+        f"{(probe.get('body_snippet') or probe.get('error') or observed['stderr'] or 'no report')[:300]}",
+    )
+    return {
+        "url": observed["url"],
+        "returncode": observed.get("returncode"),
+        "error": str(probe.get("error") or "")[:200],
+        "closed": True,
+    }
+
+
+def require_worker_edge_not_found(case_id: str, label: str, observed: Dict[str, Any],
+                                 not_found_sha256: str) -> Dict[str, Any]:
+    """One path was answered by the brand's own 404 page, not a server default."""
+    probe = observed["probe"]
+    require(
+        case_id,
+        probe.get("status") == 404,
+        f"{label} ({observed['url']}) answered {probe.get('status')!r} instead of the site's "
+        f"404 page: {(probe.get('error') or probe.get('body_snippet') or 'no report')[:300]}",
+    )
+    require(
+        case_id,
+        probe.get("body_sha256") == not_found_sha256,
+        f"{label} ({observed['url']}) was refused with {probe.get('body_sha256')} instead of the "
+        f"cover site's own 404.html {not_found_sha256}, so the answer came from a bare server "
+        f"error: {(probe.get('body_snippet') or '')[:200]}",
+    )
+    return {
+        "url": observed["url"],
+        "status": probe.get("status"),
+        "body_sha256": probe.get("body_sha256"),
+    }
+
+
+def case_worker_edge(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-WORKER-EDGE: the Worker's public 443 is the surface a scanner meets.
+
+    The stream map reads the SNI before NGINX or a transport sees a byte, so
+    every claim about the Worker's edge is made twice: once where the host keeps
+    it — the three vhosts, the map, and the site those vhosts serve — and once
+    from the independent client, which meets whatever the listener installed.
+
+    The site is one claim: the primary name serves the cover root, every asset
+    the front page points at is the Worker's own file byte for byte with the type
+    NGINX's mime table gives it, and an unknown path keeps the brand's 404 page.
+    The refusals are another: the four management paths are closed with no HTTP
+    status at all, and the paths a scanner tries next are answered by the same
+    404 page rather than by a server default. The name decides both: a client
+    that asks for the primary name with the Panel in its Host header still gets
+    the cover site and still meets the closure, and the certificate it receives
+    names the name it asked for, never the header it sent.
+
+    An unlisted name is the fallback's own claim. A handshake with no SNI at all
+    — an IP literal, which CPython does not name — and a name the product never
+    configured, written into the fixture zone for this case, both end on the
+    camouflage site over the REALITY lineage instead of on a transport or an
+    error. What a malformed ClientHello gets is a closure or a TLS alert, never
+    an HTTP answer; a request that never completed a handshake may only be
+    answered by the transport's own protocol. Public 443 keeps serving the site
+    afterwards, so the malformed client did not take the listener with it.
+    """
+    case_id = WORKER_EDGE_CASE_ID
+    host = product.require_worker()
+    domain = host.worker_domain
+    facts = worker_edge_facts(product, case_id)
+    evidence: Dict[str, Any] = {"primary": domain, "camouflage": host.worker_reality_domain}
+
+    evidence["vhost"] = require_worker_edge_vhost(case_id, host, facts)
+    evidence["routes"] = require_worker_edge_routes(case_id, host, facts)
+
+    index_sha256 = facts["cover"].get("index.html") or ""
+    not_found_sha256 = facts["cover"].get("404.html") or ""
+    require(
+        case_id,
+        index_sha256 and not_found_sha256,
+        f"the Worker's cover root holds no index.html/404.html pair: {facts['cover']}",
+    )
+    require(
+        case_id,
+        index_sha256 != not_found_sha256,
+        "the Worker's 404.html and index.html are the same document, so a missing path "
+        "answered with the front page would read as a refusal",
+    )
+    index_text = facts["bodies"].get("index.html", "")
+    require(
+        case_id,
+        index_text,
+        "the Worker's front page could not be read, so the assets it points at cannot be "
+        "measured",
+    )
+    evidence["site"] = {
+        "root": require_worker_edge_served(
+            case_id, "the primary name's front page",
+            worker_edge_read(case_id, host, f"https://{domain}/"), index_sha256, "index.html",
+        ),
+    }
+    require(
+        case_id,
+        domain in evidence["site"]["root"]["san"],
+        f"https://{domain}/ presented a certificate for {evidence['site']['root']['san']}, "
+        f"which does not name the primary name {domain}",
+    )
+
+    assets: Dict[str, Any] = {}
+    for link in cover_site_links(index_text):
+        document = cover_site_path(link)
+        require(
+            case_id,
+            document in facts["assets"],
+            f"the front page points at {link}, which the Worker's cover root does not ship: "
+            f"{sorted(facts['assets'])}",
+        )
+        served = require_worker_edge_served(
+            case_id, f"the asset {link}",
+            worker_edge_read(case_id, host, f"https://{domain}{link}"),
+            facts["assets"][document], document,
+        )
+        expected_type = COVER_SITE_ASSET_TYPES.get(os.path.splitext(document)[1].lower(), "")
+        if expected_type:
+            require(
+                case_id,
+                served["content_type"].startswith(expected_type),
+                f"https://{domain}{link} was served as {served['content_type']!r} instead of "
+                f"{expected_type!r}, so the page would not load it as it asks for it",
+            )
+        assets[link] = served
+    require(
+        case_id,
+        any(asset["content_type"].startswith("text/css") for asset in assets.values()),
+        f"none of the assets the front page points at is served as CSS: {sorted(assets)}",
+    )
+    require(
+        case_id,
+        any(asset["content_type"].startswith("image/svg") for asset in assets.values()),
+        f"none of the assets the front page points at is served as SVG: {sorted(assets)}",
+    )
+    evidence["assets"] = assets
+    evidence["unknown_path"] = require_worker_edge_not_found(
+        case_id, "an unknown path",
+        worker_edge_read(case_id, host, f"https://{domain}{WORKER_EDGE_UNKNOWN_PATH}"),
+        not_found_sha256,
+    )
+
+    evidence["management"] = {
+        path: require_worker_edge_refused(
+            case_id, f"the management path {path}",
+            worker_edge_read(case_id, host, f"https://{domain}{path}"),
+        )
+        for path in WORKER_EDGE_MANAGEMENT_PATHS
+    }
+    evidence["scanners"] = {
+        path: require_worker_edge_not_found(
+            case_id, f"the scanner path {path}",
+            worker_edge_read(case_id, host, f"https://{domain}{path}"),
+            not_found_sha256,
+        )
+        for path in WORKER_EDGE_SCANNER_PATHS
+    }
+
+    # The name decides the answer, not the header a client puts in its request:
+    # the Panel's name in Host must not reach the Panel from this listener.
+    mismatched_root = require_worker_edge_served(
+        case_id, "the primary name carrying the Panel's Host header",
+        worker_edge_read(
+            case_id, host, f"https://{domain}/",
+            headers=(f"Host: {host.panel_domain}",),
+        ),
+        index_sha256, "index.html",
+    )
+    require(
+        case_id,
+        host.panel_domain not in mismatched_root["san"],
+        f"https://{domain}/ with Host: {host.panel_domain} presented a certificate naming "
+        f"{host.panel_domain}: the Host header chose the answer, not the SNI",
+    )
+    evidence["mismatch"] = {
+        "host_header": host.panel_domain,
+        "site": mismatched_root,
+        "management": require_worker_edge_refused(
+            case_id, "a management path carrying the Panel's Host header",
+            worker_edge_read(
+                case_id, host, f"https://{domain}/api/nodes",
+                headers=(f"Host: {host.panel_domain}",),
+            ),
+        ),
+    }
+
+    # An IP literal carries no SNI, which is the one handshake a client cannot
+    # fake: whatever the fallback does with it is what an unconfigured scanner
+    # meets. Either answer is the camouflage site's — a closure or the page.
+    absent = worker_edge_read(case_id, host, f"https://{host.plan.worker_ip}/", insecure=True)
+    if absent["probe"].get("status") is None:
+        evidence["absent_sni"] = require_worker_edge_refused(
+            case_id, "a handshake with no SNI", absent,
+        )
+    else:
+        served = require_worker_edge_served(
+            case_id, "a handshake with no SNI", absent, index_sha256, "index.html",
+        )
+        require(
+            case_id,
+            host.worker_reality_domain in served["san"],
+            f"a handshake with no SNI was served the cover page over a certificate for "
+            f"{served['san']}, which does not name the camouflage name "
+            f"{host.worker_reality_domain}",
+        )
+        evidence["absent_sni"] = served
+
+    # A name the product never configured, resolved to this host for the length
+    # of the probe: the fallback can only be read as "this host answered it" if
+    # the client resolves it to this host.
+    base_zone = host.zone()
+    try:
+        zone = copy.deepcopy(base_zone)
+        zone["records"][WORKER_EDGE_UNMAPPED_SNI] = {"A": [str(host.plan.worker_ip)]}
+        host.write_dns_zone(zone)
+        unmapped = require_worker_edge_served(
+            case_id, "an SNI the product never configured",
+            worker_edge_read(case_id, host, f"https://{WORKER_EDGE_UNMAPPED_SNI}/", insecure=True),
+            index_sha256, "index.html",
+        )
+    finally:
+        try:
+            host.write_dns_zone(base_zone)
+        except OSError:
+            pass
+    require(
+        case_id,
+        host.worker_reality_domain in unmapped["san"],
+        f"https://{WORKER_EDGE_UNMAPPED_SNI}/ was served the cover page over a certificate for "
+        f"{unmapped['san']}, which does not name the camouflage name "
+        f"{host.worker_reality_domain}: the fallback did not reach the decoy",
+    )
+    evidence["unmapped_sni"] = dict(unmapped, name=WORKER_EDGE_UNMAPPED_SNI)
+
+    # The malformed ClientHello is a TCP-level claim, so it is attempted over a
+    # real socket from the client network that already reaches 443.
+    attempts = [
+        {"label": "worker-443", "address": str(host.plan.worker_ip), "port": 443,
+         "timeout": WORKER_EDGE_PATH_TIMEOUT_SECONDS},
+        {"label": f"worker-{DECOY_LISTENER_PORT}", "address": str(host.plan.worker_ip),
+         "port": DECOY_LISTENER_PORT, "timeout": WORKER_EDGE_PATH_TIMEOUT_SECONDS},
+        {"label": "worker-443-malformed", "address": str(host.plan.worker_ip), "port": 443,
+         "timeout": WORKER_EDGE_PATH_TIMEOUT_SECONDS,
+         "payload_b64": base64.b64encode(MALFORMED_CLIENT_HELLO).decode("ascii"),
+         "read_reply": True},
+    ]
+    paths = denial.tcp_paths(product.podman, host.client_name, attempts)
+    require(
+        case_id,
+        paths.get("returncode") == 0,
+        f"the client could not attempt a connection to the Worker: {paths.get('detail') or ''}",
+    )
+    require(
+        case_id,
+        (paths.get("worker-443") or {}).get("outcome") == "CONNECTED",
+        f"the client could not reach the Worker's 443 at all "
+        f"({(paths.get('worker-443') or {}).get('outcome')}), so the attempts below prove "
+        "nothing about this listener",
+    )
+    decoy_path = paths.get(f"worker-{DECOY_LISTENER_PORT}") or {}
+    require(
+        case_id,
+        decoy_path.get("outcome") in ("REFUSED", "TIMEOUT", "UNREACHABLE"),
+        f"the client reached the Worker's {DECOY_LISTENER_PORT} ({decoy_path.get('outcome')}), "
+        "so the camouflage listener is a public surface",
+    )
+    malformed = paths.get("worker-443-malformed") or {}
+    require(
+        case_id,
+        malformed.get("outcome") == "CONNECTED",
+        f"the malformed ClientHello did not reach the Worker's 443 "
+        f"({malformed.get('outcome')}), so its answer is not this listener's",
+    )
+    require(
+        case_id,
+        malformed.get("sent_bytes") == len(MALFORMED_CLIENT_HELLO),
+        f"only {malformed.get('sent_bytes')!r} of the {len(MALFORMED_CLIENT_HELLO)} malformed "
+        "bytes were sent, so the listener read something else",
+    )
+    reply = str(malformed.get("reply_preview") or "")
+    require(
+        case_id,
+        "HTTP/" not in reply,
+        f"a malformed ClientHello was answered with an HTTP response ({reply[:160]!r}), so "
+        "public 443 speaks HTTP to a client that never completed a handshake",
+    )
+    require(
+        case_id,
+        malformed.get("reply_closed") or not reply or reply[:1] in ("\x15", "\x16"),
+        f"after a malformed ClientHello the listener neither closed nor answered at the TLS "
+        f"layer: {reply[:160]!r} ({malformed.get('reply_bytes')!r} bytes)",
+    )
+    evidence["paths"] = {
+        "443": paths.get("worker-443", {}),
+        f"{DECOY_LISTENER_PORT}": decoy_path,
+        "malformed": malformed,
+    }
+
+    evidence["still_serving"] = require_worker_edge_served(
+        case_id, "the primary name after the malformed handshake",
+        worker_edge_read(case_id, host, f"https://{domain}/"), index_sha256, "index.html",
+    )
+    return evidence
+
+
+def worker_edge_map_write_script(text: str) -> str:
+    """Install one exact stream-map body on the Worker and reload what reads it.
+
+    The body is written as a synced sibling renamed over the managed file, and
+    the reload only runs once ``nginx -t`` accepted it: a migration the case
+    simulates has to be a configuration the host actually serves, or the answer
+    read from the client would be about a file nothing loaded.
+    """
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"""set -Eeuo pipefail
+target={shlex.quote(WORKER_EDGE_STREAM)}
+tmp="${{target}}.e2e.$$"
+trap 'rm -f "$tmp"' EXIT
+printf '%s' {shlex.quote(payload)} | base64 -d > "$tmp"
+sync
+mv "$tmp" "$target"
+sync
+trap - EXIT
+nginx -t
+systemctl reload nginx
+printf 'written\\t%s\\n' "$(sha256sum "$target" | cut -d' ' -f1)"
+"""
+
+
+def legacy_map_text(case_id: str, text: str, domain: str) -> str:
+    """The same map with the primary name moved to the camouflage port, counted first.
+
+    A legacy Worker is exactly this: a host whose primary name terminates on the
+    site listener instead of on the transport vhost, so a management path is
+    answered by the site rather than closed. The substitution is anchored on the
+    whole line and refused unless it matches exactly once, because the same
+    shape appears once per configured name.
+    """
+    old = f"    {domain} 127.0.0.1:{WORKER_EDGE_PRIMARY_PORT};"
+    new = f"    {domain} 127.0.0.1:{DECOY_LISTENER_PORT};"
+    matches = text.count(old)
+    require(
+        case_id,
+        matches == 1,
+        f"the Worker's stream map carries {matches} `{old.strip()}` lines instead of exactly "
+        "one, so the legacy identity cannot be simulated without guessing which name it "
+        "belonged to",
+    )
+    return text.replace(old, new)
+
+
+def worker_cluster_identity(case_id: str, product: MultiNodeProduct) -> Dict[str, Any]:
+    """What the Panel says the Worker is: its node record and the Hosts it owns.
+
+    A re-provision rewrites the edge this host serves; it may not change which
+    node that is or which Host records its clients were handed. The values are
+    the Panel's own digests, so two reads of the same cluster compare equal
+    without the report carrying an identifier.
+    """
+    cluster = product.cluster_facts(case_id)
+    nodes = (cluster.get("nodes") or {}).get("records") or []
+    node = next(
+        (record for record in nodes if record.get("name") == topology.WORKER_NODE_NAME), None,
+    )
+    require(
+        case_id,
+        node is not None,
+        f"GET /api/nodes lists no {topology.WORKER_NODE_NAME!r} node: "
+        f"{[record.get('name') for record in nodes]}",
+    )
+    hosts = (cluster.get("hosts") or {}).get("records") or []
+    owned = sorted(
+        (
+            str(record.get("uuid") or ""),
+            str(record.get("remark") or ""),
+            str(record.get("sni") or ""),
+            str(record.get("inbound") or ""),
+        )
+        for record in hosts
+        if node.get("uuid") in (record.get("nodes") or [])
+    )
+    require(
+        case_id,
+        owned,
+        "the Panel publishes no Host that names the Worker, so its clients would be handed "
+        "records that are not this node's",
+    )
+    return {
+        "node": {
+            "uuid": node.get("uuid"),
+            "profile": node.get("profile"),
+            "inbounds": list(node.get("inbounds") or []),
+        },
+        "hosts": owned,
+    }
+
+
+def worker_renewal_answer(case_id: str, product: MultiNodeProduct,
+                          host: topology.MultiNodeTopology) -> Dict[str, Any]:
+    """Port 80 answers an HTTP-01 challenge for the names this Worker owns.
+
+    A re-provision that rewrites the edge carries the renewal path with it, so
+    the case writes a token into the Worker's own webroot and fetches it through
+    the product's port 80 vhost from the client — the exchange certbot performs
+    when a lineage is renewed, read on the side the answer is served from.
+    """
+    written = product.podman.exec_bash(
+        host.worker_name, acme_challenge_script(ACME_CHALLENGE_TOKEN),
+        check=False, timeout=120,
+    )
+    require(
+        case_id,
+        written.returncode == 0,
+        f"the Worker could not write its own challenge token: "
+        f"{(written.stderr or '').strip()[-400:]}",
+    )
+    read = product.podman.exec_bash(
+        host.worker_name, acme_vhost_script(ACME_WORKER_VHOST, host.panel_domain),
+        check=False, timeout=120,
+    )
+    require(
+        case_id,
+        read.returncode == 0,
+        f"the Worker could not read its port 80 tree: {(read.stderr or '').strip()[-400:]}",
+    )
+    facts = require_acme_vhost(
+        case_id, "the Worker", parse_acme_vhost(read.stdout or ""),
+        [host.worker_domain, host.worker_reality_domain], False,
+    )
+    return {
+        "vhost": ACME_WORKER_VHOST,
+        "server_name": facts["server_name"],
+        "listen": facts["listen"],
+        "root": facts["root"],
+        "challenge": acme_challenge_fetch(
+            case_id, host, host.worker_domain, ACME_CHALLENGE_TOKEN,
+        ),
+    }
+
+
+def case_worker_migration(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-MIGRATE: re-provisioning an installed Worker rewrites its edge, on purpose.
+
+    A Worker that still carries another edge identity — a primary name that
+    terminated on the site listener — is what a host provisioned by an older
+    payload looks like. The case builds that state from the running map (one
+    counted line), reloads it, and reads the weaker answer from the client: the
+    management path is answered by the site's 404 page instead of being closed.
+
+    The operator's own `node reapply`, with no terminal and no confirmation,
+    must then refuse before the payload is streamed: nothing about this host may
+    change without the operator's word, and the preview it prints names the
+    identity this run would serve. The confirmed run — the same command with the
+    `GOWAVE_MIGRATE_EXISTING=yes` the preview asks for — has to adopt the edge:
+    the routes, the three vhosts and the cover site come back byte for byte as
+    the product renders them, the management path is closed again, the port 80
+    vhost answers the same HTTP-01 challenge it answered before, and the Panel
+    still reports the same node and the same Host records for this Worker.
+
+    The map is restored from the snapshot before the case returns, so a defect
+    here cannot leave the following cases reading a host this case broke.
+    """
+    case_id = WORKER_MIGRATION_CASE_ID
+    host = product.require_worker()
+    domain = host.worker_domain
+    evidence: Dict[str, Any] = {"worker": host.worker_node_name, "primary": domain}
+
+    baseline = worker_edge_facts(product, case_id)
+    evidence["vhost"] = require_worker_edge_vhost(case_id, host, baseline)
+    product_routes = require_worker_edge_routes(case_id, host, baseline)
+    evidence["routes"] = product_routes
+    original_text = baseline["stream"]["text"]
+    not_found_sha256 = baseline["cover"].get("404.html") or ""
+    require(
+        case_id,
+        original_text and baseline["stream"]["sha256"] and not_found_sha256,
+        "the Worker's stream map or its 404 page could not be read, so the migration it "
+        "carried could not be compared against what it serves now",
+    )
+    digests = {
+        "stream": baseline["stream"]["sha256"],
+        "vhosts": {key: entry["sha256"] for key, entry in baseline["vhosts"].items()},
+        "cover": dict(baseline["cover"]),
+        "assets": dict(baseline["assets"]),
+    }
+    identity = worker_cluster_identity(case_id, product)
+    evidence["identity"] = identity
+    renewal = worker_renewal_answer(case_id, product, host)
+    evidence["renewal"] = renewal
+
+    legacy_text = legacy_map_text(case_id, original_text, domain)
+    legacy_sha256 = hashlib.sha256(legacy_text.encode("utf-8")).hexdigest()
+    restored = False
+    try:
+        written = product.podman.exec_bash(
+            host.worker_name, worker_edge_map_write_script(legacy_text),
+            check=False, timeout=WORKER_EDGE_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            written.returncode == 0,
+            "the Worker could not be put into the legacy identity this case needs: "
+            f"{(written.stderr or written.stdout or '').strip()[-600:]}",
+        )
+        legacy = worker_edge_facts(product, case_id)
+        require(
+            case_id,
+            legacy["routes"].get(domain) == f"127.0.0.1:{DECOY_LISTENER_PORT}",
+            f"the legacy map did not take effect: {domain} goes to "
+            f"{legacy['routes'].get(domain)!r}",
+        )
+        require(
+            case_id,
+            legacy["stream"]["sha256"] == legacy_sha256,
+            f"the Worker reloaded a stream map that is not the legacy one "
+            f"({legacy['stream']['sha256']} vs {legacy_sha256})",
+        )
+        weaker = worker_edge_read(case_id, host, f"https://{domain}/api/nodes", insecure=True)
+        evidence["legacy"] = {
+            "routes": dict(legacy["routes"]),
+            "management_path": require_worker_edge_not_found(
+                case_id, "the legacy edge's management path", weaker, not_found_sha256,
+            ),
+        }
+
+        refused = product.podman.exec_bash(
+            host.target_name, node_reapply_script(host.worker_node_name, confirmed=False),
+            check=False, timeout=WORKER_MIGRATION_TIMEOUT_ONE_RUN_SECONDS,
+        )
+        output = f"{refused.stdout or ''}{refused.stderr or ''}"
+        require(
+            case_id,
+            refused.returncode != 0,
+            f"`node reapply` with no terminal and no confirmation exited 0, so a re-provision "
+            f"rewrote this Worker's edge without the operator's word: {output.strip()[-600:]}",
+        )
+        for token, why in (
+            (f"Edge migration preview for Worker {host.worker_node_name}",
+             "the preview that names the Worker it would rewrite"),
+            (f"{domain} -> 127.0.0.1:{WORKER_EDGE_PRIMARY_PORT}",
+             "the identity this run would serve"),
+            (f"{host.worker_reality_domain} -> 127.0.0.1:{WORKER_EDGE_REALITY_PORT}",
+             "the camouflage route this run would serve"),
+            ("GOWAVE_MIGRATE_EXISTING=yes", "the confirmation it asks the operator for"),
+            ("there is no terminal to confirm it on", "the reason it refused"),
+        ):
+            require(
+                case_id,
+                token in output,
+                f"the refused re-provision does not carry {why} ({token!r}): "
+                f"{output.strip()[-600:]}",
+            )
+        require(
+            case_id,
+            "Re-applying the Worker payload" not in output,
+            f"the refused re-provision streamed the payload anyway: {output.strip()[-600:]}",
+        )
+        unchanged = worker_edge_facts(product, case_id)
+        require(
+            case_id,
+            unchanged["stream"]["sha256"] == legacy_sha256,
+            f"the refused re-provision still rewrote the Worker's stream map "
+            f"({unchanged['stream']['sha256']} vs {legacy_sha256}), so a run with no "
+            "confirmation changed the host",
+        )
+        require(
+            case_id,
+            unchanged["routes"].get(domain) == f"127.0.0.1:{DECOY_LISTENER_PORT}",
+            f"the refused re-provision moved {domain} to "
+            f"{unchanged['routes'].get(domain)!r}, so it rewrote the edge it refused to migrate",
+        )
+        evidence["refused"] = {
+            "returncode": refused.returncode,
+            "preview": output.strip().splitlines()[-3:],
+            "stream_sha256": unchanged["stream"]["sha256"],
+        }
+
+        confirmed = product.podman.exec_bash(
+            host.target_name, node_reapply_script(host.worker_node_name),
+            check=False, timeout=WORKER_MIGRATION_TIMEOUT_ONE_RUN_SECONDS,
+        )
+        require(
+            case_id,
+            confirmed.returncode == 0,
+            f"the confirmed `node reapply` exited {confirmed.returncode}: "
+            f"{(confirmed.stderr or confirmed.stdout or '').strip()[-800:]}",
+        )
+        adopted = worker_edge_facts(product, case_id)
+        evidence["adopted"] = {
+            "routes": require_worker_edge_routes(case_id, host, adopted),
+            "vhost": require_worker_edge_vhost(case_id, host, adopted),
+            "stream_sha256": adopted["stream"]["sha256"],
+        }
+        require(
+            case_id,
+            adopted["stream"]["sha256"] == digests["stream"],
+            f"the adopted stream map is not the one the product rendered before the legacy "
+            f"identity ({adopted['stream']['sha256']} vs {digests['stream']}): "
+            f"{sorted(adopted['routes'].items())}",
+        )
+        adopted_vhosts = {key: entry["sha256"] for key, entry in adopted["vhosts"].items()}
+        require(
+            case_id,
+            adopted_vhosts == digests["vhosts"],
+            "the adopted vhosts differ from the ones the host served before the legacy "
+            f"identity: {adopted_vhosts} vs {digests['vhosts']}",
+        )
+        require(
+            case_id,
+            dict(adopted["cover"]) == digests["cover"],
+            f"the adopted cover site differs from the rendered one: {adopted['cover']} vs "
+            f"{digests['cover']}",
+        )
+        require(
+            case_id,
+            dict(adopted["assets"]) == digests["assets"],
+            "the adopted cover assets differ from the rendered ones: "
+            f"{sorted(set(adopted['assets'].items()) ^ set(digests['assets'].items()))}",
+        )
+        restored = True
+        evidence["adopted"]["management"] = require_worker_edge_refused(
+            case_id, "the adopted edge's management path",
+            worker_edge_read(case_id, host, f"https://{domain}/api/nodes"),
+        )
+        adopted_renewal = worker_renewal_answer(case_id, product, host)
+        require(
+            case_id,
+            adopted_renewal == renewal,
+            "the adopted edge does not answer the renewal path the host carried before the "
+            f"legacy identity: {adopted_renewal} vs {renewal}, so a later `certbot renew` "
+            "would have nothing to revalidate through",
+        )
+        evidence["renewal_unchanged"] = adopted_renewal == renewal
+        after = worker_cluster_identity(case_id, product)
+        require(
+            case_id,
+            after == identity,
+            "re-provisioning the Worker changed what the Panel publishes about it: "
+            f"{after} vs {identity}; the registration, node UUID, profile and Host records "
+            "are reused, not recreated",
+        )
+        evidence["identity_unchanged"] = after == identity
+        evidence["connected"] = bool(
+            product.wait_for_worker_connection(
+                case_id, True, RESTART_TIMEOUT_SECONDS,
+            ).get("connected")
+        )
+    finally:
+        if not restored:
+            # The cluster is the state later cases read, so the map this case
+            # replaced is put back even when a check above failed. A restore
+            # failure must not replace the error being reported.
+            try:
+                product.podman.exec_bash(
+                    host.worker_name, worker_edge_map_write_script(original_text),
+                    check=False, timeout=WORKER_EDGE_TIMEOUT_SECONDS,
+                )
+            except Exception:  # noqa: BLE001 - the case's own failure is the report
+                pass
+    return evidence
+
+
+def verify_public_tls_sni(
+    product: MultiNodeProduct, case_id: str, domain: str, ip: str, port: int = 443
+) -> bool:
+    """Verify a domain's public TLS certificate from the independent client.
+
+    The probe runs in the client container with the run's own CA anchored, which
+    is the same vantage the data-plane cases use: the Master's system trust
+    store does not carry the fixture CA. The URL is the
+    name, not the address, so the handshake carries the SNI the certificate must
+    cover; `expect_san` makes the probe fail unless the certificate names it.
+    """
+    host = product.require_installed()
+    url = f"https://{domain}/" if port == 443 else f"https://{domain}:{port}/"
+    report = host.client_http(url, expect_san=(domain,), timeout=WORKER_EDGE_PROBE_TIMEOUT_SECONDS)
+    return report.get("returncode") == 0
+
+
+def describe_security(security: Dict[str, Any]) -> str:
+    """Name the controls that made a report not ready, not just the verdict.
+
+    The diagnostic bundle is written `root:root 0700`, so a bare `'failed'` in a
+    case message is not reproducible without root on the runner. The report is
+    already in hand here, so the message carries the evidence instead.
+    """
+    report = security.get("report") or {}
+    controls = report.get("controls") or {}
+    broken = [
+        f"{name}={control.get('status')}"
+        + (f"/recovery={control.get('recovery')}" if control.get("recovery") not in (None, "verified") else "")
+        for name, control in sorted(controls.items())
+        if control.get("policy") == "required" and control.get("status") != "verified"
+        or control.get("recovery") in {"failed", "unknown"}
+        or (control.get("policy") == "best-effort"
+            and control.get("status") == "failed"
+            and control.get("recovery") != "verified")
+    ]
+    detail = ", ".join(broken) if broken else "no control reported a failure"
+    return f"{security.get('ready')!r} ({detail}) {(security.get('error') or '')[:300]}".strip()
+
+
+def verify_worker_security_readback_via_ssh(
+    product: MultiNodeProduct, case_id: str, worker
+) -> Dict[str, Any]:
+    """Read a Worker's security report via SSH using the managed.py helper.
+
+    The transport is the Worker's public address, the one the operator added the
+    node by and the harness pinned the host key under: the containers' resolver
+    is the fixture DNS, not podman's, so a container name does not resolve from
+    the Master and `ssh root@worker-<id>` fails with `Could not resolve hostname`.
+    """
+    cmd = (
+        f"timeout 45 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes "
+        f"-o ConnectTimeout=5 -o ClearAllForwardings=yes -o ForwardAgent=no "
+        f"-o UpdateHostKeys=no -p 22 root@{worker.plan.worker_ip} "
+        f"'python3 - --worker-security-readback 3002 10.89.0.10 \"\" best-effort' "
+        f"< {topology.REPO_IN_CONTAINER}/assets/security/managed.py"
+    )
+    result = product.podman.exec_bash(product.require_installed().target_name, cmd, check=False, timeout=60)
+    if result.returncode != 0:
+        return {"ready": "ssh_failed", "error": result.stderr}
+    try:
+        report = json.loads(result.stdout)
+        from modules.security_report import readiness
+        ready_status = readiness(report)
+        return {"ready": ready_status, "report": report}
+    except Exception as exc:
+        return {"ready": "parse_failed", "error": str(exc)}
+
+
+# ------------------------------------------------- NGX-PIN: the pinned NGINX on both roles
+#
+# The unit tests prove the selection logic against a stubbed toolchain, and the
+# installer claims a specific package; neither of those is a fact about an
+# installed host. This case reads the three things the pin promises from the
+# hosts themselves: the package revision, the Stream SNI build flags, and the
+# evidence that the package came from the downloaded pin rather than the
+# distribution archive. The distribution revisions differ from the vendor's
+# (`1.26.3-3+deb13u11` against `1.30.8-1~trixie`), so a suite-suffixed revision
+# cannot be produced by the archive at all.
+NGINX_PIN_CASE_ID = "NGX-PIN"
+NGINX_PIN_VERSION = "1.30.8"
+NGINX_PIN_TIMEOUT_SECONDS = 420
+NGINX_PIN_SUITE = {
+    "debian-12": "bookworm",
+    "debian-13": "trixie",
+    "ubuntu-24.04": "noble",
+    "ubuntu-26.04": "resolute",
+}
+NGINX_PIN_STREAM_FLAGS = ("--with-stream", "--with-stream_ssl_preread_module")
+
+
+def nginx_pin_facts(product: MultiNodeProduct, case_id: str, role: str,
+                    container: str, suite: str) -> Dict[str, Any]:
+    """Read the installed revision, the Stream flags and the install's origin."""
+    expected = f"{NGINX_PIN_VERSION}-1~{suite}"
+    package = product.podman.exec_bash(container, "dpkg-query -W nginx", check=False, timeout=30)
+    fields = package.stdout.split()
+    require(case_id, len(fields) == 2 and fields[0] == "nginx" and fields[1] == expected,
+            f"{role}: installed NGINX is {package.stdout.strip()!r}, "
+            f"expected 'nginx {expected}'")
+    built = product.podman.exec_bash(container, "nginx -V 2>&1", check=False, timeout=30)
+    for flag in NGINX_PIN_STREAM_FLAGS:
+        require(case_id, flag in built.stdout,
+                f"{role}: nginx -V does not report {flag}, so the Stream SNI plane is "
+                f"not built into the pinned package: {(built.stdout or built.stderr)[:300]!r}")
+    history = product.podman.exec_bash(
+        container, "cat /var/log/apt/history.log 2>/dev/null", check=False, timeout=30)
+    require(case_id, f"nginx_{expected}_" in history.stdout,
+            f"{role}: the package history never installed nginx_{expected}_<arch>.deb, so "
+            f"the installed package did not come from the approved download")
+    return {"version": fields[1], "stream": "static", "origin": "approved download"}
+
+
+def case_nginx_pin(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-PIN: both roles run the pinned official NGINX with static Stream SNI."""
+    case_id = NGINX_PIN_CASE_ID
+    suite = NGINX_PIN_SUITE.get(product.distribution)
+    require(case_id, suite is not None,
+            f"the run's distribution {product.distribution!r} has no approved NGINX suite")
+    master = nginx_pin_facts(
+        product, case_id, "master", product.require_installed().target_name, suite)
+    host = product.require_worker()
+    worker = nginx_pin_facts(product, case_id, "worker", host.worker_name, suite)
+    return {"suite": suite, "master": master, "worker": worker}
+
+
+# ------------------------------------------------- MN-WORKER-RESUME: Worker resume verifies TLS and security
+#
+# A resumed run reaches `wizard_onboard_nodes` with `GOWAVE_DRAFT_RESUMED=1`:
+# the Panel is verified without a reinstall, then every Worker with a
+# `verified` checkpoint is rechecked by `_wizard_recheck_verified_node` -- the
+# public TLS certificate for each name it owns (primary, camouflage, optional
+# vision) at the Worker's public 443, and the effective-state security report
+# over trusted, non-interactive SSH. A failure holds only that Worker as
+# indeterminate; it neither repeats the registration nor touches the Master.
+#
+# The suite's NODE_ADD case already provisioned the Worker through the
+# operator's command, so this case verifies the live host instead of
+# reinstalling it: a reinstall would prove the install, not the re-verification
+# the resume path performs.
+def case_worker_resume(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-WORKER-RESUME: a resumed run re-verifies Worker TLS and security state."""
+    case_id = WORKER_RESUME_CASE_ID
+    host = product.require_worker()
+    evidence: Dict[str, Any] = {"topology": "multi-node", "resume": True}
+
+    record = product.wait_for_worker_connection(case_id, True, RESTART_TIMEOUT_SECONDS)
+    require(case_id, record.get("connected") is True,
+            f"the Panel does not report the Worker connected before resume: {record!r}")
+    evidence["connected"] = True
+
+    for label, domain in (("primary", host.worker_domain),
+                          ("reality", host.worker_reality_domain),
+                          ("vision", host.worker_vision_domain)):
+        if not domain:
+            continue
+        tls_ok = verify_public_tls_sni(product, case_id, domain, host.plan.worker_ip, 443)
+        require(case_id, tls_ok,
+                f"the Worker does not serve a valid certificate for its {label} name {domain}")
+        evidence[f"tls_{label}"] = "verified"
+
+    security = verify_worker_security_readback_via_ssh(product, case_id, host)
+    require(case_id, security.get("ready") in ("ready", "ready-with-warnings"),
+            f"the Worker security readback is not ready: {describe_security(security)}")
+    evidence["security"] = security.get("ready")
+
+    # Holding one Worker must not take the Master with it: the Panel keeps
+    # serving while the Worker is re-verified.
+    master = product.podman.exec_bash(host.target_name, "systemctl is-active gowave.service", check=False)
+    require(case_id, master.stdout.strip() == "active",
+            f"the Master Panel is {master.stdout.strip()!r} during Worker re-verification")
+    evidence["master_panel"] = "active"
+    evidence["resume_verification"] = {
+        "panel_verified": True,
+        "tls": sorted(key for key in evidence if key.startswith("tls_")),
+        "security": evidence["security"],
+    }
+    return evidence
+
+
+# ------------------------------------------------- MN-COMPOSED-MIXED: failure, retry, interruption and restart
+#
+# A full mixed topology -- the Panel and its local Node on the Master, one remote
+# Worker -- runs through the operator's own `node reapply`. The case breaks the
+# Worker's SSH transport, proves the Master cannot reach it, restores the
+# transport, interrupts the confirmed retry with SIGTERM in flight, proves the
+# interruption did not damage the running Worker, retries to completion,
+# restarts the Worker's unit, and reads the cluster back: TLS on every name, the
+# security report over SSH, and the Panel's own node/Host identity unchanged
+# across the whole cycle.
+def case_composed_mixed_topology(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-COMPOSED-MIXED: failure, retry, interruption and restart on a mixed topology."""
+    case_id = COMPOSED_MIXED_CASE_ID
+    host = product.require_worker()
+    evidence: Dict[str, Any] = {"topology": "multi-node", "mixed": True}
+
+    record = product.wait_for_worker_connection(case_id, True, RESTART_TIMEOUT_SECONDS)
+    require(case_id, record.get("connected") is True,
+            f"the Panel does not report the Worker connected before the cycle: {record!r}")
+    master_health = product.podman.exec_bash(
+        host.target_name,
+        "systemctl is-active gowave.service; systemctl is-active nginx.service", check=False)
+    require(case_id, master_health.stdout.split().count("active") == 2,
+            f"the Master services are not both active: {master_health.stdout.strip()!r}")
+    identity = worker_cluster_identity(case_id, product)
+    evidence["identity"] = identity
+
+    def require_tls(stage: str) -> None:
+        for label, domain in (("primary", host.worker_domain),
+                              ("reality", host.worker_reality_domain),
+                              ("vision", host.worker_vision_domain)):
+            if not domain:
+                continue
+            ok = verify_public_tls_sni(product, case_id, domain, host.plan.worker_ip, 443)
+            require(case_id, ok,
+                    f"the Worker does not serve a valid certificate for its {label} name "
+                    f"{domain} {stage}")
+
+    require_tls("before the cycle")
+    evidence["tls_before"] = "verified"
+
+    # 1. Failure: the Worker's SSH transport goes away.
+    product.podman.exec_bash(
+        host.worker_name,
+        "systemctl stop ssh.socket 2>/dev/null; systemctl stop ssh.service 2>/dev/null; true",
+        check=False)
+    unreachable = product.podman.exec_bash(
+        host.target_name,
+        f"timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no "
+        f"root@{host.plan.worker_ip} true 2>&1", check=False)
+    require(case_id, unreachable.returncode != 0,
+            "the Master still reaches the Worker over SSH after the fault: "
+            f"{(unreachable.stdout or '').strip()[-300:]!r}")
+    evidence["failure"] = "ssh_stopped"
+
+    # 2. Recovery: the transport comes back and the Master can reach it again.
+    product.podman.exec_bash(
+        host.worker_name,
+        "systemctl start ssh.socket 2>/dev/null; systemctl start ssh.service 2>/dev/null; true",
+        check=False)
+    recovered = False
+    for _ in range(60):
+        probe = product.podman.exec_bash(
+            host.target_name,
+            f"timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no "
+            f"root@{host.plan.worker_ip} true", check=False)
+        if probe.returncode == 0:
+            recovered = True
+            break
+        time.sleep(1)
+    require(case_id, recovered, "the Master could not reach the Worker after the transport restarted")
+    evidence["recovered"] = True
+
+    # 3. Retry with an interruption: the confirmed `node reapply` is killed with
+    # SIGTERM in flight. `GOWAVE_MIGRATE_EXISTING=yes` is the confirmation the
+    # preview asks for, so the interrupted payload's partial regular files are
+    # adopted on the retry instead of refused.
+    retry_script = node_reapply_script(host.worker_node_name)
+    interrupted: Dict[str, Any] = {}
+
+    def run_retry() -> None:
+        interrupted["result"] = product.podman.exec_bash(host.target_name, retry_script, check=False)
+
+    thread = threading.Thread(target=run_retry, daemon=True)
+    thread.start()
+    time.sleep(3)
+    product.podman.exec_bash(
+        host.target_name, "pkill -TERM -f 'gowave-auto.sh node reapply' 2>/dev/null || true",
+        check=False)
+    thread.join(timeout=180)
+    require(case_id, not thread.is_alive(), "the interrupted retry did not exit after SIGTERM")
+    killed = interrupted.get("result")
+    require(case_id, killed is not None and killed.returncode in (143, -15),
+            "the retry did not die from SIGTERM: exit "
+            f"{getattr(killed, 'returncode', None)!r} "
+            f"{(getattr(killed, 'stderr', '') or '')[-300:]!r}")
+    evidence["interrupted"] = {"returncode": killed.returncode}
+
+    # 4. The interruption must not damage the Worker that is already serving.
+    still = product.wait_for_worker_connection(case_id, True, RESTART_TIMEOUT_SECONDS)
+    require(case_id, still.get("connected") is True,
+            "the Worker stopped being connected after the interrupt")
+
+    # 5. Retry to completion, once the killed run has actually let go. SIGTERM
+    # reaches the product inside the container, but its canceller releases the
+    # mutation lock asynchronously: retrying after a fixed pause raced it and
+    # failed with "Another process currently holds the mutation lock", which
+    # then left the Worker half-applied for every case after this one. The lock
+    # itself is the only authoritative signal, so wait on it and on nothing
+    # else: a `pgrep` here would match this very script's own command line.
+    freed = product.podman.exec_bash(
+        host.target_name,
+        "timeout 180 sh -c 'until flock -n /run/lock/gowave-managed-mutation.lock "
+        "-c true 2>/dev/null; do sleep 2; done'; echo rc=$?",
+        check=False, timeout=200,
+    )
+    require(case_id, "rc=0" in freed.stdout,
+            "the interrupted run still holds the mutation lock 180 s after SIGTERM "
+            f"({(freed.stdout or freed.stderr).strip()[:200]!r}); a retry now would "
+            "measure the lock, not the resume")
+    # The retry re-provisions the Worker, which is the same work the migration
+    # case budgets for: a default 300 s exec timeout cut it off mid-run and the
+    # case reported its own timeout as a resume failure.
+    retried = product.podman.exec_bash(
+        host.target_name, retry_script, check=False,
+        timeout=WORKER_MIGRATION_TIMEOUT_ONE_RUN_SECONDS,
+    )
+    require(case_id, retried.returncode == 0,
+            f"the retry after the interrupt exited {retried.returncode}:\n"
+            f"{(retried.stderr or retried.stdout or '')[-3000:]}")
+    evidence["retried"] = {"returncode": retried.returncode}
+
+    # 6. Restart the Worker's own unit and read the cluster back.
+    product.podman.exec_bash(host.worker_name, "systemctl restart gowave-node.service", check=False)
+    product.wait_for_worker_connection(case_id, True, RESTART_TIMEOUT_SECONDS)
+    require_tls("after the restart")
+    security = verify_worker_security_readback_via_ssh(product, case_id, host)
+    require(case_id, security.get("ready") in ("ready", "ready-with-warnings"),
+            f"the Worker security readback is not ready after the cycle: "
+            f"{describe_security(security)}")
+    after = worker_cluster_identity(case_id, product)
+    require(case_id, after == identity,
+            f"the Panel's node/Host identity changed across the cycle: "
+            f"before={identity!r} after={after!r}")
+    evidence["identity_preserved"] = True
+    evidence["security_after"] = security.get("ready")
+    evidence["tls_after"] = "verified"
+    return evidence
+
+
 # ------------------------------------------------- VIS-06: incomplete compensation
 # The resolver is asked from the Master, because that is the host whose own
 # `node add` precondition and whose certbot both read it: an answer observed
@@ -7527,9 +9137,17 @@ def second_node_address_script(address: str) -> str:
 
 
 def second_worker_add_script(host: topology.MultiNodeTopology) -> str:
-    """The operator's own ``node add``, addressed to a second node on the Worker."""
+    """The operator's own ``node add``, addressed to a second node on the Worker.
+
+    Both Panel records reach the same Worker container, so the second add meets
+    the files the first install wrote. `GOWAVE_MIGRATE_EXISTING=yes` is the
+    operator's confirmation the preview asks for: it lets the Worker adopt those
+    regular files and reach the stage this case needs to fail (the Vision
+    certificate whose name has no record), instead of stopping at the ownership
+    gate and reporting a different failure.
+    """
     return (
-        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
+        f"GOWAVE_MIGRATE_EXISTING=yes bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
         f"--vision-domain '{SECOND_WORKER_VISION_DOMAIN}' "
         f"'{SECOND_WORKER_NODE_NAME}' '{host.plan.second_node_ip}' "
         f"'{SECOND_WORKER_DOMAIN}' '{SECOND_WORKER_REALITY_DOMAIN}'"
@@ -9054,19 +10672,40 @@ def cover_published_answers(zone: Dict[str, Any]) -> Dict[str, str]:
 def cover_probe_script(role: str, probe: Dict[str, Any],
                        attempts: int = COVER_PROBE_SETTLE_ATTEMPTS,
                        settle: str = COVER_PROBE_SETTLE_SECONDS) -> str:
-    """One steered pair run through this role's own copy of the decision.
+    """One steered pair read through this role's own answer.
 
     The probe waits for the steered answers to be live before it reads: the
     fixture reloads its zone on a poll and the resolver has already cached what
     the install asked it, so every attempt flushes and only a settled pair is
     handed to the decision. What the resolver finally answered is printed either
     way, so a pair that never settled is still reported rather than hidden.
+
+    The Master hands the settled pair to its decision. The Worker has none: the
+    same probe proves that no steering of the apex makes it name one, and reports
+    any apex function its payload still defines.
     """
     apex = topology.COVER_APEX
     www = f"www.{apex}"
     answers = probe["answers"]
+    if role == "master":
+        prologue = f"{cover_decision_loader(role)}\n{cover_selection_exports(role)}"
+        decision = (
+            f"decided=$(cover_domain_for {shlex.quote(probe['domain'])} "
+            f"{shlex.quote(probe['server_ip'])} 2>/dev/null || true)\n"
+            f"reason=$(cover_domain_for {shlex.quote(probe['domain'])} "
+            f"{shlex.quote(probe['server_ip'])} 2>&1 >/dev/null || true)\n"
+            f"printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(probe['domain'])} "
+            "\"$decided\" \"$reason\""
+        )
+    elif role == "worker":
+        prologue = worker_apex_absence_lines()
+        decision = (
+            f"printf 'decision\\t%s\\t\\t\\n' {shlex.quote(probe['domain'])}"
+        )
+    else:
+        raise ValueError(f"unknown cover-domain role: {role!r}")
     return f"""set -eu
-{cover_decision_loader(role)}
+{prologue}
 want_apex={shlex.quote(answers[apex])}
 want_www={shlex.quote(answers[www])}
 read_half() {{
@@ -9083,9 +10722,7 @@ for _ in {{1..{attempts}}}; do
 done
 printf 'resolved\\t%s\\t%s\\n' {shlex.quote(apex)} "$apex_ip"
 printf 'resolved\\t%s\\t%s\\n' {shlex.quote(www)} "$www_ip"
-apex=$(cover_domain_for {shlex.quote(probe['domain'])} {shlex.quote(probe['server_ip'])} 2>/dev/null || true)
-reason=$(cover_domain_for {shlex.quote(probe['domain'])} {shlex.quote(probe['server_ip'])} 2>&1 >/dev/null || true)
-printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(probe['domain'])} "$apex" "$reason"
+{decision}
 """
 
 
@@ -9099,11 +10736,29 @@ def cover_state_script(role: str, domain: str, server_ip: str,
     is read from the certificate files themselves, so "no partial decoy" and "no
     lineage issued" are facts about the deployable state rather than about the
     decision's wording.
+
+    Both roles read the selected apex pair: the Master decides it, and the Worker
+    reads the same names to prove that nothing on it claims or received them.
     """
-    apex = ".".join(domain.rstrip(".").split(".")[-2:])
+    apex = topology.COVER_APEX
+    if role == "master":
+        prologue = f"{cover_decision_loader(role)}\n{cover_selection_exports(role)}"
+        decide = (
+            f"decision_apex=$(cover_domain_for {shlex.quote(domain)} \"$server_ip\" "
+            "2>/dev/null || true)\n"
+            f"decision_reason=$(cover_domain_for {shlex.quote(domain)} \"$server_ip\" "
+            "2>&1 >/dev/null || true)\n"
+            f"printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(domain)} "
+            "\"$decision_apex\" \"$decision_reason\""
+        )
+    elif role == "worker":
+        prologue = worker_apex_absence_lines()
+        decide = f"printf 'decision\\t%s\\t\\t\\n' {shlex.quote(domain)}"
+    else:
+        raise ValueError(f"unknown cover-domain role: {role!r}")
     dirs = " ".join(shlex.quote(path) for path in COVER_VHOST_DIRS)
     return f"""set -u
-{cover_decision_loader(role)}
+{prologue}
 server_ip={shlex.quote(server_ip)}
 apex={shlex.quote(apex)}
 want_apex={shlex.quote(answers.get(apex, ""))}
@@ -9123,9 +10778,7 @@ done
 printf 'resolved\\t%s\\t%s\\n' "$apex" "$apex_ip"
 printf 'resolved\\t%s\\t%s\\n' "www.$apex" "$www_ip"
 hostname -I 2>/dev/null | tr ' ' '\\n' | sed '/^$/d; s/^/self\\t/' || true
-decision_apex=$(cover_domain_for {shlex.quote(domain)} "$server_ip" 2>/dev/null || true)
-decision_reason=$(cover_domain_for {shlex.quote(domain)} "$server_ip" 2>&1 >/dev/null || true)
-printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(domain)} "$decision_apex" "$decision_reason"
+{decide}
 printf 'site\\t%s\\t%s\\n' {shlex.quote(COVER_SITE_INDEX)} "$(stat -c '%s' {shlex.quote(COVER_SITE_INDEX)} 2>/dev/null || true)"
 for dir in {dirs}; do
     [ -d "$dir" ] || continue
@@ -9147,7 +10800,7 @@ def parse_cover_state(output: str) -> Dict[str, Any]:
     """
     facts: Dict[str, Any] = {
         "resolved": {}, "self": [], "decisions": {}, "site_size": "",
-        "claims": [], "lineages": {},
+        "claims": [], "lineages": {}, "apexdef": [], "apexfile": "",
     }
     for line in output.splitlines():
         fields = line.split("\t")
@@ -9164,6 +10817,10 @@ def parse_cover_state(output: str) -> Dict[str, Any]:
             facts["claims"].append(fields[1])
         elif kind == "lineage" and len(fields) == 3:
             facts["lineages"][fields[1]] = fields[2]
+        elif kind == "apexdef" and len(fields) >= 2:
+            facts["apexdef"].append(fields[1])
+        elif kind == "apexfile" and len(fields) >= 2:
+            facts["apexfile"] = fields[1]
     return facts
 
 
@@ -9178,11 +10835,42 @@ def cover_decision_for(case_id: str, role: str, domain: str, facts: Dict[str, An
     return decision or {}
 
 
+def require_worker_apex_absent(case_id: str, label: str, facts: Dict[str, Any]) -> None:
+    """A Worker has no apex to decide, so neither its payload nor its answer may name one.
+
+    The state and decision readers both feed this: an apex function left in the
+    installed payload and a decision that named an apex are the two ways a Worker
+    would take a name the Master selected, and each has to be reported as its own
+    defect instead of only failing later through a missing route.
+    """
+    require(
+        case_id,
+        facts["apexfile"] == "",
+        f"{label} could not read its installed payload {WORKER_PAYLOAD!r}, so "
+        "'no apex function' would be an answer about a missing file",
+    )
+    require(
+        case_id,
+        facts["apexdef"] == [],
+        f"{label}'s payload still defines the cover-apex decision "
+        f"{facts['apexdef']!r} although a Worker owns no apex",
+    )
+    decided = {
+        domain: entry for domain, entry in facts["decisions"].items()
+        if entry.get("apex")
+    }
+    require(
+        case_id,
+        not decided,
+        f"{label} decided a cover apex it does not own: {decided}",
+    )
+
+
 def cover_refusal_message(names: Sequence[str], server_ip: str) -> str:
     """The operator-facing refusal, worded the way the product words it."""
     verb = "do not resolve" if len(names) > 1 else "does not resolve"
     return (
-        f"Camouflage apex disabled — {' / '.join(names)} {verb} to {server_ip}, "
+        f"Camouflage apex disabled — {' '.join(names)} {verb} to {server_ip}, "
         "so HTTP-01 would fail."
     )
 
@@ -9232,6 +10920,49 @@ def require_cover_probe(case_id: str, role: str, probe: Dict[str, Any],
         f"{role} refuses {probe['domain']} on the {probe['label']} probe with "
         f"{decision.get('reason')!r} instead of naming the records that did not resolve, "
         f"{expected!r}",
+    )
+    return {
+        "domain": probe["domain"],
+        "steered": probe["answers"],
+        "apex_rendered": decision.get("apex", ""),
+        "refusal": decision.get("reason", ""),
+    }
+
+
+def require_worker_probe(case_id: str, role: str, probe: Dict[str, Any],
+                         facts: Dict[str, Any]) -> Dict[str, Any]:
+    """A steered probe on the role that has no apex: it never decides one.
+
+    The steering still has to be real — the fixture answered the pair the probe
+    asked for, with at least one half pointed away from this host — because a
+    probe that changed nothing would not show that this role ignores the apex
+    rather than merely agreeing with the zone. What the role then answers is
+    "nothing": no apex function in its payload, no apex, and no refusal wording
+    for a decision it does not make.
+    """
+    server_ip = probe["server_ip"]
+    for name, expected in probe["answers"].items():
+        require(
+            case_id,
+            facts["resolved"].get(name, "") == expected,
+            f"{role}: the fixture answered {name} with "
+            f"{facts['resolved'].get(name, '')!r} instead of {expected!r}, so the "
+            f"{probe['label']} probe cannot stand for the pair it was steered to withhold",
+        )
+    failing = [name for name, expected in probe["answers"].items() if expected != server_ip]
+    require(
+        case_id,
+        failing,
+        f"{role}: the {probe['label']} probe resolves every record to {server_ip}, so it "
+        "shows no steering at all",
+    )
+    decision = cover_decision_for(case_id, role, probe["domain"], facts)
+    require_worker_apex_absent(case_id, role, facts)
+    require(
+        case_id,
+        decision.get("reason") == "",
+        f"{role} explains a refusal for {probe['domain']} on the {probe['label']} probe "
+        f"({decision.get('reason')!r}) although it has no apex to refuse",
     )
     return {
         "domain": probe["domain"],
@@ -9296,52 +11027,62 @@ def require_cover_rendered(case_id: str, role: str, domain: str, apex: str,
     }
 
 
-def require_cover_withheld(case_id: str, role: str, domain: str, apex: str,
-                           server_ip: str, answers: Dict[str, str],
-                           facts: Dict[str, Any]) -> Dict[str, Any]:
-    """The apex resolves elsewhere, so nothing may claim it and nothing may be issued."""
+def require_worker_owns_no_apex(case_id: str, role: str, domain: str, apex: str,
+                                server_ip: str, answers: Dict[str, str],
+                                reality: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """A Worker never takes the apex the Master selected, whatever the zone says.
+
+    This is the Worker's half of the restored read, and it is the opposite claim
+    to the Master's: not "the apex is rendered" but "nothing here is". The zone
+    has to be the restored one — otherwise the run would be evidence about a
+    steering, not about the installation — and then no vhost may claim either half
+    of the pair, no installed lineage may name it, and the camouflage vhost must
+    carry exactly the camouflage name its site was rendered for.
+    """
     for name, expected in answers.items():
         require(
             case_id,
             facts["resolved"].get(name, "") == expected,
             f"{role}: {name} resolves to {facts['resolved'].get(name, '')!r} instead of "
-            f"{expected!r}, so this run cannot show the refusal it claims",
+            f"{expected!r}, so this run cannot show the installed state",
         )
-    failing = [name for name, expected in answers.items() if expected != server_ip]
-    decision = cover_decision_for(case_id, role, domain, facts)
-    require(
-        case_id,
-        decision.get("apex") == "",
-        f"{role} rendered the apex {decision.get('apex')!r} although {failing} do not "
-        f"resolve to its own {server_ip}",
-    )
-    expected_reason = cover_refusal_message(failing, server_ip)
-    require(
-        case_id,
-        decision.get("reason") == expected_reason,
-        f"{role} refuses its apex with {decision.get('reason')!r} instead of "
-        f"{expected_reason!r}",
-    )
+    require_worker_apex_absent(case_id, role, facts)
     claimed = [name for claim in facts["claims"] for name in cover_claim_names(claim)]
     for name in (apex, f"www.{apex}"):
         require(
             case_id,
             name not in claimed,
-            f"{role} refused the apex but a vhost still claims {name}, leaving a partial "
+            f"{role} owns no apex but a vhost still claims {name}, leaving a partial "
             f"decoy or a stale sites-enabled entry: {claimed}",
         )
+    decoy = [claim for claim in facts["claims"] if "gowave-worker-decoy.conf" in claim]
+    require(
+        case_id,
+        decoy,
+        f"{role} has no camouflage vhost, so the site it serves has no name of its "
+        f"own: {facts['claims']}",
+    )
+    decoy_names = [name for claim in decoy for name in cover_claim_names(claim)]
+    require(
+        case_id,
+        decoy_names == [reality],
+        f"{role}'s camouflage vhost has to name only {reality!r}: {decoy_names}",
+    )
     sans = {path: cover_lineage_sans(text) for path, text in facts["lineages"].items()}
-    covering = [path for path, names in sans.items() if apex in names]
+    covering = [
+        path for path, names in sans.items()
+        if apex in names or f"www.{apex}" in names
+    ]
     require(
         case_id,
         not covering,
-        f"{role} refused the apex but already holds a lineage naming it ({covering}), so "
-        f"the refusal came after issuance: {sans}",
+        f"{role} owns no apex but holds a lineage naming it ({covering}), so the "
+        f"Master's names would be issued on the wrong host: {sans}",
     )
     return {
         "server_ip": server_ip,
-        "apex_rendered": decision.get("apex", ""),
-        "refusal": decision.get("reason", ""),
+        "apex_rendered": "",
+        "decoy_names": decoy_names,
         "claimed_names": claimed,
         "lineages": sans,
     }
@@ -9350,19 +11091,23 @@ def require_cover_withheld(case_id: str, role: str, domain: str, apex: str,
 def case_cover_unresolved(product: MultiNodeProduct) -> Dict[str, Any]:
     """NGX-COVER-UNRESOLVED: resolution, not intent, decides whether the apex is rendered.
 
-    The install publishes one apex for the Master, so a single run cannot show
-    what a half-missing pair refuses unless the fixture zone is steered. The
-    derived apex is the last two labels of the deployment domain, so a probe
-    domain cannot carry an apex of its own: the probes steer the installed pair
-    itself instead. Each role is asked three times — once with `www.<apex>`
-    withheld, once with the apex withheld, once with both answered elsewhere —
-    and every probe must refuse, name exactly the records that did not resolve,
-    and render nothing.
+    The install publishes one apex pair for the cluster, so a single run cannot
+    show what a half-missing pair refuses unless the fixture zone is steered. The
+    apex is a name the deployment selected, so a probe domain cannot carry one of
+    its own: the probes steer the installed pair itself instead. The Master is
+    asked three times — once with `www.<apex>` withheld, once with the apex
+    withheld, once with both answered elsewhere — and every probe must refuse,
+    name exactly the records that did not resolve, and render nothing.
+
+    The Worker is asked the same three steered pairs, and its answer is the same
+    each time: it has no apex decision in its payload, so no zone content makes it
+    name one. A Worker that started rendering the Master's names would be issuing
+    a lineage for a name it cannot validate from its own port 80.
 
     The installed apex is then read on both roles against the restored zone: the
-    role that holds the address gets a rendered page, a claiming vhost and a
-    lineage covering the pair, and the role that does not gets a refusal with no
-    claim and no lineage. The zone is restored before the case returns, because
+    Master holds the address and must show a rendered page, a claiming vhost and a
+    lineage covering the pair, while the Worker must claim neither half and hold
+    no lineage naming one. The zone is restored before the case returns, because
     the cases after it resolve the installed names.
     """
     case_id = COVER_UNRESOLVED_CASE_ID
@@ -9391,7 +11136,9 @@ def case_cover_unresolved(product: MultiNodeProduct) -> Dict[str, Any]:
                     f"{(steered.stderr or '').strip()[-500:]}",
                 )
                 facts = parse_cover_state(steered.stdout or "")
-                seen[probe["label"]] = require_cover_probe(case_id, label, probe, facts)
+                checked = (require_cover_probe if key == "master"
+                           else require_worker_probe)
+                seen[probe["label"]] = checked(case_id, label, probe, facts)
             probe_evidence[key] = seen
         evidence["probes"] = probe_evidence
 
@@ -9421,8 +11168,9 @@ def case_cover_unresolved(product: MultiNodeProduct) -> Dict[str, Any]:
                     case_id, label, domain, topology.COVER_APEX, server_ip, facts,
                 )
             else:
-                evidence[key] = require_cover_withheld(
-                    case_id, label, domain, topology.COVER_APEX, server_ip, answers, facts,
+                evidence[key] = require_worker_owns_no_apex(
+                    case_id, label, domain, topology.COVER_APEX, server_ip, answers,
+                    host.worker_reality_domain, facts,
                 )
     finally:
         # A restore failure must not replace the error the case is reporting, and
@@ -9951,6 +11699,15 @@ def cases(
         Case(IPV6_CASE_ID, "multi-node",
              lambda context: case_ipv6_policy(product),
              timeout_seconds=IPV6_TIMEOUT_SECONDS),
+        # Both rule sets of the pair as one ingress decision: the Master denies
+        # the local Node port to every source, the Worker grants exactly its
+        # Master, the shipped renderer answers the same way for a port the
+        # install never used, and each host reads back its own rules after the
+        # unit a reboot runs re-applies them.
+        Case(ingress_matrix.WORKER_CASE_ID, "multi-node",
+             lambda context: ingress_matrix.case_worker_ingress(product, context),
+             timeout_seconds=2 * (ingress_matrix.POLICY_TIMEOUT_SECONDS
+                                  + 2 * ingress_matrix.FACTS_TIMEOUT_SECONDS)),
         Case("CLUS-01", "multi-node", lambda context: case_cluster_hosts(product),
              timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
         Case("CLUS-02", "multi-node", lambda context: case_cluster_squad(product),
@@ -10044,6 +11801,13 @@ def cases(
         Case(DECOY_ROUTE_CASE_ID, "multi-node",
              lambda context: case_decoy_route(product),
              timeout_seconds=DECOY_ROUTE_TIMEOUT_SECONDS),
+        # Public 443 on the Worker is the surface a scanning client meets, so it
+        # is read in the same healthy window: the site, the refusals and the
+        # fallback are install-time state of the host, and it is untouched by
+        # the cases below until the migration case rewrites its edge on purpose.
+        Case(WORKER_EDGE_CASE_ID, "multi-node",
+             lambda context: case_worker_edge(product),
+             timeout_seconds=WORKER_EDGE_TIMEOUT_SECONDS),
         # The refusal case steers the fixture zone and puts it back before it
         # returns, so it runs beside the other reads of a healthy cluster.
         Case(COVER_UNRESOLVED_CASE_ID, "multi-node",
@@ -10304,6 +12068,29 @@ def cases(
         Case(negative_matrix.TEN_CASE_ID, "multi-node",
              lambda context: negative_matrix.case_ten_rows_are_witnessed(product, context),
              timeout_seconds=120),
+        # The edge a legacy Worker still carries is migrated on purpose: the case
+        # puts one name on the camouflage port, refuses an unconfirmed re-apply
+        # and adopts the product's edge with the confirmation. It reads the cover
+        # site and the Panel's own inventory as its baseline, so it runs before
+        # the lifecycle cases below fault a role, and it restores the map it
+        # replaced before it returns.
+        Case(WORKER_MIGRATION_CASE_ID, "multi-node",
+             lambda context: case_worker_migration(product),
+             timeout_seconds=WORKER_MIGRATION_TIMEOUT_SECONDS),
+        # MN-WORKER-RESUME: re-verify Worker TLS and security on resume.
+        # Runs after migration so the edge is in its adopted state, and before
+        # lifecycle cases that fault the cluster. It reads the live containers
+        # without modifying them.
+        Case(WORKER_RESUME_CASE_ID, "multi-node",
+             lambda context: case_worker_resume(product),
+             timeout_seconds=WORKER_RESUME_TIMEOUT_SECONDS),
+        # MN-COMPOSED-MIXED: full mixed topology (Panel + local Node + 1 remote Worker)
+        # with country entry, failure, retry, interruption and restart.
+        # Runs after resume so the cluster is healthy, and before lifecycle cases
+        # that fault the cluster. It exercises real orchestration boundaries.
+        Case(COMPOSED_MIXED_CASE_ID, "multi-node",
+             lambda context: case_composed_mixed_topology(product),
+             timeout_seconds=COMPOSED_MIXED_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.

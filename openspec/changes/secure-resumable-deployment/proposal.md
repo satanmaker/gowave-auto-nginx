@@ -14,6 +14,9 @@ Issue #2 exposes inconsistent host-security integration across Panel, All-in-One
 - Record hostname-to-host-to-certificate ownership, adopt valid existing certificate lineages consistently and verify renewal/rollback and certificates actually served.
 - **BREAKING** for new Worker deployments: ordinary requests to the primary transport hostname serve the generated static cover instead of a generic refusal; management/subscription paths remain denied. Existing deployments require an explicit migration preview, not silent routing or certificate changes.
 
+- Pin NGINX stable 1.30.8 from the signed official NGINX APT repository as the primary source on every supported OS. Fall back only to a distribution package with explicitly verified equivalent security fixes; refuse if neither source qualifies.
+- Run all four supported distributions concurrently in GitHub Actions and local Podman acceptance, keeping independent results and stable required check names.
+
 ## Capabilities
 
 ### New Capabilities
@@ -22,7 +25,8 @@ None. Extend the existing security, wizard, routing and integration boundaries.
 
 ### Modified Capabilities
 
-- `vps-security`: per-role ingress and effective security reporting; shared verified hardening and explicit DoT policy.
+- `vps-security`: per-role ingress and effective security reporting; shared verified hardening, explicit DoT policy and pinned NGINX package selection.
+- `podman-e2e`: parallel distribution coverage and independent evidence in GitHub Actions and locally.
 - `interactive-deployment`: durable draft/checkpoints, reconciled resume, all-failed retry, strict failure propagation and truthful final outcomes.
 - `setup-wizard`: role-specific domain explanations, ownership review and correction without losing answers.
 - `traffic-routing`: explicit cover ownership, Worker static cover, isolated fallbacks and certificate/SNI routing consistency.

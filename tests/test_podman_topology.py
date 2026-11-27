@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 from unittest import mock
 
@@ -102,6 +104,13 @@ def run_for(kwargs_by_name, name):
 
 
 class TestPodmanTopology(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = mock.patch.object(topology, "NETWORK_RESERVATION_LOCK", Path(directory.name) / "networks.lock")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def topology(self, **overrides):
         podman = FakePodman(**{key: overrides[key] for key in ("install_output", "install_returncode") if key in overrides})
         self.addCleanup(podman.context.run_cleanup)
@@ -118,6 +127,55 @@ class TestPodmanTopology(unittest.TestCase):
                 mock.patch.object(acme_fixture.AcmeFixture, "wait_ready", return_value=None):
             instance.create()
         return instance, podman
+
+    def test_four_concurrent_creates_reserve_distinct_networks(self):
+        used = []
+        start = Barrier(4)
+        instances = []
+        for distribution in target_image.DISTRIBUTIONS:
+            instance, podman = self.topology(distribution=distribution, egress_resolvers=["192.0.2.53"])
+            podman.used_subnets = used
+            podman.network_create = lambda name, subnet, **kwargs: used.append(subnet)
+            instances.append(instance)
+
+        def create(instance):
+            start.wait(timeout=5)
+            return instance.create().plan
+
+        with mock.patch.multiple(topology.AioTopology, _start_dns=mock.DEFAULT,
+                                 _start_acme=mock.DEFAULT, _start_target=mock.DEFAULT,
+                                 _start_echo=mock.DEFAULT, _start_client=mock.DEFAULT), \
+                ThreadPoolExecutor(max_workers=4) as executor:
+            plans = list(executor.map(create, instances))
+        self.assertEqual(len(set(used)), 8)
+        self.assertEqual({plan.subnet for plan in plans}, set(topology.CONTROL_PREFIX_CANDIDATES))
+        self.assertEqual({plan.data_subnet for plan in plans}, set(topology.DATA_PREFIX_CANDIDATES))
+        with self.assertRaisesRegex(topology.TopologyError, "no free /24"):
+            topology.allocate_plan(used)
+
+    def test_parallel_matrix_rejects_missing_evidence_and_failed_children(self):
+        for failure in (None, "missing", "child"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                start = Barrier(4)
+                observed = []
+
+                def run(command, **kwargs):
+                    start.wait(timeout=5)
+                    distribution = command[command.index("--distribution") + 1]
+                    artifact_root = Path(command[command.index("--artifact-root") + 1])
+                    observed.append((distribution, artifact_root))
+                    if distribution != "debian-13" or failure != "missing":
+                        result = artifact_root / "run" / "result.json"
+                        result.parent.mkdir(parents=True)
+                        result.write_text('{"overall": "PASS"}', encoding="utf-8")
+                    return subprocess.CompletedProcess(command, int(distribution == "debian-13" and failure == "child"))
+
+                with mock.patch.object(run_podman_e2e.subprocess, "run", side_effect=run), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    status = run_podman_e2e.main(["--all-distributions", "--artifact-root", directory])
+                self.assertEqual(status, int(failure is not None))
+                self.assertEqual({name for name, _ in observed}, set(target_image.DISTRIBUTIONS))
+                self.assertEqual(len({path for _, path in observed}), 4)
 
     def test_plan_skips_subnets_already_claimed_on_the_host(self):
         plan = topology.allocate_plan(["203.0.114.0/24"])
@@ -453,12 +511,13 @@ class TestPanelOnlyTopology(unittest.TestCase):
         self.assertEqual(record["install_command"], instance.install_script())
         self.assertEqual(record["vision_domain"], "")
 
-    def test_the_topology_declares_the_six_panel_only_cases(self):
+    def test_the_topology_declares_the_seven_panel_only_cases(self):
         suite = panel_only.cases(FakePodman())
         self.assertEqual(
             [case.id for case in suite],
             [
-                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
+                "PO-INSTALL", "PO-HOST", "PO-FIREWALL", "PO-API", "PO-SQUAD",
+                "PO-SQUAD-REFUSED",
                 # The add-node refusal needs a Panel and no Worker, so both
                 # topologies run it: Panel-only is where the mutation boundary it
                 # asserts stays crossed by construction.
@@ -495,8 +554,8 @@ class TestPanelOnlyTopology(unittest.TestCase):
         self.assertEqual(
             [case.id for case in suite],
             [
-                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
-                "MN-ADD-NODE-REFUSED",
+                "PO-INSTALL", "PO-HOST", "PO-FIREWALL", "PO-API", "PO-SQUAD",
+                "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED",
             ],
         )
         self.assertEqual(run_podman_e2e.TOPOLOGIES, ("aio", "multi-node", "panel-only"))

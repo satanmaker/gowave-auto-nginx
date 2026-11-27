@@ -19,6 +19,7 @@ OS_SH = REPO_ROOT / "modules" / "os.sh"
 PANEL_SH = REPO_ROOT / "modules" / "panel.sh"
 ARTIFACT_SH = REPO_ROOT / "modules" / "artifact.sh"
 PREFLIGHT_SH = REPO_ROOT / "modules" / "preflight.sh"
+NGINX_PACKAGE_SH = REPO_ROOT / "modules" / "nginx_package.sh"
 NODE_AUTO_SH = REPO_ROOT / "gowave-node-auto.sh"
 MATRIX_YAML = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
 
@@ -385,7 +386,7 @@ class TestNodeIntegration(unittest.TestCase):
                       '        rollback_failed=1\n',
                       worker_script)
         self.assertNotIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
-        self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
+        self.assertIn("certbot delete --cert-name \"$worker_lineage\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
         self.assertIn("ufw delete allow proto tcp from \"$PANEL_IP\"", worker_script)
         self.assertIn("local rollback_failed=0", worker_script)
@@ -395,8 +396,8 @@ class TestNodeIntegration(unittest.TestCase):
 
         self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
         self.assertIn(
-            'restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" "$state_root/recovery" '
-            '"$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1',
+            'restore_acme_lineage "$_ACME_TX_ID" "${_WORKER_LINEAGE:-$WORKER_DOMAIN}" '
+            '"$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1',
             worker_script,
         )
 
@@ -449,8 +450,36 @@ class TestNodeIntegration(unittest.TestCase):
         https = body[vhost_start:body.index("\nEOF\n", vhost_start)]
         self.assertIn("ssl_protocols TLSv1.2 TLSv1.3;", https)
         self.assertIn("ssl_ciphers HIGH:!aNULL:!MD5;", https)
-        self.assertIn("ssl_certificate /etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem;", https)
+        self.assertIn("ssl_certificate $worker_live/fullchain.pem;", https)
         self.assertNotIn("ssl_protocols TLSv1.3;", https)
+
+    def test_worker_edge_https_serves_cover_and_denies_management(self):
+        """The Worker primary is an ordinary website: the root and every known
+        asset are the rendered cover site, an unknown path keeps the brand's own
+        404 page, and no management or subscription path reaches a transport."""
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        funcs_start = script.index("cat <<'RUNNER_FUNCS'")
+        payload = script[funcs_start:script.index("\nRUNNER_FUNCS\n", funcs_start)]
+
+        start = payload.index("configure_edge_nginx() {")
+        end = payload.index("\ncore_version_matches() {", start)
+        body = payload[start:end]
+        vhost_start = body.index("cat > /etc/nginx/conf.d/gowave-worker-https.conf")
+        https = body[vhost_start:body.index("\nEOF\n", vhost_start)]
+
+        self.assertIn("root /var/www/gowave-auto-nginx/cover-reality;", https)
+        self.assertIn("index index.html;", https)
+        self.assertIn("error_page 404 /404.html;", https)
+        self.assertIn("location ^~ /api/ {\n        return 444;\n    }", https)
+        self.assertIn("location / {\n        try_files \\$uri \\$uri/ =404;\n    }", https)
+        self.assertNotIn("return 404;", https)
+        for transport in ("location ^~ /xhttp-down/ {", "location = /ws {",
+                          "location /trojan-grpc {"):
+            self.assertIn(transport, https)
+        xhttp = https.split("location ^~ /xhttp-down/ {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("grpc_pass grpc://127.0.0.1:10001;", xhttp)
+        self.assertIn('grpc_set_header Connection "";', xhttp)
+        self.assertNotIn("proxy_pass", xhttp)
 
     def test_standalone_remote_rollback_reports_non_acme_cleanup_failures(self):
         """Standalone rollback must fail if service, NGINX, hook, or scratch cleanup is incomplete."""
@@ -492,7 +521,7 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('awk \'$3 == "443/tcp" { found=1 } END { exit !found }\'', rollback_script)
         self.assertNotIn("rollback_restore_failed", rollback_script)
 
-    def _run_worker_dot(self, body: str) -> subprocess.CompletedProcess:
+    def _run_worker_dot(self, body: str, env=None) -> subprocess.CompletedProcess:
         script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         start = script.index("configure_worker_dot() {")
         end = script.index("\n}\n", start) + len("\n}\n")
@@ -502,7 +531,8 @@ class TestNodeIntegration(unittest.TestCase):
             + script[start:end]
             + "\n"
         )
-        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True)
+        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True,
+                              env=env)
 
     def test_worker_host_security_enables_strict_dot(self):
         """Worker hardening must run the DoT helper and track ownership of the drop-in."""
@@ -527,19 +557,53 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn("flag=0", res.stdout)
 
-    def test_worker_dot_failure_is_non_fatal_and_not_owned(self):
-        """A DoT failure must warn instead of aborting, and must not claim the drop-in."""
+    def test_worker_dot_failure_stops_the_installation(self):
+        """Only a configured policy or a verified rollback may finish a Worker.
+
+        `configure_dot` returns 0 in those two cases, so a non-zero result is a
+        `required` failure or an unproven rollback in either mode. The
+        ownership flag stays as computed, which is what lets the compensating
+        rollback remove a drop-in the failed attempt left behind.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             dropin = Path(tmpdir) / "90-gowave-auto-nginx.conf"
             body = (
                 'configure_dot() { return 1; }\n'
+                f'if configure_worker_dot "{dropin}"; then echo "rc=0"; else echo "rc=$?"; fi\n'
+                'echo "flag=${_DOT_CREATED_BY_US:-unset}"\n'
+            )
+            res = self._run_worker_dot(body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("rc=1", res.stdout)
+            self.assertIn("flag=1", res.stdout)
+            self.assertIn("stopping the Worker installation", res.stderr)
+
+            res = self._run_worker_dot(body, env={**os.environ, "GOWAVE_DOT_POLICY": "required"})
+            self.assertIn("rc=1", res.stdout)
+
+    def test_worker_dot_without_the_helper_only_passes_when_it_is_not_required(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dropin = Path(tmpdir) / "90-gowave-auto-nginx.conf"
+            body = (
                 f'configure_worker_dot "{dropin}"\n'
                 'echo "flag=${_DOT_CREATED_BY_US:-unset}"\n'
             )
             res = self._run_worker_dot(body)
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertIn("flag=0", res.stdout)
             self.assertIn("remains unhardened", res.stderr)
+            self.assertIn("flag=0", res.stdout)
+
+            res = self._run_worker_dot(body, env={**os.environ, "GOWAVE_DOT_POLICY": "required"})
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("Required DNS-over-TLS cannot even be attempted", res.stderr)
+
+    def test_worker_dot_success_does_not_warn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dropin = Path(tmpdir) / "90-gowave-auto-nginx.conf"
+            res = self._run_worker_dot(
+                'configure_dot() { return 0; }\n' f'configure_worker_dot "{dropin}"\n')
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertNotIn("remains unhardened", res.stderr)
 
     def test_worker_payload_ships_security_helper_for_dot(self):
         """The Worker never receives the project checkout, so managed.py must travel with the payload."""
@@ -552,18 +616,30 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("configure_dot() {", payload)
         self.assertIn("--prepare-dns", payload)
 
+    def _payload_function(self, payload: str, function: str) -> str:
+        start = payload.index(function + "() {")
+        end = payload.index("\n}\n", start) + len("\n}\n")
+        return payload[start:end]
+
     def _run_payload_function(self, function: str, body: str, exports: str = "",
-                              env=None) -> subprocess.CompletedProcess:
+                              env=None, stubs: str = "") -> subprocess.CompletedProcess:
         script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         funcs_start = script.index("cat <<'RUNNER_FUNCS'")
         payload = script[funcs_start:script.index("\nRUNNER_FUNCS\n", funcs_start)]
-        start = payload.index(function + "() {")
-        end = payload.index("\n}\n", start) + len("\n}\n")
+        target = self._payload_function(payload, function)
+        # The payload defines both functions side by side, so a case that runs
+        # one must carry the helper the other calls.
+        needed = [function]
+        if "materialize_security_helper" in target:
+            needed.insert(0, "materialize_security_helper")
         prelude = (
             "set -euo pipefail\n"
             "log_warn() { printf '[WARN] %s\\n' \"$*\" >&2; }\n"
             + exports
-            + payload[start:end]
+            + "".join(self._payload_function(payload, name) for name in needed)
+            # Stubs come last: they replace the payload's own collaborators that
+            # a slice cannot carry (the policy deriviver, the streamed helper).
+            + stubs
             + "\n"
         )
         return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True,
@@ -587,6 +663,27 @@ class TestNodeIntegration(unittest.TestCase):
         res = self._run_payload_function("configure_dot", "configure_dot\n", exports)
         self.assertEqual(res.returncode, 1)
         self.assertIn('"status": "failed"', res.stdout)
+
+    def test_worker_payload_dot_continues_after_a_verified_best_effort_rollback(self):
+        helper = ("import json, sys\n"
+                  "print(json.dumps({'status': 'failed_rolled_back', 'recovery': 'verified'}))\n"
+                  "sys.exit(1)\n")
+        exports = "export SECURITY_HELPER_B64=%s\n" % base64.b64encode(helper.encode()).decode()
+        res = self._run_payload_function("configure_dot", "configure_dot\n", exports,
+                                         env={**os.environ, "GOWAVE_DOT_POLICY": "best-effort"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("restored and verified", res.stderr)
+        self.assertIn('"status": "failed_rolled_back"', res.stdout)
+
+    def test_worker_payload_dot_stops_on_a_required_failure(self):
+        helper = ("import json, sys\n"
+                  "print(json.dumps({'status': 'failed_rolled_back', 'recovery': 'verified'}))\n"
+                  "sys.exit(1)\n")
+        exports = "export SECURITY_HELPER_B64=%s\n" % base64.b64encode(helper.encode()).decode()
+        res = self._run_payload_function("configure_dot", "configure_dot\n", exports,
+                                         env={**os.environ, "GOWAVE_DOT_POLICY": "required"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("rollback was not verified", res.stderr)
 
     def test_worker_payload_dot_warns_when_helper_not_delivered(self):
         res = self._run_payload_function("configure_dot", "configure_dot\n")
@@ -649,6 +746,16 @@ class TestNodeIntegration(unittest.TestCase):
             )
             ufw.chmod(0o755)
             declaration = root / "ufw-default"
+            helper = root / "helper.py"
+            helper.write_text(
+                'import json, sys\n'
+                'sys.stdin.read()\n'
+                'if sys.argv[1] == "--firewall-preflight":\n'
+                '    print(json.dumps({"status": "success", "preserved_exceptions": []}))\n'
+                'else:\n'
+                '    print(json.dumps({"status": "success"}))\n',
+                encoding="utf-8",
+            )
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
@@ -662,9 +769,23 @@ class TestNodeIntegration(unittest.TestCase):
                     'export PANEL_IP="10.89.0.10"\nexport SSH_PORT=22\nexport NODE_PORT=3002\n'
                     % decision
                 )
+                policy_text = ('{"status": "ok", "policy": {"commands": '
+                               '[["default", "deny", "incoming"], ["allow", "22/tcp"]]}}')
+                stubs = (
+                    "worker_firewall_policy_json() { printf '%s' '" + policy_text + "'; }\n"
+                    # The function under test deletes the helper it materialized,
+                    # exactly as it does on a host; a shared file would vanish
+                    # between two runs of the same slice.
+                    "materialize_security_helper() {\n"
+                    "    local copy\n"
+                    "    copy=$(mktemp /tmp/gowave-test-helper.XXXXXX) || return 1\n"
+                    "    cp \"$STUB_HELPER\" \"$copy\" || return 1\n"
+                    "    printf '%s\\n' \"$copy\"\n"
+                    "}\n"
+                )
                 res = self._run_payload_function(
                     "configure_firewall", f'configure_firewall "{declaration}"\n', exports,
-                    env=environment,
+                    env={**environment, "STUB_HELPER": str(helper)}, stubs=stubs,
                 )
                 self.assertEqual(res.returncode, 0, res.stderr)
                 return declaration.read_text()
@@ -674,98 +795,65 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("IPV6=yes", run(0))
             self.assertIn("--force enable", calls.read_text())
 
-    @staticmethod
-    def _payload_slice(function: str) -> str:
+    def test_the_worker_claims_no_cover_apex(self):
+        """A Worker owns no apex: its camouflage site is served under its own
+        camouflage name, so the payload carries no apex decision, no apex route,
+        no apex SAN and no `www` alias a shared zone could have lent the Master."""
         script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
-        start = script.index("cat <<'RUNNER_FUNCS'")
-        payload = script[start:script.index("\nRUNNER_FUNCS\n", start)]
-        at = payload.index(function + "() {")
-        return payload[at:payload.index("\n}\n", at) + len("\n}\n")]
-
-    def test_the_worker_derives_the_cover_apex_with_the_masters_decision(self):
-        """A role-local copy of the decoy decision may not drift from modules/nginx.sh."""
-        master = (REPO_ROOT / "modules" / "nginx.sh").read_text()
-
-        def master_slice(function: str) -> str:
-            at = master.index(function + "() {")
-            return master[at:master.index("\n}\n", at) + len("\n}\n")]
+        payload = script[script.index("cat <<'RUNNER_FUNCS'"):]
+        payload = payload[:payload.index("\nRUNNER_FUNCS\n")]
 
         for function in ("derive_cover_domain", "cover_domains_resolve_here",
                          "cover_domains_not_resolving", "cover_domain_for"):
             with self.subTest(function=function):
-                self.assertEqual(self._payload_slice(function), master_slice(function))
+                self.assertNotIn(f"{function}() {{", script)
 
-    def test_the_worker_names_every_cover_refusal(self):
-        """The decoy is either derived or refused out loud, never silently skipped."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "bin"
-            fake_bin.mkdir()
-            getent = fake_bin / "getent"
-            getent.write_text(
-                "#!/usr/bin/env bash\n"
-                'name="${2}"\n'
-                'if [[ -n "${FAKE_UNRESOLVED:-}" && "$name" == "$FAKE_UNRESOLVED" ]]; then\n'
-                "    exit 2\n"
-                "fi\n"
-                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${name}"\n'
-            )
-            getent.chmod(0o755)
-            environment = os.environ.copy()
-            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-            exports = (self._payload_slice("derive_cover_domain")
-                       + self._payload_slice("cover_domains_not_resolving")
-                       + self._payload_slice("cover_domains_resolve_here"))
+        start = payload.index("configure_edge_nginx() {")
+        body = payload[start:payload.index("\ncore_version_matches() {", start)]
 
-            def run(domain: str, resolved: str = "203.0.113.10", unresolved: str = ""):
-                environment["FAKE_RESOLVED"] = resolved
-                environment["FAKE_UNRESOLVED"] = unresolved
-                body = f'cover_domain_for "{domain}" "203.0.113.10"; echo "rc=$?"\n'
-                res = self._run_payload_function("cover_domain_for", body, exports,
-                                                env=environment)
-                self.assertEqual(res.returncode, 0, res.stderr)
-                return res
+        stream_start = body.index("cat > /etc/nginx/stream-enabled/gowave-worker-stream.conf")
+        stream = body[stream_start:body.index("\nEOF\n", stream_start)]
+        self.assertNotIn("9443", stream)
+        self.assertIn("$REALITY_DOMAIN 127.0.0.1:8443;", stream)
 
-            # The last two labels are the apex, whatever the deployment depth.
-            res = run("worker.testbed.internal")
-            self.assertIn("testbed.internal", res.stdout)
-            self.assertNotIn("worker.testbed", res.stdout)
-            self.assertEqual(res.stderr, "")
+        decoy_start = body.index("cat > /etc/nginx/conf.d/gowave-worker-decoy.conf")
+        decoy = body[decoy_start:body.index("\nEOF\n", decoy_start)]
+        self.assertIn("server_name $REALITY_DOMAIN;", decoy)
 
-            # A domain without a subdomain has no apex to camouflage.
-            res = run("example.com")
-            self.assertNotIn("example.com\n", res.stdout)
-            self.assertIn("example.com has no subdomain", res.stderr)
+        self.assertIn(
+            r'''    run_certbot certonly --webroot -w /var/www/gowave-acme \
+        -d "$REALITY_DOMAIN" --cert-name "$reality_lineage" \
+''',
+            body,
+        )
+        self.assertNotIn("--expand", body)
+        self.assertIn('    render_cover_site "/var/www/gowave-auto-nginx/cover-reality" '
+                      '"$REALITY_DOMAIN" || return 1', body)
 
-            res = run("localhost")
-            self.assertIn("localhost has no subdomain", res.stderr)
-
-            # Apex present but not pointing here is a different, named refusal.
-            res = run("worker.testbed.internal", resolved="198.51.100.7")
-            self.assertNotIn("testbed.internal", res.stdout)
-            self.assertIn("do not resolve to 203.0.113.10", res.stderr)
-
-            # One half of the pair missing names that half, so the operator knows
-            # which record to fix instead of re-checking both.
-            res = run("worker.testbed.internal", unresolved="www.testbed.internal")
-            self.assertEqual(res.stdout.strip(), "rc=0")
-            self.assertIn("Camouflage apex disabled — www.testbed.internal does not "
-                          "resolve to 203.0.113.10, so HTTP-01 would fail.", res.stderr)
-            self.assertNotIn("testbed.internal /", res.stderr)
-            self.assertNotIn("— testbed.internal does not", res.stderr)
-
-            res = run("worker.testbed.internal", unresolved="testbed.internal")
-            self.assertIn("Camouflage apex disabled — testbed.internal does not "
-                          "resolve to 203.0.113.10, so HTTP-01 would fail.", res.stderr)
-            self.assertNotIn("www.testbed.internal", res.stderr)
-
-    def test_the_worker_resolves_its_public_ipv4_only_when_an_apex_exists(self):
+    def test_worker_port_80_redirects_managed_names_and_refuses_other_hosts(self):
+        """Port 80 is the renewal path: every name this Worker manages keeps an
+        ordinary HTTPS visit, an unmanaged host is closed, and no cover name the
+        Worker does not own is answered here."""
         script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
-        block = script.index("# Camouflage apex: the bare domain of this Worker")
-        cover = script[block:script.index("local cover_names=", block)]
-        self.assertIn('cover_domain=$(cover_domain_for "$WORKER_DOMAIN"', cover)
-        self.assertLess(cover.index('derive_cover_domain "$WORKER_DOMAIN"'),
-                        cover.index("ifconfig.me"),
-                        "the public IPv4 lookup must sit behind the apex decision")
+        start = script.index("cat > /etc/nginx/conf.d/00-worker-acme-challenge.conf")
+        vhost = script[start:script.index("\nEOF\n", start)]
+        prefix = script[:start]
+
+        self.assertIn(
+            r'managed_http_regex="${WORKER_DOMAIN//./\\.}|${REALITY_DOMAIN//./\\.}"',
+            prefix,
+        )
+        self.assertIn(r'managed_http_regex+="|${VISION_DOMAIN//./\\.}"', prefix)
+        self.assertIn("server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-};", vhost)
+        self.assertIn("root /var/www/gowave-acme;", vhost)
+        self.assertIn(
+            r"""        if (\$host ~* ^(${managed_http_regex})\$) {
+            return 301 https://\$host\$request_uri;
+        }
+        return 444;
+""",
+            vhost,
+        )
 
     def test_worker_rollbacks_remove_only_project_owned_dns_drop_in(self):
         """Both rollback paths must gate DNS drop-in removal on the project marker."""
@@ -836,7 +924,14 @@ class TestNodeIntegration(unittest.TestCase):
         api_index = worker_script.index(
             "# 2. Register the node using argv for data and FD 3 for the password.", secret_index
         )
-        dispatch_index = worker_script.index('if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
+        # The add branch's dispatch opens with the interactive-deployment flag so
+        # the payload streams through the stage-heartbeat reader; the reapply
+        # branch keeps the plain `if ! ACME_TX_ID=` form. Anchoring on the add
+        # branch's own first line is what keeps the transaction window from
+        # spilling into reapply and its later secret extraction.
+        dispatch_index = worker_script.index(
+            'GOWAVE_WORKER_INTERACTIVE_DEPLOYMENT="$interactive_deployment"', api_index
+        )
         self.assertLess(secret_index, api_index)
         self.assertLess(api_index, dispatch_index)
 
@@ -861,7 +956,17 @@ class TestNodeIntegration(unittest.TestCase):
         acme_start = rollback_script.index("# 3. Clean ACME certificates")
         acme_end = rollback_script.index("# 4. Restore the UFW before-image", acme_start)
         acme_cleanup = rollback_script[acme_start:acme_end]
-        self.assertIn('restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN"', acme_cleanup)
+        # The snapshot names the lineage, not the requested name: an adopted
+        # suffixed lineage (`cover2.example.net-0001`) has no manifest under the
+        # plain name, and a rollback that asks for the plain name restores nothing
+        # while reporting itself complete. The recovery script therefore restores
+        # every snapshot directory the transaction wrote.
+        self.assertIn('acme_snapshot_root="/var/lib/gowave-auto-nginx/recovery/$ACME_TX_ID/acme"',
+                      acme_cleanup)
+        self.assertIn('restore_acme_lineage "$ACME_TX_ID" "$(basename -- "$acme_snapshot")"',
+                      acme_cleanup)
+        self.assertIn('echo "[ROLLBACK] ERROR: transaction $ACME_TX_ID has no ACME snapshot to restore."',
+                      acme_cleanup)
         self.assertIn("ACME_TX_ID missing; preserving unknown certificate lineage", acme_cleanup)
         self.assertNotIn("certbot delete", acme_cleanup)
         self.assertIn("rollback_failed=1", acme_cleanup)
@@ -1442,6 +1547,14 @@ exit 0
             captured = payload_capture.read_text()
             self.assertIn("export GOWAVE_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory", captured)
             self.assertIn('--server "$GOWAVE_ACME_SERVER"', captured)
+
+            mock_timeout = bin_dir / "timeout"
+            mock_timeout.write_text('#!/bin/sh\n[ "$1 $2 $3" = "--kill-after=10s 60m ssh" ] || exit 9\nexit 124\n')
+            mock_timeout.chmod(0o755)
+            env["GOWAVE_WORKER_INTERACTIVE_DEPLOYMENT"] = "1"
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertNotIn(env["SECRET_KEY"], result.stdout + result.stderr)
 
     def test_the_node_installer_gate_requires_a_pinned_verified_installer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2220,6 +2333,7 @@ class TestPinnedXrayCore(unittest.TestCase):
         parts = [PREFLIGHT_SH.read_text(encoding="utf-8")]
         if with_artifact:
             parts.append(ARTIFACT_SH.read_text(encoding="utf-8"))
+            parts.append(NGINX_PACKAGE_SH.read_text(encoding="utf-8"))
         parts += [self._heredoc(text, "RUNNER_FUNCS"), self._heredoc(text, "REMOTE_EOF")]
         return "\n".join(parts).replace(
             'main "$@" </dev/null',
@@ -2237,6 +2351,21 @@ class TestPinnedXrayCore(unittest.TestCase):
         text = NODE_AUTO_SH.read_text(encoding="utf-8")
         self.assertLess(text.index('cat "$artifact_module"'),
                         text.index("cat <<'RUNNER_FUNCS'"))
+
+    def test_the_payload_carries_the_nginx_package_module_as_its_module(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertIn('nginx_package_module="$SCRIPT_DIR/modules/nginx_package.sh"', text)
+        self.assertEqual(text.count('cat "$nginx_package_module"'), 1)
+        self.assertLess(text.index('cat "$nginx_package_module"'),
+                        text.index("setup_system_prereqs() {"))
+
+    def test_the_worker_prerequisite_step_installs_the_pinned_nginx(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        prereqs = text[text.index("setup_system_prereqs() {"):]
+        prereqs = prereqs[:prereqs.index("\n}")]
+        self.assertIn('install_pinned_nginx "$os_id" "$codename"', prereqs)
+        self.assertNotIn("nginx-full libnginx-mod-stream", prereqs,
+                         "the distribution nginx-full conflicts with the pinned official package")
 
     def test_the_composed_payload_resolves_every_function_its_pinned_step_calls(self):
         result = subprocess.run(["bash", "-s"], input=self._composed_payload(),
@@ -2481,6 +2610,34 @@ class TestWorkerPayloadBootstrap(unittest.TestCase):
         self.assertLess(bootstrap_at, main_body.index("snapshot_acme_lineage"))
         self.assertLess(bootstrap_at, main_body.index("setup_system_prereqs"))
 
+    def test_the_payload_configures_the_managed_jail_before_the_firewall(self):
+        # The Worker gets the same SSH jail as the Master, and it is mandatory:
+        # a jail that only warns leaves the discovered SSH ports protected by
+        # the package install alone. Running it before the firewall keeps an
+        # aborting Worker from having changed its ingress already.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = self.payload(tmpdir)
+        syntax = subprocess.run(["bash", "-n"], input=payload, text=True, capture_output=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        main_body = payload.split("main() {", 1)[1]
+        self.assertIn("--configure-fail2ban", payload)
+        lines = [line.strip() for line in main_body.splitlines()
+                 if "configure_worker_fail2ban </dev/null" in line]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertNotIn("||", lines[0])
+        self.assertLess(main_body.index(lines[0]), main_body.index("configure_firewall </dev/null"))
+
+    def test_the_security_helper_lands_on_a_random_private_path(self):
+        # A fixed name in /tmp is a file another local account can pre-create,
+        # and both the DoT and the Fail2ban step write it as root.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = self.payload(tmpdir)
+        self.assertEqual(payload.count("materialize_security_helper()"), 1)
+        self.assertIn("mktemp /tmp/gowave-managed-security.XXXXXX", payload)
+        self.assertNotIn("/tmp/gowave-managed-security.py", payload)
+        self.assertIn("/tmp/gowave-managed-security.*", payload)
+        self.assertIn('chmod 0700 "$helper"', payload)
+
     def test_the_rollback_can_run_without_a_preinstalled_interpreter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rollback = self.capture(tmpdir, "remote_rollback", "127.0.0.1", "22",
@@ -2606,6 +2763,308 @@ class TestWorkerInstallerRetry(unittest.TestCase):
         self.assertIn('return "$installer_rc"', installer_body)
 
 
+class TestWorkerLineageSelection(unittest.TestCase):
+    """A Worker adopts the lineage it already serves, and serves the one it checked.
+
+    A Worker in a shared zone can be left with `cover2.example.net-0001`: certbot
+    names a lineage after `--cert-name`, so issuing the plain name beside it leaves
+    one name with two certificates and a vhost pointing at whichever path the
+    template happened to hardcode. The payload therefore selects the owned lineage
+    before it snapshots or renders anything, and the vhosts are rendered from the
+    directory that selection returned. The payload carries its own copy of the
+    selector, so these cases run that copy rather than the Master's module.
+    """
+
+    @staticmethod
+    def payload_functions(tmp: Path) -> Path:
+        payload = capture_remote_script(tmp, "remote_payload", "127.0.0.1", "22",
+                                        "worker.example.com", "reality.example.com", "root")
+        script = tmp / "payload-functions.sh"
+        script.write_text(
+            "\n".join(line for line in payload.splitlines() if not line.startswith('main "$@"')) + "\n",
+            encoding="utf-8",
+        )
+        return script
+
+    @staticmethod
+    def select(script: Path, name: str, root: Path, server: str):
+        return subprocess.run(
+            ["bash", "-c", f'source "{script}" && select_acme_lineage "{name}" "{server}" "{root}"'],
+            capture_output=True, text=True,
+        )
+
+    def test_the_payload_adopts_the_suffixed_lineage_that_covers_the_name(self):
+        from tests.test_nginx_routing import issue_lineage, PRODUCTION_DIRECTORY
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            root = tmp / "letsencrypt"
+            issue_lineage(root, "worker.example.com-0001", ["worker.example.com"],
+                          server=PRODUCTION_DIRECTORY)
+            res = self.select(script, "worker.example.com", root, PRODUCTION_DIRECTORY)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), str(root / "live" / "worker.example.com-0001"))
+        self.assertIn("Adopting the ACME lineage worker.example.com-0001", res.stderr)
+
+    def test_the_payload_refuses_a_lineage_from_another_acme_directory(self):
+        from tests.test_nginx_routing import issue_lineage, PRODUCTION_DIRECTORY, STAGING_DIRECTORY
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            root = tmp / "letsencrypt"
+            issue_lineage(root, "worker.example.com-0001", ["worker.example.com"],
+                          server=STAGING_DIRECTORY)
+            res = self.select(script, "worker.example.com", root, PRODUCTION_DIRECTORY)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "")
+        self.assertIn("was not issued by", res.stderr)
+
+    def test_the_payload_refuses_an_expired_or_unrelated_lineage(self):
+        from tests.test_nginx_routing import issue_lineage, PRODUCTION_DIRECTORY
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            root = tmp / "letsencrypt"
+            issue_lineage(root, "worker.example.com-0001", ["worker.example.com"],
+                          server=PRODUCTION_DIRECTORY, expired=True)
+            expired = self.select(script, "worker.example.com", root, PRODUCTION_DIRECTORY)
+            self.assertEqual(expired.returncode, 0, expired.stderr)
+            self.assertEqual(expired.stdout.strip(), "")
+            self.assertIn("has expired", expired.stderr)
+
+            other = tmp / "other"
+            issue_lineage(other, "worker.example.com-0002", ["elsewhere.example.com"],
+                          server=PRODUCTION_DIRECTORY)
+            unrelated = self.select(script, "worker.example.com", other, PRODUCTION_DIRECTORY)
+        self.assertEqual(unrelated.returncode, 0, unrelated.stderr)
+        self.assertEqual(unrelated.stdout.strip(), "")
+        self.assertNotIn("Adopting", unrelated.stderr)
+
+    def test_the_install_selects_the_lineage_before_it_snapshots_or_renders(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        main = text[text.index("cat <<'REMOTE_EOF'"):]
+        main = main[:main.index("\nREMOTE_EOF\n")]
+        selected = main.index('_WORKER_LIVE_DIR=$(select_acme_lineage "$WORKER_DOMAIN"')
+        self.assertLess(
+            selected,
+            main.index('snapshot_acme_lineage "$_ACME_TX_ID" "$_WORKER_LINEAGE"'),
+            "the snapshot has to name the lineage the run selected",
+        )
+        self.assertIn('_REALITY_LIVE_DIR=$(select_acme_lineage "$REALITY_DOMAIN"', main)
+        self.assertIn('_VISION_LIVE_DIR=$(select_acme_lineage "$VISION_DOMAIN"', main)
+        self.assertIn('_WORKER_LIVE_DIR="${_WORKER_LIVE_DIR:-/etc/letsencrypt/live/$WORKER_DOMAIN}"',
+                      main)
+        self.assertIn(
+            'check_acme_lineage "$WORKER_DOMAIN" "$effective_acme_server" \\\n'
+            '        "/etc/letsencrypt/renewal/$_WORKER_LINEAGE.conf" "$_WORKER_LIVE_DIR"',
+            main,
+        )
+        self.assertIn('configure_edge_nginx "$_WORKER_LIVE_DIR" "$_REALITY_LIVE_DIR" '
+                      '"${_VISION_LIVE_DIR:-}" </dev/null', main)
+
+    def test_the_edge_step_proves_every_owned_lineage_renews(self):
+        """Renewal is a separate path: it runs the port-80 vhost and the hook, so
+        the step that makes the production config live is the only place a dry run
+        means anything, and it may name only the lineages this Worker owns."""
+        script = NODE_AUTO_SH.read_text(encoding="utf-8")
+        payload = script[script.index("cat <<'RUNNER_FUNCS'"):]
+        payload = payload[:payload.index("\nRUNNER_FUNCS\n")]
+        self.assertEqual(payload.count("verify_renewal_dry_run() {"), 1,
+                         "the payload is one file; its own copy is the one that runs")
+        start = payload.index("configure_edge_nginx() {")
+        body = payload[start:payload.index("\ncore_version_matches() {", start)]
+        dry_run = body.index('verify_renewal_dry_run "$owned_lineage"')
+        self.assertLess(body.index("nginx -t"), dry_run)
+        self.assertLess(body.index("systemctl reload nginx || systemctl restart nginx"), dry_run)
+        self.assertLess(dry_run, body.index("_NGINX_CONFIGS_CREATED=1"),
+                        "a failed dry run has to fail while the step is still rollback-owed")
+        self.assertIn('for owned_lineage in "$worker_lineage" "$reality_lineage" '
+                      '${vision_lineage:+"$vision_lineage"}; do', body)
+        self.assertIn("renew --dry-run --cert-name", payload)
+        self.assertNotIn("certonly --dry-run", payload)
+
+    def test_the_rendered_vhosts_use_the_selected_directories(self):
+        script = NODE_AUTO_SH.read_text(encoding="utf-8")
+        payload = script[script.index("cat <<'RUNNER_FUNCS'"):]
+        payload = payload[:payload.index("\nRUNNER_FUNCS\n")]
+        start = payload.index("configure_edge_nginx() {")
+        body = payload[start:payload.index("\ncore_version_matches() {", start)]
+        self.assertIn('local worker_live="${1:-/etc/letsencrypt/live/$WORKER_DOMAIN}"', body)
+        self.assertIn('local reality_live="${2:-/etc/letsencrypt/live/$REALITY_DOMAIN}"', body)
+        self.assertIn('--cert-name "$worker_lineage"', body)
+        self.assertIn('--cert-name "$reality_lineage"', body)
+        self.assertIn("ssl_certificate $worker_live/fullchain.pem;", body)
+        self.assertIn("ssl_certificate_key $worker_live/privkey.pem;", body)
+        self.assertIn("ssl_certificate $reality_live/fullchain.pem;", body)
+        self.assertNotIn("/etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem", body)
+        self.assertNotIn("/etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem", body)
+
+
+class TestWorkerEdgeMigrationGate(unittest.TestCase):
+    """An installed Worker keeps the edge it serves until the controller confirms it.
+
+    Re-applying a Worker streams the payload again, which rewrites the stream map
+    and the certificate each listener references -- what every client of the host
+    reaches. The payload therefore reads the identity its managed files serve,
+    prints it beside the one this run would serve, and refuses a difference
+    without GOWAVE_MIGRATE_EXISTING=yes, which `node reapply` sends only after its
+    own preview. These cases run the payload's own copy of the gate.
+    """
+
+    STREAM = """\
+# Managed by GoWave Auto NGINX: Worker Edge Stream
+map $ssl_preread_server_name $worker_dest {
+    worker.example.com 127.0.0.1:7443;
+    reality.example.com 127.0.0.1:8443;
+    vision.example.com 127.0.0.1:8444;
+    default 127.0.0.1:8443;
+}
+"""
+
+    @staticmethod
+    def payload_functions(tmp: Path, vision: str = "vision.example.com") -> Path:
+        # The payload re-exports every streamed value when it is sourced, so the
+        # Vision name has to come through the controller's own input rather than
+        # the test's environment.
+        payload = capture_remote_script(
+            tmp, "remote_payload", "127.0.0.1", "22",
+            "worker.example.com", "reality.example.com", "root",
+            extra_env={"VISION_DOMAIN": vision},
+        )
+        script = tmp / "payload-functions.sh"
+        script.write_text(
+            "\n".join(line for line in payload.splitlines() if not line.startswith('main "$@"')) + "\n",
+            encoding="utf-8",
+        )
+        return script
+
+    @staticmethod
+    def write_edge(tmp: Path, worker_live: str, reality_live: str, vision_live: str = "") -> None:
+        (tmp / "gowave-worker-stream.conf").write_text(TestWorkerEdgeMigrationGate.STREAM, encoding="utf-8")
+        conf = tmp / "conf.d"
+        conf.mkdir()
+        (conf / "gowave-worker-https.conf").write_text(
+            f"server {{\n    ssl_certificate {worker_live}/fullchain.pem;\n}}\n", encoding="utf-8")
+        (conf / "gowave-worker-decoy.conf").write_text(
+            f"server {{\n    ssl_certificate {reality_live}/fullchain.pem;\n}}\n", encoding="utf-8")
+        if vision_live:
+            (conf / "gowave-worker-vision-fallback.conf").write_text(
+                f"server {{\n    ssl_certificate {vision_live}/fullchain.pem;\n}}\n", encoding="utf-8")
+
+    def gate(self, script: Path, tmp: Path, worker_live: str, reality_live: str,
+             vision_live: str = "", env=None):
+        # The confirmation is baked into the streamed payload when it is generated,
+        # so at this level it is passed to the function call itself.
+        prefix = ""
+        if env and "GOWAVE_MIGRATE_EXISTING" in env:
+            prefix = f"GOWAVE_MIGRATE_EXISTING={env['GOWAVE_MIGRATE_EXISTING']} "
+        command = (
+            f'source "{script}" && {prefix}require_worker_edge_migration_confirmation '
+            f'"{worker_live}" "{reality_live}" "{vision_live}" '
+            f'"{tmp / "gowave-worker-stream.conf"}" "{tmp / "conf.d"}"'
+        )
+        merged = {
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ.get("HOME", "/root"),
+        }
+        return subprocess.run(["bash", "-c", command], capture_output=True, text=True, env=merged)
+
+    def test_a_different_identity_is_refused_without_the_controller_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            self.write_edge(tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+            res = self.gate(script, tmp, "/etc/letsencrypt/live/worker.example.com-0001",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("already serves a different edge identity", res.stderr)
+        self.assertIn("GOWAVE_MIGRATE_EXISTING=yes", res.stderr)
+        self.assertIn("node reapply", res.stderr)
+
+    def test_the_preview_prints_both_identities_before_it_proceeds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            self.write_edge(tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+            res = self.gate(script, tmp, "/etc/letsencrypt/live/worker-0001",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com",
+                            env={"GOWAVE_MIGRATE_EXISTING": "yes"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Edge identity currently served by this Worker:", res.stdout)
+        self.assertIn("cert worker /etc/letsencrypt/live/worker.example.com", res.stdout)
+        self.assertIn("Edge identity this run will serve:", res.stdout)
+        self.assertIn("cert worker /etc/letsencrypt/live/worker-0001", res.stdout)
+        self.assertIn("Migration confirmed by GOWAVE_MIGRATE_EXISTING=yes.", res.stdout)
+
+    def test_an_identical_identity_is_not_a_migration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            self.write_edge(tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+            res = self.gate(script, tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("already serves this identity", res.stdout)
+
+    def test_a_host_with_no_managed_edge_is_a_first_install(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            res = self.gate(script, tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("nothing to migrate", res.stdout)
+
+    def test_a_symlinked_stream_map_is_refused_instead_of_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            self.write_edge(tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+            stream = tmp / "gowave-worker-stream.conf"
+            elsewhere = tmp / "elsewhere.conf"
+            stream.rename(elsewhere)
+            stream.symlink_to(elsewhere)
+            res = self.gate(script, tmp, "/etc/letsencrypt/live/worker.example.com",
+                            "/etc/letsencrypt/live/reality.example.com",
+                            "/etc/letsencrypt/live/vision.example.com")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("is not a regular file", res.stderr)
+
+    def test_the_gate_runs_before_the_first_snapshot_or_before_image(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        main = text[text.index("cat <<'REMOTE_EOF'"):]
+        main = main[:main.index("\nREMOTE_EOF\n")]
+        gate = main.index("require_worker_edge_migration_confirmation")
+        self.assertLess(gate, main.index('snapshot_acme_lineage "$_ACME_TX_ID" "$_WORKER_LINEAGE"'))
+        self.assertLess(gate, main.index("record_worker_targets_before_image"))
+        self.assertLess(gate, main.index('configure_edge_nginx "$_WORKER_LIVE_DIR"'))
+
+    def test_the_controller_streams_the_confirmation_over_stdin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = capture_remote_script(Path(tmpdir), "remote_payload", "127.0.0.1", "22",
+                                            "worker.example.com", "reality.example.com", "root")
+        self.assertIn("export GOWAVE_MIGRATE_EXISTING=no", payload)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            confirmed = capture_remote_script(
+                Path(tmpdir), "remote_payload", "127.0.0.1", "22",
+                "worker.example.com", "reality.example.com", "root",
+                extra_env={"GOWAVE_MIGRATE_EXISTING": "yes"},
+            )
+        self.assertIn("export GOWAVE_MIGRATE_EXISTING=yes", confirmed)
+
+
 class TestWorkerReapply(unittest.TestCase):
     """`node reapply` reconverges a registered Worker without re-registering it.
 
@@ -2728,6 +3187,181 @@ class TestWorkerDeployHookOwnership(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
             self.assertIn("Pre-existing unowned Certbot deploy hook found", result.stderr)
+
+
+class TestWorkerFirewallPolicy(unittest.TestCase):
+    """The Worker applies the shared role policy instead of a hand-written list.
+
+    A rule list that only looks right leaves an internal port reachable while
+    the install reports a hardened host. These cases drive the payload function
+    with a stub policy and a recording `ufw`, and read the order back: preflight
+    before any mutation, the baseline capture before the first rule, the policy
+    commands verbatim, a kernel read-back, and one restoration when the read-back
+    disagrees.
+    """
+
+    POLICY = json.dumps({"status": "ok", "policy": {"commands": [
+        ["default", "deny", "incoming"],
+        ["default", "allow", "outgoing"],
+        ["allow", "22/tcp"],
+        ["deny", "3000/tcp"],
+        ["allow", "proto", "tcp", "from", "203.0.113.10", "to", "any", "port", "3002"],
+    ]}})
+
+    def setUp(self):
+        script = NODE_AUTO_SH.read_text()
+        start = script.index("cat <<'RUNNER_FUNCS'")
+        self.payload = script[start:script.index("\nRUNNER_FUNCS\n", start)]
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workdir = Path(temporary.name)
+        self.calls = self.workdir / "calls.txt"
+        self.helper = self.workdir / "helper.py"
+        self.helper.write_text(
+            'import os, sys\n'
+            'mode = sys.argv[1] if len(sys.argv) > 1 else ""\n'
+            'document = sys.stdin.read()\n'
+            'if mode == "--firewall-preflight":\n'
+            '    sys.stdout.write(os.environ["STUB_PREFLIGHT"])\n'
+            '    sys.exit(int(os.environ.get("STUB_PREFLIGHT_RC", "0")))\n'
+            'if mode == "--firewall-verify":\n'
+            '    sys.stdout.write(os.environ["STUB_VERIFY"])\n'
+            '    sys.exit(int(os.environ.get("STUB_VERIFY_RC", "0")))\n'
+            'if mode == "--security-report":\n'
+            '    open(os.environ["STUB_REQUEST"], "w", encoding="utf-8").write(document)\n'
+            '    sys.stdout.write(os.environ["STUB_REPORT"])\n'
+            '    sys.exit(int(os.environ.get("STUB_REPORT_RC", "0")))\n'
+            'sys.exit(2)\n',
+            encoding="utf-8",
+        )
+        self.helper.chmod(0o700)
+        self.request = self.workdir / "request.json"
+        self.ufw_default = self.workdir / "ufw-default"
+        self.ufw_default.write_text("IPV6=no\n", encoding="utf-8")
+
+    def function(self, name):
+        start = self.payload.index(name + "() {")
+        return self.payload[start:self.payload.index("\n}\n", start) + len("\n}\n")]
+
+    STUBS = '''
+kernel_has_ipv6() { return 0; }
+worker_firewall_policy_json() { printf %s "$STUB_POLICY"; }
+materialize_security_helper() {
+    [[ -n "${STUB_HELPER:-}" ]] || return 1
+    local copy
+    copy=$(mktemp /tmp/gowave-test-helper.XXXXXX) || return 1
+    cp "$STUB_HELPER" "$copy" || return 1
+    printf '%s\\n' "$copy"
+}
+record_firewall_before_image() { echo capture >> "$STUB_CALLS"; }
+restore_firewall_before_image() { echo restore >> "$STUB_CALLS"; }
+ufw() {
+    echo "ufw $*" >> "$STUB_CALLS"
+    if [[ "${STUB_UFW_FAIL:-}" == "$1" ]]; then return 1; fi
+    if [[ "$1" == status ]]; then echo "Status: active"; fi
+    return 0
+}
+'''
+
+    def environment(self, **overrides):
+        values = {**os.environ, "PANEL_IP": "203.0.113.10", "PANEL_IPV6": "",
+                  "NODE_PORT": "3002", "SSH_PORT": "22", "STUB_POLICY": self.POLICY,
+                  "STUB_HELPER": str(self.helper), "STUB_CALLS": str(self.calls),
+                  "STUB_REQUEST": str(self.request),
+                  "STUB_PREFLIGHT": '{"status": "ok", "preserved_exceptions": []}',
+                  "STUB_VERIFY": '{"status": "success"}', "STUB_REPORT": '{"status": "ready"}'}
+        values.update(overrides)
+        return values
+
+    def run_firewall(self, **overrides):
+        prelude = ('set -euo pipefail\n'
+                   'log_warn() { printf "[WARN] %s\\n" "$*" >&2; }\n'
+                   + self.function("configure_firewall") + self.STUBS)
+        body = ('if configure_firewall "$UFW_DEFAULT"; then echo "rc=0"; '
+                'else echo "rc=$?"; fi\n'
+                'printf "configured=%s\\n" "${_UFW_RULES_CONFIGURED:-0}"\n')
+        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True,
+                              env=self.environment(UFW_DEFAULT=str(self.ufw_default), **overrides))
+
+    def recorded(self):
+        return self.calls.read_text(encoding="utf-8").splitlines() if self.calls.exists() else []
+
+    def test_the_policy_commands_are_applied_verbatim_and_read_back(self):
+        result = self.run_firewall()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=0", result.stdout)
+        self.assertIn("configured=1", result.stdout)
+        calls = self.recorded()
+        self.assertEqual(calls[0], "capture", "the baseline is captured before the first rule")
+        applied = [line for line in calls if line.startswith("ufw ") and line != "ufw status"]
+        self.assertEqual(applied, [
+            "ufw default deny incoming",
+            "ufw default allow outgoing",
+            "ufw allow 22/tcp comment GoWave Auto NGINX",
+            "ufw deny 3000/tcp comment GoWave Auto NGINX",
+            "ufw allow proto tcp from 203.0.113.10 to any port 3002 comment GoWave Auto NGINX",
+            "ufw --force enable",
+        ])
+        self.assertNotIn("restore", calls)
+        self.assertIn("IPV6=yes", self.ufw_default.read_text(encoding="utf-8"))
+
+    def test_a_preflight_conflict_is_refused_before_any_mutation(self):
+        result = self.run_firewall(
+            STUB_PREFLIGHT_RC="1",
+            STUB_PREFLIGHT='{"error": "Existing UFW allow conflicts with managed listener isolation"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=1", result.stdout)
+        self.assertIn("Existing UFW allow conflicts", result.stderr)
+        self.assertIn("conflicts with existing firewall policy", result.stderr)
+        self.assertEqual(self.recorded(), [], "nothing may be captured or applied after a refusal")
+
+    def test_a_failed_read_back_restores_the_baseline_exactly_once(self):
+        result = self.run_firewall(STUB_VERIFY_RC="1",
+                                   STUB_VERIFY='{"error": "Live firewall still exposes protected ports"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=1", result.stdout)
+        self.assertIn("configured=0", result.stdout)
+        self.assertIn("Live firewall still exposes protected ports", result.stderr)
+        self.assertEqual(self.recorded().count("restore"), 1)
+        self.assertIn("baseline was restored", result.stderr)
+
+    def test_a_rule_ufw_refuses_restores_the_baseline(self):
+        result = self.run_firewall(STUB_UFW_FAIL="deny")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=1", result.stdout)
+        self.assertEqual(self.recorded().count("restore"), 1)
+        self.assertNotIn("ufw --force enable", self.recorded())
+
+    def test_a_missing_helper_changes_nothing(self):
+        result = self.run_firewall(STUB_HELPER="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=1", result.stdout)
+        self.assertEqual(self.recorded(), [])
+
+    def run_report(self, **overrides):
+        prelude = ('set -euo pipefail\n'
+                   'log_warn() { printf "[WARN] %s\\n" "$*" >&2; }\n'
+                   'kernel_has_ipv6() { return 0; }\n'
+                   'materialize_security_helper() { printf "%s\\n" "$STUB_HELPER"; }\n'
+                   + self.function("write_worker_security_report"))
+        body = ('_DOT_RECOVERY=verified\n'
+                'if write_worker_security_report; then echo "rc=0"; else echo "rc=$?"; fi\n')
+        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True,
+                              env=self.environment(GOWAVE_DOT_POLICY="required", **overrides))
+
+    def test_the_worker_report_carries_the_policy_and_the_recovery_it_observed(self):
+        result = self.run_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=0", result.stdout)
+        self.assertEqual(json.loads(self.request.read_text(encoding="utf-8")), {
+            "role": "worker", "node_port": 3002, "master_sources": ["203.0.113.10"],
+            "ipv6": True, "dot_policy": "required", "dot_recovery": "verified"})
+
+    def test_a_failed_report_verdict_stops_the_worker(self):
+        result = self.run_report(STUB_REPORT_RC="1", STUB_REPORT='{"status": "failed"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rc=1", result.stdout)
+        self.assertIn("not ready for deployment", result.stderr)
 
 
 if __name__ == "__main__":

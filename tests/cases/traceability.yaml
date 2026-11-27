@@ -206,14 +206,20 @@ requirements:
 
   - requirement: Camouflage decoy and certificate lineage
     scenarios:
-      - scenario: Decoy renders for the derived apex
-        cases: [DECOY-01, NGX-COVER-DERIVE, NGX-COVER-SITE, NGX-DECOY-ROUTE]
+      - scenario: Decoy renders for the apex each role owns
+        cases:
+          - DECOY-01
+          - NGX-COVER-DERIVE
+          - NGX-COVER-SITE
+          - NGX-DECOY-ROUTE
+          - MN-WORKER-EDGE
         topologies: [aio, multi-node]
         tests:
           - tests.test_podman_aio.TestDecoyCase
           - tests.test_podman_multi_node.TestCoverDeriveCase
           - tests.test_podman_multi_node.TestCoverSiteCase
           - tests.test_podman_multi_node.TestDecoyRouteCase
+          - tests.test_podman_multi_node.TestWorkerEdgeCase
         jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
       - scenario: Unresolvable cover names block rendering
         cases: [NGX-COVER-UNRESOLVED]
@@ -222,11 +228,12 @@ requirements:
           - tests.test_podman_multi_node.TestCoverUnresolvedCase
         jobs: [Multi-Node Podman Acceptance]
       - scenario: Worker keeps its decoy and ACME route
-        cases: [NGX-WORKER-ACME80, NGX-DECOY-ROUTE]
+        cases: [NGX-WORKER-ACME80, NGX-DECOY-ROUTE, MN-MIGRATE]
         topologies: [multi-node]
         tests:
           - tests.test_podman_multi_node.TestAcme80Case
           - tests.test_podman_multi_node.TestDecoyRouteCase
+          - tests.test_podman_multi_node.TestWorkerMigrationCase
         jobs: [Multi-Node Podman Acceptance]
 
   - requirement: Private test CA trust for both client engines
@@ -288,15 +295,23 @@ requirements:
   - requirement: Security and network isolation verification
     scenarios:
       - scenario: Unauthorized management access
-        cases: [FW-01, FW-02, FW-03, FW-04, AIO-NEG-PORT]
-        topologies: [aio, multi-node]
+        cases: [FW-01, FW-02, FW-03, FW-04, FW-05, FW-06, PO-FIREWALL, AIO-NEG-PORT]
+        topologies: [aio, multi-node, panel-only]
         tests:
           - tests.test_podman_denial.TestManagementDenialCase
           - tests.test_podman_denial.TestHostFirewallParsers
           - tests.test_podman_denial.TestHostFirewallIpv6Parsers
           - tests.test_podman_multi_node.TestMasterAccessCase
           - tests.test_podman_multi_node.TestIpv6PolicyCase
-        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+          - tests.test_podman_ingress_matrix.TestNodeApiGaps
+          - tests.test_podman_ingress_matrix.TestIpv6Mirror
+          - tests.test_podman_ingress_matrix.TestDeclaredPolicy
+          - tests.test_podman_ingress_matrix.TestReload
+          - tests.test_podman_ingress_matrix.TestCaseDriver
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - Panel-only Podman Acceptance
       - scenario: SSH host-key pinning rejects mismatch and supports rotation
         cases: [MN-SSHKEY]
         topologies: [multi-node]
@@ -350,19 +365,25 @@ requirements:
   - requirement: Failure injection and recovery
     scenarios:
       - scenario: Recovery after Worker outage
-        cases: [MN-OUTAGE, MN-RESTART, MN-SSH-DOWN]
+        cases: [MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-COMPOSED-MIXED]
         topologies: [multi-node]
         tests:
           - tests.test_podman_multi_node.TestWorkerOutageCase
           - tests.test_podman_multi_node.TestWorkerRestartCase
           - tests.test_podman_multi_node.TestSshServiceDownCase
+          - tests.test_podman_multi_node.TestWorkerResumeAndComposedMixedCase
         jobs: [Multi-Node Podman Acceptance, Multi-Node Lifecycle and Recovery Acceptance]
       - scenario: Interrupted operator execution
-        cases: [AIO-INTERRUPT]
-        topologies: [aio]
+        cases: [AIO-INTERRUPT, MN-WORKER-RESUME, MN-COMPOSED-MIXED]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_aio.TestChannelCases
-        jobs: [All-in-One Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance]
+          - tests.test_podman_multi_node.TestWorkerResumeAndComposedMixedCase
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - All-in-One Lifecycle and Recovery Acceptance
+          - Multi-Node Lifecycle and Recovery Acceptance
 
   - requirement: Independent topology CI gates
     scenarios:
@@ -1523,12 +1544,12 @@ behaviours:
       - tests.test_podman_multi_node.TestSshHostKeyCase.test_a_stale_pin_accepted_after_rotation_is_refused
     jobs: [Multi-Node Podman Acceptance]
 
-  - behaviour: The decoy apex is derived from the cover names each role resolves
+  - behaviour: The Master carries the selected cover apex and a Worker owns none
     requirement: Camouflage decoy and certificate lineage
     cases: [NGX-COVER-DERIVE]
     topologies: [multi-node]
     tests:
-      - tests.test_podman_multi_node.TestCoverDeriveCase.test_both_roles_report_the_derived_apex_and_their_binding
+      - tests.test_podman_multi_node.TestCoverDeriveCase.test_the_master_binds_the_selected_apex_and_the_worker_names_only_its_own
       - tests.test_podman_multi_node.TestCoverDeriveCase.test_the_generated_tables_run_the_shipped_decisions
     jobs: [Multi-Node Podman Acceptance]
 

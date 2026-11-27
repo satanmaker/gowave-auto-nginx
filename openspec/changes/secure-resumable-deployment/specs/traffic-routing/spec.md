@@ -33,6 +33,11 @@ The routing subsystem SHALL bind public TCP 443 through NGINX Stream, route visi
 - **WHEN** public SNI matches a Worker's primary, REALITY or enabled Vision name
 - **THEN** it reaches local 7443, 8443 or 8444 respectively; primary serves transport paths and static cover, its management and subscription paths are denied, and a same-zone Master's apex is not adopted by Worker.
 
+#### Scenario: XHTTP stream-up over a loopback HTTP/2 upstream
+- **WHEN** an Xray or Mihomo client uses its issued XHTTP `stream-up` profile on `/xhttp-down/` through the Master or Worker
+- **THEN** NGINX retains HTTP/2 on the TLS listener and forwards this path over cleartext HTTP/2 to `127.0.0.1:10001` using `grpc_pass`, without changing the public port, client transport, or WebSocket and Trojan routes.
+- **AND** acceptance requires the expected payload through each client on both roles; TLS negotiation or a response to an invalid XHTTP request is insufficient.
+
 #### Scenario: Xray REALITY loopback PROXY protocol acceptance
 - **WHEN** Stream forwards a PROXY protocol v1 header to REALITY
 - **THEN** Xray consumes it with `acceptProxyProtocol`, restores client source and proceeds without TLS framing errors.
@@ -91,6 +96,22 @@ The installer SHALL bootstrap TLS by issuing certificates for the host's primary
 - **THEN** only the Worker identities are issued or renewed, Master apex/www are absent from Worker SANs and ACME routes, and Master DNS, certificates and routes remain unchanged.
 
 ## ADDED Requirements
+
+### Requirement: Stream edge keeps an operational access log
+The port-443 stream router SHALL write one access-log line per connection to a managed name, in the same place an operator reads when diagnosing a deployment: the host's own NGINX log. The line SHALL carry the SNI the client sent, the negotiated transport protocol, the client address and the local port. The Panel and transport locations beneath the stream layer SHALL stay unlogged, so the log names edge connections rather than every proxied request.
+
+#### Scenario: A connection on a managed name is logged at the edge
+- **WHEN** a client completes a request through the Master's or the Worker's 443 under a managed domain
+- **THEN** the stream access log on that host holds a line with that domain as the SNI, the client's address and the port, and the request's own result is unchanged.
+
+#### Scenario: The edge log does not become a request log
+- **WHEN** the Panel or a transport location proxies a request behind the stream router
+- **THEN** no additional stream line is written for it, and the Panel's and transports' own logging stays as configured.
+
+#### Scenario: The log is rotated and its retention is documented
+- **WHEN** the edge log grows on a long-running host
+- **THEN** a logrotate rule rotates and compresses it, and the operator documentation states that the file records client addresses.
+
 
 ### Requirement: Explicit certificate identity and lineage ownership
 Certificate provisioning SHALL map each role hostname to its owning host, intended SANs and selected live lineage. Master and Worker SHALL adopt existing valid matching lineages consistently, reject unsuitable or unowned material, and verify served identity after activation. Same-zone Workers SHALL NOT issue or renew the Master's cover apex or www names.

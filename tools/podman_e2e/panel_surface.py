@@ -531,6 +531,9 @@ def cluster(panel: Panel) -> Dict[str, Any]:
             value = reference.get("uuid") if isinstance(reference, dict) else reference
             nodes_of_host.append(identifier(value))
         host_records.append({
+            # The digest, not the identifier: a Host has to be recognisable across
+            # two reads of the same cluster to prove a re-provision left it alone.
+            "uuid": identifier(host.get("uuid")),
             "remark": str(host.get("remark") or ""),
             "address": str(host.get("address") or ""),
             "port": host.get("port"),

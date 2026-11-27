@@ -182,7 +182,12 @@ topologies:
       worker-only: 18
       both: 20
     case_id_pattern: "MN-DP-{node}-{inbound}-{client}"
-    runtime_budget_seconds: 4500
+    # Measured on 2026-11-27 with all four distributions running concurrently on
+    # one host: the fast cells finished at 62-70 minutes, the slowest ones were
+    # still inside the case list at the old 4500 s deadline and owed the rest as
+    # INCOMPLETE. Four concurrent cells are the required local mode, so the
+    # deadline covers them; one cell per runner finishes well inside it.
+    runtime_budget_seconds: 6300
     gate: [pre-push, pr]
   # The Panel and the static decoy on one host, with no traffic plane: no local
   # node, no backend on 8443/8444 and no Vision inbound. It therefore owes no
@@ -194,7 +199,7 @@ topologies:
   #
   # Its budget matches the Multi-Node one because it runs the same two heavy
   # steps from that suite — a real install and a real `node add` — and the `pr`
-  # wave bounds one full wave plus one recovery wave at 4500 + 4500 s.
+  # wave bounds one full wave plus one recovery wave at 6300 + 6300 s.
   panel-only:
     nodes: []
     vision_combinations: []
@@ -204,8 +209,8 @@ topologies:
     gate: [pr]
 
 runtime_budget:
-  pre_push_total_seconds: 7200
-  pr_total_seconds: 9000
+  pre_push_total_seconds: 9600
+  pr_total_seconds: 12600
   nightly_total_seconds: 14400
   on_exhaustion: INCOMPLETE
 

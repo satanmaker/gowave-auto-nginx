@@ -110,3 +110,18 @@ Each host SHALL produce an atomic machine-readable security report and a readabl
 #### Scenario: Scope of DNS protection
 - **WHEN** the report explains verified system-resolver DoT
 - **THEN** it states that bypassing applications are not covered, DNSSEC is separate, and neither DoT nor the firewall is a guarantee of DPI invisibility or upstream DDoS protection.
+
+### Requirement: Pinned NGINX package provenance and security level
+The installer SHALL enforce one NGINX package policy for Panel-only, All-in-One and Worker provisioning. The primary source SHALL be the official signed NGINX stable APT repository and its approved exact package revisions for upstream `1.30.8`. Trust SHALL be scoped to that repository, and package versions, provenance and Stream capability SHALL be verified before NGINX is used by the deployment. The installer SHALL NOT select a floating latest version or downgrade a newer existing installation.
+
+#### Scenario: Approved official package is available
+- **WHEN** the signed official repository offers the approved revision for the target OS and architecture
+- **THEN** provisioning selects that exact revision and a compatible Stream-capable package set, and verifies the actual installation before using NGINX.
+
+#### Scenario: Official package is unavailable
+- **WHEN** the required official revision is unavailable without a repository authentication error
+- **THEN** provisioning may use a package from the signed distribution archive only if an explicitly approved revision covers all required applicable fixes, including CVE-2026-132779 where affected, and its installed revision and Stream capability are verified.
+
+#### Scenario: Neither source can establish a verified install
+- **WHEN** neither source qualifies, a repository authentication check fails, a downgrade would be required, or the installed package cannot be verified
+- **THEN** provisioning fails with a safe diagnostic identifying the source and version check, does not activate the managed NGINX configuration, and does not stop or replace a pre-existing service merely to work around the refusal.

@@ -665,6 +665,42 @@ class GoWaveClient:
         """
         return _extract_list(self.request("GET", "/api/nodes"), "nodes")
 
+    def verify_node_associations(self, node_uuid, profile_uuid, host_uuids):
+        if not node_uuid or not isinstance(profile_uuid, str) or not profile_uuid:
+            return False
+        if not isinstance(host_uuids, list) or not host_uuids or any(
+            not isinstance(uuid, str) or not uuid for uuid in host_uuids
+        ) or len(set(host_uuids)) != len(host_uuids):
+            return False
+        nodes = [node for node in self.list_nodes() if isinstance(node, dict) and node.get("uuid") == node_uuid]
+        if len(nodes) != 1:
+            return False
+        profile = nodes[0].get("configProfile")
+        if not isinstance(profile, dict) or profile.get("activeConfigProfileUuid") != profile_uuid:
+            return False
+        active = profile.get("activeInbounds")
+        if not isinstance(active, list):
+            return False
+        active_ids = [item.get("uuid") if isinstance(item, dict) else item for item in active]
+        if any(not isinstance(item, str) or not item for item in active_ids):
+            return False
+        recorded = set(host_uuids)
+        found = set()
+        matched_inbounds = set()
+        for host in _extract_list(self.request("GET", "/api/hosts"), "hosts"):
+            if not isinstance(host, dict) or host.get("uuid") not in recorded:
+                continue
+            host_uuid = host["uuid"]
+            ownership = host_ownership(host)
+            if host_uuid in found or ownership is None:
+                return False
+            owner_profile, inbound_uuid, owner_nodes = ownership
+            if owner_profile != profile_uuid or owner_nodes != (node_uuid,) or inbound_uuid in matched_inbounds:
+                return False
+            found.add(host_uuid)
+            matched_inbounds.add(inbound_uuid)
+        return found == recorded and matched_inbounds == set(active_ids)
+
     def associate_node(self, node_name, node_address, node_port, profile_uuid, inbound_uuids, existing_node_uuid=None):
         payload = {
             "name": node_name,
