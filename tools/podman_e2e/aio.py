@@ -3503,6 +3503,12 @@ def case_idempotent(product: AioProduct) -> Dict[str, Any]:
             "the repeated install rotated the credentials the served subscription carries, so "
             "every client that already imported it would stop working")
 
+    # The second install restarts the node, and the Panel answers before it has
+    # an endpoint again: a transfer attempted in that window comes back 503 with
+    # no endpoint report, which is the propagation lag every other data-plane case
+    # waits out. Measuring it here read as a product verdict (GitHub run
+    # 46114497205), so the case waits the same way they do.
+    product.wait_tunnel_ready("AIO-IDEMPOTENT")
     facts = product.traffic_facts("AIO-IDEMPOTENT", "traffic")
     expected = product.inbound_count * len(TRAFFIC_ENGINES)
     require("AIO-IDEMPOTENT", int(facts.get("transfer_count") or 0) == expected,

@@ -114,7 +114,9 @@ reinstalled node had registered an endpoint. The same case passed on the same
 distribution twice the same day (local `podman-aio-20261128T054644-8c6d8beb`
 and GitHub run `46111515705`), so the failure is a window, not a configuration.
 
-**Done when** the case waits for the endpoint the way every other data-plane case
+**Closed 2026-11-28:** the case now calls `wait_tunnel_ready` before its traffic
+probe, so the window is waited out instead of read as a verdict. Kept as the
+record of the measurement. **Done when** the case waits for the endpoint the way every other data-plane case
 already does (`wait_tunnel_ready`), and a run that hits the window reports the
 wait it performed instead of reading a 503 as a product verdict — or the case
 proves that the Panel publishes the endpoint before the install returns, and the
