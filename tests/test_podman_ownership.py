@@ -107,10 +107,16 @@ def _panel_copy(workdir, old, new, expected, suffix):
     root it derives from its own path, so the copy keeps that import reachable.
     """
     repo = Path(workdir) / f"repo-{suffix}"
-    (repo / "modules").mkdir(parents=True)
-    (repo / "modules" / "api_client.py").symlink_to(
-        ownership.PANEL_SECURITY.parent / "api_client.py")
-    (repo / "modules" / "security.sh").write_text(
+    modules = repo / "modules"
+    modules.mkdir(parents=True)
+    # The probe runs the real module graph with one clause damaged, so every
+    # module the copy reaches must exist: `security.sh` sources its siblings, and
+    # a fixture that listed them by hand fell behind the moment one was added.
+    for source in sorted(ownership.PANEL_SECURITY.parent.iterdir()):
+        if source.suffix in (".sh", ".py"):
+            (modules / source.name).symlink_to(source)
+    (modules / "security.sh").unlink()
+    (modules / "security.sh").write_text(
         _rewritten(ownership.PANEL_SECURITY, old, new, expected), encoding="utf-8")
     return repo
 

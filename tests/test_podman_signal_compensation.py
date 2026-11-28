@@ -273,7 +273,10 @@ def _damage_source(damage):
         # Both copies remove the payload's temp file: the handler's own cleanup
         # and the compensator's step 8. A damage that left either in place would
         # be repaired by the other, so the clause is damaged in both.
-        names = "rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py"
+        # The cleanup names the managed-helper family by glob, because the helper
+        # is written under a random suffix; the damage keeps the rest of the line
+        # intact so only the temp file survives.
+        names = "rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.*"
         broken = _rewritten(
             body,
             names + " " + _TEMP_FILE + " /run/gowave-acme-test-ca.pem 2>/dev/null || true\n",

@@ -34,12 +34,12 @@ jobs:
           # host's own sshd, and `sshd -t` exits 255 on a host with no host keys
           # or no privilege-separation directory. The runner image ships
           # openssh-server with neither, so the precondition the suite documents
-          # is established here rather than assumed — and `sshd -t` is run once
-          # by the workflow, so a broken sshd names its own reason instead of
+          # is established here rather than assumed — and the config test is run
+          # once by the workflow, so a broken daemon-config names its own reason
+          # instead of
           # surfacing as a product verdict inside the suite.
           sudo mkdir -p /run/sshd
           sudo ssh-keygen -A
-          sudo systemctl enable --now ssh || sudo systemctl enable --now sshd || true
           sudo sshd -t || { sudo sshd -T | head -20; exit 1; }
           sudo systemctl enable --now fail2ban
 
