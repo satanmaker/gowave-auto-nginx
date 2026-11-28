@@ -20,6 +20,7 @@ operator is the same narrow, test-only path the installer already validates.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from tools.podman_e2e import (
-    acme_fixture, argv_probe, client_image, ingress, matrix, target_image,
+    acme_fixture, argv_probe, client_image, ingress, matrix, run_setup, target_image,
 )
 
 # Two networks, because one block cannot satisfy both ends of the run.
@@ -41,7 +42,8 @@ from tools.podman_e2e import (
 # test-only override that refuses anything but a private address (so an operator
 # can never pass a public IP off as a NAT-ed host), and every fixture, both
 # probes, and the ACME directory live on it.
-CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24")
+NETWORK_RESERVATION_LOCK = Path("/run/lock/gowave-podman-e2e-networks.lock")
+CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24", "10.92.0.0/24")
 
 # The data network must carry real public addresses, because two independent
 # guards otherwise swallow the payload before it can prove egress:
@@ -62,7 +64,7 @@ CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24")
 # bytes look routable. Each candidate sits next to a documentation block so it is
 # easy to recognise in an evidence file, and the allocator skips any block the
 # workstation or another Podman network already claims.
-DATA_PREFIX_CANDIDATES = ("203.0.114.0/24", "198.51.101.0/24", "192.0.3.0/24")
+DATA_PREFIX_CANDIDATES = ("203.0.114.0/24", "198.51.101.0/24", "192.0.3.0/24", "203.0.115.0/24")
 
 DNS_OFFSET = 53
 TARGET_OFFSET = 10
@@ -402,6 +404,11 @@ class AioTopology:
     # than in the container layer or anywhere an artifact could reach them.
     backup_volumes: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
+    # The matrix topology these hosts belong to. ``--reuse`` reads it back from the
+    # setup record to decide which suite the kept cell can run, and the
+    # subclasses narrow it.
+    setup_topology = "aio"
+
     def _backup_volume(self, role: str) -> str:
         name = self.context.resource_name(f"backups-{role}")
         self.podman.volume_create(name)
@@ -424,7 +431,11 @@ class AioTopology:
         self.engine_client_name = self.context.resource_name("engines")
         self.payload_dir = self.context.secret_dir / "subscriptions"
         self._engine_image = ""
-        if self.plan is None:
+        # The id of the kept run whose hosts this instance was rebuilt on. Empty
+        # for a run that creates its own, and what makes ``create`` refuse.
+        self.adopted_from = ""
+        self._select_plan_on_create = self.plan is None
+        if self._select_plan_on_create:
             self.plan = allocate_plan(self.podman.network_subnets())
         if self.egress_resolvers is None:
             self.egress_resolvers = egress_resolvers()
@@ -434,7 +445,202 @@ class AioTopology:
         """The fixture zone for every name this topology installs."""
         return zone(self.plan)
 
+    def _setup_extra_containers(self) -> Dict[str, str]:
+        """The containers this contour adds beyond the shared fixtures.
+
+        The All-in-One host has none; a cluster's Worker and denial vantage are
+        appended by the subclass, so the same record builder serves both.
+        """
+        return {}
+
+    def setup_record(self) -> Dict[str, Any]:
+        """Everything a later process must know to attach to these hosts.
+
+        Read back by ``--reuse``. The record is deliberately a description of the
+        harness rather than of the product: the network plan and the addresses it
+        assigns, the fixture and secret directories the running containers mount,
+        the container names that were started, and the images they run. A field
+        this contour does not have is written as an empty string or zero instead
+        of being omitted, so an incomplete record is visible as such rather than
+        mistaken for a complete one with a shorter schema.
+        """
+        worker_vision = getattr(self, "worker_vision_domain", None)
+        containers = {
+            "dns": self.dns_name,
+            "target": self.target_name,
+            "echo": self.echo_name,
+            "client": self.client_name,
+            "engine_client": self.engine_client_name,
+            "acme": self.acme.name if self.acme is not None else "",
+        }
+        containers.update(self._setup_extra_containers())
+        return {
+            "schema": run_setup.SETUP_SCHEMA,
+            "run_id": self.context.run_id,
+            "topology": self.setup_topology,
+            "distribution": self.distribution,
+            "vision": {
+                "enabled": self.vision_domain is not None,
+                "worker_enabled": worker_vision is not None,
+                "combination": matrix.combination(
+                    self.setup_topology,
+                    self.vision_domain is not None,
+                    worker_vision is not None,
+                ),
+            },
+            # Where the record itself lives, so a copy of the directory can be
+            # told from the run it describes.
+            "artifact_root": str(self.context.artifact_dir.parent),
+            "secret_dir": str(self.context.secret_dir),
+            "fixtures": {
+                "dns": str(self.dns_dir) if self.dns_dir is not None else "",
+                "echo": str(self.echo_dir) if self.echo_dir is not None else "",
+                "acme": str(self.acme.directory) if self.acme is not None else "",
+                "client_ca": str(self._ca_dir) if self._ca_dir is not None else "",
+                "payloads": str(self.payload_dir),
+            },
+            "network": {
+                "control": {"name": self.network, "subnet": self.plan.subnet},
+                "data": {
+                    "name": self.data_network,
+                    "subnet": self.plan.data_subnet,
+                    "internal": True,
+                },
+            },
+            # Every role's recorded address, not only the two subnets: a case
+            # asserts which node answered on which address, so the plan a reused
+            # run rebuilds has to give the same answers as the one it replaces.
+            "addresses": {
+                "dns": self.plan.dns_ip,
+                "target": self.plan.target_ip,
+                "target_data": self.plan.data_target_ip,
+                "pebble": self.plan.pebble_ip,
+                "echo": self.plan.echo_ip,
+                "echo_data": self.plan.data_echo_ip,
+                "client": self.plan.client_ip,
+                "engine_client": self.plan.engine_client_ip,
+                "engine_client_data": self.plan.data_engine_client_ip,
+                "worker": self.plan.worker_ip,
+                "worker_data": self.plan.data_worker_ip,
+                "second_node": self.plan.second_node_ip,
+                "untrusted": self.plan.untrusted_ip,
+            },
+            "containers": containers,
+            "started": list(self.started),
+            "images": {
+                # The local tags a later case may need to start a role from, and
+                # the pinned references the run actually pulled. ``client`` names
+                # the tag a start would use; an empty ``started`` entry for the
+                # engine client is what tells adoption it was never started.
+                "target": target_image.tag(self.distribution),
+                "client": self._engine_image or client_image.tag(),
+                "fixture": FIXTURE_IMAGE,
+                "acme": acme_fixture.IMAGE_ALIAS,
+                "resolved": dict(self.context.environment.get("images_resolved") or {}),
+            },
+            "domains": {
+                "panel": self.panel_domain,
+                "reality": self.reality_domain,
+                "vision": self.vision_domain or "",
+                "worker": getattr(self, "worker_domain", "") or "",
+                "worker_reality": getattr(self, "worker_reality_domain", "") or "",
+                "worker_vision": worker_vision or "",
+                "cover_apex": COVER_APEX,
+                "dns_zone": DNS_ZONE_SUFFIX,
+            },
+            "admin_email": self.admin_email,
+            "egress_resolvers": list(self.egress_resolvers or []),
+            "ipv6": {
+                "enabled": bool(self.ipv6_host),
+                "address": self.ipv6_address,
+            },
+            "backup_volumes": {
+                role: dict(facts) for role, facts in self.backup_volumes.items()
+            },
+            "acme": {
+                "management_host_port": int(self.acme.management_host_port or 0)
+                if self.acme is not None and self.acme.management_host_port else 0,
+            },
+            "pre_install": dict(self._clean_facts),
+            "pre_install_worker": dict(getattr(self, "worker_clean_facts", {}) or {}),
+        }
+
+    def persist_setup(self) -> Path:
+        """Write this topology's setup record into the run's artifact directory."""
+        return run_setup.write_setup(self.context.artifact_dir, self.setup_record())
+
+    def _restore_container_names(self, containers: Dict[str, Any]) -> None:
+        """Address this contour's containers by the names the kept run gave them.
+
+        ``__post_init__`` names every resource after the adopting context's run id,
+        which is a different run; the record is the only account of the containers
+        that are actually running.
+        """
+        self.dns_name = str(containers["dns"])
+        self.target_name = str(containers["target"])
+        self.echo_name = str(containers["echo"])
+        self.client_name = str(containers["client"])
+        self.engine_client_name = str(containers["engine_client"])
+
+    def _restore_from_setup(self, record: Dict[str, Any]) -> "AioTopology":
+        """Rebuild this instance's run-scoped names and paths from a record.
+
+        Called after construction, because ``__post_init__`` names resources after
+        the context's own run id and reads the secret directory off that context.
+        Everything restored here is a fact the kept run wrote down; nothing is
+        allocated, created or started.
+        """
+        containers = record["containers"]
+        self.network = str(record["network"]["control"]["name"])
+        self.data_network = str(record["network"]["data"]["name"])
+        self._restore_container_names(containers)
+        fixtures = record["fixtures"]
+        self.payload_dir = Path(str(fixtures["payloads"]))
+        self.dns_dir = Path(str(fixtures["dns"])) if fixtures["dns"] else None
+        self.echo_dir = Path(str(fixtures["echo"])) if fixtures["echo"] else None
+        self._ca_dir = Path(str(fixtures["client_ca"]))
+        issued = self._ca_dir / ISSUED_ROOT_NAME
+        if not issued.is_file():
+            raise TopologyError(
+                f"the kept run recorded its client CA directory as {self._ca_dir}, but "
+                f"{issued.name} is not there, so the trust anchor its clients used cannot be rebuilt"
+            )
+        self._issued_root = issued.read_text(encoding="utf-8")
+        self.acme = adopt_acme_fixture(self.podman, record)
+        # The kept fixture reports the root it issued from; reading it back from
+        # the file its clients trust keeps a later probe from re-fetching it.
+        self.acme._root_pem = self._issued_root
+        # ``started`` is what ``require_roles`` reads: a role the kept run
+        # started is a role the adopting run must still find.
+        self.started = [str(name) for name in record["started"]]
+        # An engine client the kept run never started is started on demand by the
+        # first case that needs it, exactly as it would have been there; one that
+        # was started is never started again.
+        client_tag = str(record["images"].get("client") or "")
+        self._engine_image = client_tag if self.engine_client_name in self.started else ""
+        self.ipv6_host = bool(record["ipv6"]["enabled"])
+        self.ipv6_address = str(record["ipv6"].get("address") or "")
+        self.backup_volumes = {
+            str(role): {str(key): str(value) for key, value in (facts or {}).items()}
+            for role, facts in (record.get("backup_volumes") or {}).items()
+        }
+        self._clean_facts = dict(record.get("pre_install") or {})
+        # A single host never reads this, and a cluster reads it as the evidence
+        # its creation recorded; both keep the key so the attribute exists on
+        # either contour instead of only on the one that created its own hosts.
+        self.worker_clean_facts = dict(record.get("pre_install_worker") or {})
+        self.adopted_from = str(record["run_id"])
+        return self
+
     def create(self) -> "AioTopology":
+        if self.adopted_from:
+            # Adoption attaches to hosts that already exist. A second create here
+            # would install beside them under this run's name, which is the one
+            # thing ``--reuse`` exists to prevent.
+            raise TopologyError(
+                f"this topology was adopted from run {self.adopted_from}; its hosts exist and "
+                "a second create would provision a second cell beside them"
+            )
         if not self.egress_resolvers:
             consulted = ", ".join(
                 str(path) for path in (HOST_RESOLV_CONF, *SYSTEMD_UPSTREAM_RESOLV_CONFS)
@@ -443,15 +649,25 @@ class AioTopology:
                 f"no egress resolver found in {consulted}; the disposable host could not install packages"
             )
         self.payload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
-        self.podman.network_create(
-            self.data_network, self.plan.data_subnet, disable_dns=True, internal=True,
-        )
+        lock_fd = os.open(NETWORK_RESERVATION_LOCK, os.O_CREAT | os.O_NOFOLLOW | os.O_RDONLY, 0o600)
+        with os.fdopen(lock_fd, "rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._select_plan_on_create:
+                self.plan = allocate_plan(self.podman.network_subnets())
+            self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
+            self.podman.network_create(
+                self.data_network, self.plan.data_subnet, disable_dns=True, internal=True,
+            )
         self._start_dns()
         self._start_acme()
         self._start_target()
         self._start_echo()
         self._start_client()
+        # The run's plan, fixture paths, secret directory and container names are
+        # the only account of how to attach to these hosts later. They are written
+        # as soon as the roles exist, before any case can spend product time, so a
+        # kept run is adoptable even when every case after this one fails.
+        self.persist_setup()
         return self
 
     def _start_dns(self) -> None:
@@ -1067,6 +1283,10 @@ class AioTopology:
             "GOWAVE_PANEL_VERSION": pins.get("panel_version", "latest"),
             "GOWAVE_NODE_VERSION": pins.get("node_version", "latest"),
             "XRAY_SERVER_VERSION": pins.get("xray_version", ""),
+            # The cover apex is the name the operator selects, so the installed
+            # host is given one explicitly instead of relying on a suffix guess.
+            "GOWAVE_COVER_DOMAIN": COVER_APEX,
+            "GOWAVE_COVER_WWW": "yes",
             "DEBIAN_FRONTEND": "noninteractive",
         }
 
@@ -1202,6 +1422,7 @@ class MultiNodeTopology(AioTopology):
     # happens to enable.
     ipv6_host: bool = True
     target_role: str = "master"
+    setup_topology = "multi-node"
     # The prefix the registration's own two evidence files are named under. A
     # topology that reuses this command names them after itself, so a run
     # directory never files one contour's dispatch under another's name.
@@ -1306,7 +1527,20 @@ class MultiNodeTopology(AioTopology):
         super().create()
         self._start_worker()
         self._start_untrusted_client()
+        # The base write happened before these two roles existed; this second,
+        # atomic write is what makes the record describe the whole contour.
+        self.persist_setup()
         return self
+
+    def _setup_extra_containers(self) -> Dict[str, str]:
+        return {"worker": self.worker_name, "untrusted": self.untrusted_name}
+
+    def _restore_container_names(self, containers: Dict[str, Any]) -> None:
+        super()._restore_container_names(containers)
+        for attribute, role in (("worker_name", "worker"), ("untrusted_name", "untrusted")):
+            name = str(containers.get(role) or "")
+            if name:
+                setattr(self, attribute, name)
 
     # ------------------------------------------------------------------ roles
     def roles(self) -> List[Dict[str, Any]]:
@@ -1801,6 +2035,7 @@ class PanelOnlyTopology(MultiNodeTopology):
     # keeps the plain IPv4 shape the All-in-One contour installs.
     ipv6_host: bool = False
     target_role: str = "panel-only"
+    setup_topology = "panel-only"
     # The registration is the same product command the Multi-Node contour runs,
     # and its evidence must not be filed under that contour's prefix.
     node_add_evidence_prefix: str = "panel-only-node-add"
@@ -1853,3 +2088,98 @@ class PanelOnlyTopology(MultiNodeTopology):
         record = super().evidence(outcome)
         record["installation_mode"] = "panel-only"
         return record
+
+
+# Which class rebuilds a kept run's contour, keyed by the name the record carries.
+# A record naming a topology this module cannot rebuild is refused rather than
+# guessed at.
+ADOPTABLE = {
+    "aio": AioTopology,
+    "multi-node": MultiNodeTopology,
+    "panel-only": PanelOnlyTopology,
+}
+
+# The containers every complete record of a contour must name. The engine client
+# is absent on purpose: it is started on demand, so a cell that never needed one
+# is complete without it. A record missing any of these was written by a create
+# that stopped halfway, and adopting it would run cases against a half-built cell.
+SETUP_CONTAINER_ROLES: Dict[str, Sequence[str]] = {
+    "aio": ("dns", "target", "echo", "client", "acme"),
+    "multi-node": ("dns", "target", "echo", "client", "acme", "worker", "untrusted"),
+    "panel-only": ("dns", "target", "echo", "client", "acme", "worker", "untrusted"),
+}
+
+
+def adopt_acme_fixture(podman: Any, record: Dict[str, Any]) -> acme_fixture.AcmeFixture:
+    """Rebuild the ACME fixture object for a kept container, without starting it.
+
+    The fixture's CA material lives in the directory the kept container mounts, so
+    the object is reconstructed around that directory and the published management
+    port the record carries. Nothing is generated and nothing is started: a second
+    Pebble would issue from a second root and invalidate the lineage the kept host
+    already serves.
+    """
+    directory = Path(str(record["fixtures"]["acme"]))
+    port = int((record.get("acme") or {}).get("management_host_port") or 0)
+    fixture = acme_fixture.AcmeFixture(
+        podman,
+        str(record["network"]["control"]["name"]),
+        directory=directory,
+        extra_args=(
+            "--ip", str(record["addresses"]["pebble"]),
+            "--dns", str(record["addresses"]["dns"]),
+        ),
+        management_host_port=port or None,
+    )
+    fixture.ca = acme_fixture.FixtureCA(
+        directory=directory,
+        root_cert=directory / "fixture-root.crt",
+        root_key=directory / "fixture-root.key",
+    )
+    # The container is addressed by the name the kept run gave it, not by the name
+    # this instance's context would mint: the record is the only account of it.
+    fixture.name = str(record["containers"]["acme"])
+    return fixture
+
+
+def adopt_topology(podman: Any, record: Dict[str, Any]) -> AioTopology:
+    """Rebuild a kept run's topology from its setup record, creating nothing.
+
+    The plan comes from the record rather than from ``allocate_plan``: the kept
+    containers hold addresses in the recorded subnets, and a freshly allocated
+    pair would address hosts that are not there. ``AioTopology.__post_init__``
+    allocates only when it was given no plan, so passing one is what makes this
+    path allocation-free, and ``create`` refuses once ``adopted_from`` is set.
+    """
+    kind = str(record["topology"])
+    if kind not in ADOPTABLE:
+        raise TopologyError(
+            f"the setup record names topology {kind!r}, which this suite cannot rebuild "
+            f"(known: {', '.join(sorted(ADOPTABLE))})"
+        )
+    domains = record["domains"]
+    network = record["network"]
+    plan = NetworkPlan(
+        subnet=str(network["control"]["subnet"]),
+        data_subnet=str(network["data"]["subnet"]),
+    )
+    shared: Dict[str, Any] = {
+        "distribution": str(record["distribution"]),
+        "panel_domain": str(domains["panel"]),
+        "reality_domain": str(domains["reality"]),
+        "vision_domain": str(domains["vision"]) or None,
+        "admin_email": str(record["admin_email"]),
+        "plan": plan,
+        "egress_resolvers": [str(entry) for entry in record["egress_resolvers"]],
+    }
+    if kind == "aio":
+        host: AioTopology = AioTopology(podman, **shared)
+    else:
+        host = ADOPTABLE[kind](
+            podman,
+            worker_domain=str(domains["worker"]),
+            worker_reality_domain=str(domains["worker_reality"]),
+            worker_vision_domain=str(domains["worker_vision"]) or None,
+            **shared,
+        )
+    return host._restore_from_setup(record)

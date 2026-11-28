@@ -416,7 +416,12 @@ vision_domain=vision.example.test
                       '        rollback_failed=1\n',
                       compensation)
         self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
-        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
+        # The lineage this run snapshotted, with the plain name as the fallback
+        # when no suffix was adopted: the restore must name the same lineage the
+        # snapshot wrote, not the requested name blindly.
+        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "${_VISION_LINEAGE:-$VISION_DOMAIN}"',
+                      compensation)
+
     def test_case_matrix_counts_match_independent_vision_topologies(self):
         """Traffic and JUnit counts stay aligned for zero, one, or two Vision endpoints."""
         with tempfile.TemporaryDirectory() as td:

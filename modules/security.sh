@@ -4,6 +4,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANAGED_SECURITY_PY="${SCRIPT_DIR}/assets/security/managed.py"
+source "${SCRIPT_DIR}/modules/firewall.sh"
+source "${SCRIPT_DIR}/modules/tempdir.sh"
 
 configure_ssh_and_fail2ban() {
     echo "Configuring non-destructive SSH inspection and Fail2ban..."
@@ -11,8 +13,106 @@ configure_ssh_and_fail2ban() {
 }
 
 configure_dot() {
-    echo "Configuring strict DNS-over-TLS via systemd-resolved..."
-    python3 "$MANAGED_SECURITY_PY" --prepare-dns
+    local policy="${GOWAVE_DOT_POLICY:-best-effort}"
+    local output status
+    _DOT_RECOVERY=unknown
+    case "$policy" in
+        off|best-effort|required) ;;
+        *)
+            echo "Error: unsupported DNS-over-TLS policy '$policy'; expected off, best-effort or required." >&2
+            return 1
+            ;;
+    esac
+    echo "Configuring DNS-over-TLS policy: $policy..."
+    if output=$(GOWAVE_DOT_POLICY="$policy" python3 "$MANAGED_SECURITY_PY" --prepare-dns); then
+        printf '%s\n' "$output"
+        _DOT_RECOVERY=not-needed
+        return 0
+    fi
+    printf '%s\n' "$output"
+    status=$(printf '%s' "$output" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("status", ""))
+except Exception:
+    print("")' 2>/dev/null || true)
+    # Only a verified rollback may be tolerated, and only when the operator did
+    # not ask for DoT as a hard requirement: the host then keeps working
+    # resolution without it, and the run reports the control as failed.
+    if [[ "$policy" != "required" && "$status" == "failed_rolled_back" ]]; then
+        _DOT_RECOVERY=verified
+        echo "Warning: DNS-over-TLS was not applied; the original resolver state was restored and verified, so the deployment continues without it." >&2
+        return 0
+    fi
+    echo "Fatal: DNS-over-TLS policy '$policy' was not applied and the resolver rollback was not verified." >&2
+    return 1
+}
+
+write_security_report() {
+    # One report per host, produced from effective state rather than from the
+    # steps that configured it: the helper reads the firewall, the jail, the
+    # update schedule and the resolver back before it writes anything, so a
+    # control that drifted since it was configured is reported failed.
+    local role="${1:-}"
+    local node_port="${2-}"
+    local master_sources="${3:-}"
+    local ipv6="${4:-false}"
+    local dot_recovery="${5:-unknown}"
+    local request output rc=0
+    if [[ -z "$role" ]]; then
+        echo "Error: a security report needs the host role." >&2
+        return 1
+    fi
+    request=$(python3 -c 'import json,sys
+role, port, sources, ipv6, recovery = sys.argv[1:6]
+json.dump({"role": role,
+           "node_port": int(port) if port else None,
+           "master_sources": [item for item in sources.split(",") if item],
+           "ipv6": ipv6 == "true",
+           "dot_recovery": recovery}, sys.stdout)' \
+        "$role" "$node_port" "$master_sources" "$ipv6" "$dot_recovery") || return 1
+    if ! output=$(printf '%s' "$request" | python3 "$MANAGED_SECURITY_PY" --security-report); then
+        rc=1
+    fi
+    printf '%s\n' "$output"
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Error: this host is not ready for deployment; the security report names the control that failed." >&2
+        return 1
+    fi
+    return 0
+}
+
+verify_worker_security_readback() {
+    local host="$1" ipv4 ipv6 policy report
+    ipv4=$(resolve_panel_ipv4) || return 1
+    ipv6=$(resolve_panel_ipv6) || return 1
+    policy="${GOWAVE_DOT_POLICY:-best-effort}"
+    local remote_command
+    remote_command=$(python3 -c 'import ipaddress, shlex, sys
+port, v4, v6, policy = sys.argv[1:]
+if (not v4 or ipaddress.ip_address(v4).version != 4
+        or (v6 and ipaddress.ip_address(v6).version != 6)
+        or policy not in {"off", "best-effort", "required"}):
+    sys.exit(1)
+print(shlex.join(["python3", "-", "--worker-security-readback", port, v4, v6, policy]))' \
+        "$GOWAVE_SSH_NODE_PORT" "$ipv4" "$ipv6" "$policy" 2>/dev/null) || return 1
+    report=$(timeout 45 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=5 -o ClearAllForwardings=yes -o ForwardAgent=no -o UpdateHostKeys=no \
+        -p "${GOWAVE_SSH_PORT:-22}" -- "root@$host" "$remote_command" \
+        < "$MANAGED_SECURITY_PY" 2>/dev/null) || return 1
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+import json
+import sys
+from modules.security_report import StateError, readiness
+
+try:
+    report = json.load(sys.stdin)
+    status = readiness(report)
+    if report["role"] != "worker" or report["controls"]["dot"]["policy"] != sys.argv[1]:
+        sys.exit(1)
+except (StateError, ValueError, TypeError):
+    sys.exit(1)
+sys.exit(status != "ready")
+' "$policy" <<< "$report"
 }
 
 configure_unattended_upgrades() {
@@ -23,65 +123,67 @@ configure_unattended_upgrades() {
 configure_ufw() {
     local is_worker="${1:-false}"
     local panel_ip="${2:-}"
-    local node_port="${3:-3002}"
+    # `-` not `:-`: an absent port means the caller has no Node listener to
+    # isolate, while an explicit 3002 names the one this host does have.
+    local node_port="${3-3002}"
     local if_inet6="${4:-/proc/net/if_inet6}"
     local ufw_default="${5:-/etc/default/ufw}"
+    local root="${6:-/}"
 
     echo "Configuring UFW firewall rules..."
 
-    # Extract detected SSH ports
-    local ports_json
-    ports_json=$(python3 "$MANAGED_SECURITY_PY" --ssh-ports 2>/dev/null || echo '{"ports": [22]}')
-    local ports
-    mapfile -t ports < <(echo "$ports_json" | python3 -c 'import sys, json; print("\n".join(str(p) for p in json.load(sys.stdin).get("ports", [22])))')
-
-    if [[ ${#ports[@]} -eq 0 ]]; then
-        ports=(22)
+    # A Panel-only host has no Node listener, so its policy carries no Node
+    # exception; the role decides which ports are internal, not the caller.
+    local role=aio
+    local policy_port="${node_port:-3002}"
+    if [[ "$is_worker" == "true" ]]; then
+        role=worker
+    elif [[ -z "$node_port" ]]; then
+        role=panel-only
+    fi
+    if [[ "$role" == "worker" && -z "$panel_ip" ]]; then
+        echo "Warning: Panel IP not provided for worker UFW configuration." >&2
     fi
 
-    # 1. Whitelist detected SSH ports
-    for port in "${ports[@]}"; do
-        echo "UFW: Allowing SSH port $port/tcp..."
-        ufw allow "${port}/tcp" comment "SSH port" || true
-    done
-
-    # 2. Allow public web ports 80/443
-    echo "UFW: Allowing public ports 80/tcp and 443/tcp..."
-    ufw allow 80/tcp comment "HTTP ACME challenge" || true
-    ufw allow 443/tcp comment "HTTPS and Xray Stream" || true
-
-    # 3. Handle Node port (a Panel-only host has none)
-    if [[ -z "$node_port" ]]; then
-        echo "UFW: No local Node port to isolate (Panel-only installation)."
-    elif [[ "$is_worker" == "true" ]]; then
-        if [[ -n "$panel_ip" ]]; then
-            echo "UFW: Whitelisting Central Panel IP $panel_ip for Node port $node_port/tcp..."
-            ufw allow from "$panel_ip" to any port "$node_port" proto tcp comment "GoWave Panel control plane" || true
-        else
-            echo "Warning: Panel IP not provided for worker UFW configuration." >&2
-        fi
-    else
-        # All-in-One: strictly deny external access to local Node port 3002
-        echo "UFW: Blocking external access to local Node port $node_port/tcp..."
-        ufw deny "$node_port/tcp" comment "Isolate local GoWave Node from external access" || true
+    # One policy document serves the run: the rules the preflight approved are
+    # the rules applied below. A different role or port rebuilds and rechecks it
+    # rather than applying a verdict about a policy this step no longer uses.
+    if [[ -z "${_FIREWALL_POLICY_JSON:-}" ||
+          "${_FIREWALL_POLICY_ROLE:-}" != "$role" ||
+          "${_FIREWALL_POLICY_PORT:-}" != "$policy_port" ]]; then
+        firewall_prepare "$role" "$policy_port" "$panel_ip" "${PANEL_IPV6:-}" "$if_inet6" "$root" || return 1
     fi
+    firewall_begin_transaction "$root" || return 1
 
-    # 4. Handle IPv6 configuration in /etc/default/ufw
+    # The family declaration comes first: `ufw allow` only maintains
+    # user6.rules while the declaration says yes, so a host told yes after its
+    # rules were written keeps the package's v6 table instead of this policy's.
     if [[ -f "$ufw_default" ]]; then
-        # Same decision the listener generator makes, taken through the same
-        # helper: one host must never get ``[::]`` listeners without the v6
-        # rules that filter them, or the reverse.
-        if check_kernel_ipv6 "$if_inet6" 2>/dev/null; then
+        if [[ "${_FIREWALL_POLICY_IPV6:-false}" == "true" ]]; then
             echo "UFW: IPv6 active in kernel; setting IPV6=yes in $ufw_default..."
-            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
+            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || {
+                firewall_failed "writing IPV6=yes to $ufw_default failed"
+                return 1
+            }
         else
             echo "UFW: IPv6 disabled in kernel; setting IPV6=no in $ufw_default..."
-            sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || true
+            sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || {
+                firewall_failed "writing IPV6=no to $ufw_default failed"
+                return 1
+            }
         fi
     fi
 
-    # 5. Enable UFW
-    ufw --force enable || true
+    firewall_apply_policy || return 1
+
+    ufw --force enable </dev/null || {
+        firewall_failed "ufw --force enable failed"
+        return 1
+    }
+    firewall_verify "$root" || {
+        firewall_failed "the applied firewall policy does not read back from the running ruleset"
+        return 1
+    }
     echo "UFW configuration complete."
 }
 
@@ -330,4 +432,131 @@ EOF
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl restart --no-ask-password systemd-journald 2>/dev/null || true
     fi
+}
+
+# Aggregate Worker security reports onto the Master.
+#
+# After all Workers are onboarded and verified, this function reads each
+# host's effective-state security report and writes one aggregate document on
+# the Master. The Master re-reads itself when its stored report is older than
+# the freshness window; a Worker answers a fresh readback over the existing
+# trusted SSH channel. Every report is checked against its own timestamp, and
+# one stale host refuses the whole aggregate instead of letting it ride on its
+# siblings' freshness — the refusal names the host and its age. A Worker that
+# could not be read at all is kept as an explicit `fetch_failed` entry so the
+# gap stays visible, and the aggregate verdict is the weakest of its hosts.
+#
+# Reading an existing report never rewrites it. A rerun replaces the aggregate
+# atomically (private temp sibling, fsync, rename, directory sync), so a reader
+# sees the previous document or the new one, never a patched mixture.
+#
+# Args: none (reads GOWAVE_PLAN_* arrays, GOWAVE_SSH_* vars, MANAGED_SECURITY_PY,
+#       GOWAVE_STATE_DIR for the state directory)
+# Returns 0 when every host is ready or ready-with-warnings, 1 otherwise.
+aggregate_worker_security_reports() {
+    local state_dir="${GOWAVE_STATE_DIR:-/var/lib/gowave-auto-nginx}"
+    local master_path="${state_dir}/security-report.json"
+    local aggregate_path="${state_dir}/security-report-aggregate.json"
+    local owner_uid
+    owner_uid=$(id -u) || return 1
+
+    if [[ ! -f "$master_path" ]]; then
+        echo "Error: Master security report not found at $master_path" >&2
+        return 1
+    fi
+
+    # A stored report outside the freshness window is not evidence for this
+    # moment. Regenerate it from effective state before combining, rather than
+    # presenting an old Master readback next to fresh Worker ones. A report
+    # inside the window is used as it is; --check only reads it.
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m modules.security_report --check --path "$master_path" --owner-uid "$owner_uid" >/dev/null; then
+        local master_role node_port=""
+        master_role=$(python3 -c 'import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+role = report.get("role")
+if role not in {"aio", "panel-only"}:
+    sys.exit(1)
+print(role)' "$master_path" 2>/dev/null) || {
+            echo "Error: the Master security report at $master_path is stale and its role cannot be read for a fresh readback." >&2
+            return 1
+        }
+        if [[ "$master_role" == "aio" ]]; then
+            node_port=3002
+        fi
+        echo "Refreshing the Master security report: the recorded one is outside the freshness window."
+        write_security_report "$master_role" "$node_port" "" "${_FIREWALL_POLICY_IPV6:-false}" "${_DOT_RECOVERY:-unknown}" || {
+            echo "Error: the Master security report could not be refreshed; no aggregate was written." >&2
+            return 1
+        }
+    fi
+
+    local workdir
+    workdir=$(mktemp -d) || return 1
+    track_temp_dir "$workdir"
+    local rc=0 index=0 host entries='[]' request='' result
+
+    local ipv4 ipv6 policy
+    if ! ipv4=$(resolve_panel_ipv4) || ! ipv6=$(resolve_panel_ipv6); then
+        release_temp_dir "$workdir"
+        return 1
+    fi
+    policy="${GOWAVE_DOT_POLICY:-best-effort}"
+
+    for host in "${GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        [[ -n "$host" ]] || continue
+        # The name-to-file mapping is recorded before the fetch: a Worker whose
+        # readback fails then appears as a present gap, not as a missing row.
+        entries=$(python3 -c 'import json, sys
+entries = json.load(sys.stdin)
+entries.append({"name": sys.argv[1], "file": sys.argv[2]})
+print(json.dumps(entries))' "$host" "$index.json" <<< "$entries") || { rc=1; index=$((index + 1)); continue; }
+
+        local remote_command worker_report
+        remote_command=$(python3 -c 'import ipaddress, shlex, sys
+port, v4, v6, policy = sys.argv[1:]
+if (not v4 or ipaddress.ip_address(v4).version != 4
+        or (v6 and ipaddress.ip_address(v6).version != 6)
+        or policy not in {"off", "best-effort", "required"}):
+    sys.exit(1)
+print(shlex.join(["python3", "-", "--worker-security-readback", port, v4, v6, policy]))' \
+            "$GOWAVE_SSH_NODE_PORT" "$ipv4" "$ipv6" "$policy" 2>/dev/null) || {
+            echo "Warning: cannot build a security readback command for Worker $host" >&2
+            rc=1
+            index=$((index + 1))
+            continue
+        }
+
+        worker_report=$(timeout 45 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=5 -o ClearAllForwardings=yes -o ForwardAgent=no -o UpdateHostKeys=no \
+            -p "${GOWAVE_SSH_PORT:-22}" -- "root@$host" "$remote_command" \
+            < "$MANAGED_SECURITY_PY" 2>/dev/null) || {
+            echo "Warning: failed to fetch a security report from Worker $host" >&2
+            rc=1
+            index=$((index + 1))
+            continue
+        }
+        printf '%s' "$worker_report" > "$workdir/$index.json" || rc=1
+        index=$((index + 1))
+    done
+
+    request=$(printf '{"workers": %s}' "$entries") || { release_temp_dir "$workdir"; return 1; }
+    # Validation, the weakest-host reduction and the atomic replacement all
+    # live in one place; this shell only carries the readbacks to it. The
+    # request holds paths and host names, never a report body on argv.
+    result=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m modules.security_report --aggregate --master "$master_path" \
+        --workers "$workdir" --path "$aggregate_path" --owner-uid "$owner_uid" \
+        <<< "$request") || rc=1
+    release_temp_dir "$workdir"
+    if [[ -n "$result" ]]; then
+        printf '%s\n' "$result"
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        echo "Error: the security report aggregate was not written or names a host that is not ready." >&2
+        return 1
+    fi
+    echo "Security report aggregate written to $aggregate_path"
+    return 0
 }

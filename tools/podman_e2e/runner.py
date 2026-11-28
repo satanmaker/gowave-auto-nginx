@@ -34,6 +34,11 @@ INCOMPLETE = "INCOMPLETE"
 
 FAILING_STATES = {FAIL, BLOCKED, INCOMPLETE}
 
+#: How much of a case message the compact summary keeps. ``result.json`` carries
+#: the whole thing; the summary is what a person and an agent read first, and an
+#: unbounded message would make it as large as the file it summarizes.
+SUMMARY_MESSAGE_LIMIT = 400
+
 
 def repository_state(checkout: Optional[Path] = None) -> Dict[str, str]:
     """The commit and tree state the run is measuring, recorded with its result.
@@ -212,8 +217,20 @@ class RunContext:
         budget_seconds: int,
         run_id: Optional[str] = None,
         labels: Optional[Dict[str, str]] = None,
+        distribution: Optional[str] = None,
+        reused_from: Optional[str] = None,
+        keep: bool = False,
+        secret_dir: Optional[Path] = None,
     ) -> None:
         self.topology = topology
+        # The distribution is a fact about the hosts, not about the suite: a run
+        # that installed nothing (a unit test, a report probe) has none, and the
+        # summary then says nothing instead of naming a default it never used.
+        self.distribution = distribution
+        # The id of the earlier kept run whose hosts this run executes against.
+        # A run with one is never a full suite, so the artifact says so; it is
+        # ``None`` for every ordinary run, which installs its own hosts.
+        self.reused_from = reused_from
         self.run_id = run_id or f"podman-{topology}-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self.artifact_dir = artifact_root / self.run_id
         self.artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -230,10 +247,23 @@ class RunContext:
         # Every evidence file is listed here as it is written, so a case result can
         # name the files it produced instead of only inlining their content.
         self.evidence_files: List[str] = []
+        # ``keep`` is the switch behind ``--keep`` and behind an adopted run: the
+        # resources this context touches still belong to a cell someone needs, so
+        # the exit-time cleanup is not registered for them.
+        self.keep_resources = bool(keep)
         # Secrets never live under artifact_dir: artifacts are retained and shared.
-        self.secret_dir = Path(tempfile.mkdtemp(prefix=f"gowave-e2e-{self.run_id}-"))
+        # An adopting run is handed the kept run's directory because the running
+        # containers mount it — the payloads they read and the CA they trust are
+        # files inside it — and it never removes a directory it did not create.
+        if secret_dir is not None:
+            self.secret_dir = Path(secret_dir)
+            self.owns_secret_dir = False
+        else:
+            self.secret_dir = Path(tempfile.mkdtemp(prefix=f"gowave-e2e-{self.run_id}-"))
+            self.owns_secret_dir = not self.keep_resources
         self.secret_dir.chmod(0o700)
-        self.add_cleanup(lambda: shutil.rmtree(self.secret_dir, ignore_errors=True))
+        if self.owns_secret_dir:
+            self.add_cleanup(lambda: shutil.rmtree(self.secret_dir, ignore_errors=True))
         self._previous_signal_handlers: Dict[int, Any] = {}
 
     def install_signal_handlers(self) -> None:
@@ -306,6 +336,11 @@ class Runner:
         self.context = context
         self.cases: List[Case] = []
         self.results: List[CaseResult] = []
+        # Every case whose body was started, in the order it started. A declared
+        # case that the budget or an abort left unrun is reported INCOMPLETE, so
+        # the results alone cannot tell "ran and did not decide" from "never ran";
+        # the compact summary needs that difference.
+        self.executed: List[str] = []
         # Failure collectors are registered by the entrypoint instead of the
         # runner: collection needs Podman, while the runner stays a result
         # machine a unit test can drive without one.
@@ -342,6 +377,7 @@ class Runner:
                 if self.context.remaining() <= 0:
                     unexecuted = list(self.cases[index:])
                     break
+                self.executed.append(case.id)
                 started = time.monotonic()
                 evidence_before = len(self.context.evidence_files)
                 timeout, capped_by_budget = self._case_timeout(case)
@@ -492,7 +528,7 @@ class Runner:
             return record
 
         def payload() -> Dict[str, Any]:
-            return {
+            record: Dict[str, Any] = {
                 "schema": "gowave-podman-e2e-result/v1",
                 "run_id": self.context.run_id,
                 "topology": self.context.topology,
@@ -500,8 +536,18 @@ class Runner:
                 "duration": round(self.context.elapsed(), 3),
                 "budget_seconds": self.context.budget_seconds,
                 "environment": {**self.context.environment, "repository": repository_state()},
+                # Which cases actually ran, and which earlier run supplied the
+                # hosts. A case list cannot tell "ran and did not decide" from
+                # "never ran", and nothing else in the artifact says a run was
+                # only partly its own; ``summary.json`` reports both.
+                "executed": list(self.executed),
+                "reused": bool(self.context.reused_from),
+                "reused_from": self.context.reused_from,
                 "cases": [case_record(result) for result in self.results],
             }
+            if self.context.distribution:
+                record["distribution"] = self.context.distribution
+            return record
 
         data = payload()
         data["overall"] = overall_status(self.results)
@@ -635,6 +681,64 @@ def write_result(artifact_dir: Path, data: Dict[str, Any]) -> Path:
     tmp.chmod(0o600)
     os.replace(tmp, path)
     write_junit(artifact_dir, data)
+    write_summary(artifact_dir, data)
+    return path
+
+
+def summary_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The compact account of a run, derived from the same payload as ``result.json``.
+
+    ``result.json`` is the full record and runs to megabytes; a person or an
+    agent deciding what to do next reads counts, the non-PASS ids and the first
+    line of each message. Everything here is a projection of the result — the
+    summary can never disagree with the verdict it sits beside.
+    """
+    cases = data.get("cases", [])
+    counts: Dict[str, int] = {}
+    for case in cases:
+        status = str(case.get("status", ""))
+        counts[status] = counts.get(status, 0) + 1
+    summary: Dict[str, Any] = {
+        "schema": "gowave-podman-e2e-summary/v1",
+        "run_id": data.get("run_id", ""),
+        "topology": data.get("topology", ""),
+        "overall": data.get("overall", ""),
+        "counts": {status: counts[status] for status in sorted(counts)},
+        "executed": list(data.get("executed") or []),
+        "reused": bool(data.get("reused_from")),
+        "cases": [
+            {
+                "id": case.get("id", ""),
+                "status": case.get("status", ""),
+                "message": str(case.get("message", ""))[:SUMMARY_MESSAGE_LIMIT],
+            }
+            for case in cases
+            if case.get("status") != PASS
+        ],
+    }
+    distribution = data.get("distribution")
+    if distribution:
+        summary["distribution"] = str(distribution)
+    if data.get("reused_from"):
+        # A reused run is never a full suite, so the artifact names the run it
+        # borrowed its hosts from instead of leaving that to the operator.
+        summary["reused_from"] = str(data["reused_from"])
+    return summary
+
+
+def write_summary(artifact_dir: Path, data: Dict[str, Any]) -> Path:
+    """Write ``summary.json`` beside ``result.json``, atomically and world-readable.
+
+    Mode 0644 rather than the result's 0600: the summary is what someone reads
+    without root and without opening the full record, and it carries no evidence,
+    only ids, statuses and an already-redacted bounded message.
+    """
+    artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = artifact_dir / "summary.json"
+    tmp = artifact_dir / ".summary.json.tmp"
+    tmp.write_text(redact(json.dumps(summary_payload(data), indent=2)), encoding="utf-8")
+    tmp.chmod(0o644)
+    os.replace(tmp, path)
     return path
 
 

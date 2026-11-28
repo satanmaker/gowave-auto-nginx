@@ -47,6 +47,10 @@ CHALLENGE_TLS_PORT = 443
 
 CONTAINER_FIXTURE_DIR = "/fixtures/acme"
 
+# The pinned image alias the fixture starts from, named once because the run's
+# setup record carries it as one of the references the kept cell used.
+IMAGE_ALIAS = "acme-pebble"
+
 # Pebble rejects a percentage of requests with ``badNonce`` by default (5%) so
 # that ACME client retry logic can be exercised. That is a feature of Pebble's
 # own test suite, not of the product under test: here it would turn one install
@@ -281,7 +285,7 @@ class AcmeFixture:
         self.ca = prepare_acme_directory(self.directory)
         self.podman.run(
             name=self.name,
-            image_alias="acme-pebble",
+            image_alias=IMAGE_ALIAS,
             network=self.network,
             aliases=(self.host_alias,),
             privileged=False,
@@ -291,7 +295,12 @@ class AcmeFixture:
             systemd="false",
             extra_args=self._podman_args(),
         )
-        self.context.add_cleanup(self.stop)
+        # A kept run leaves the container behind: it is part of the cell a later
+        # ``--reuse`` attaches to, and removing it at exit would leave the kept
+        # hosts with an ACME directory nothing answers on. The run label still
+        # lets the stale-run sweep reclaim it once the cell is old.
+        if not getattr(self.context, "keep_resources", False):
+            self.context.add_cleanup(self.stop)
         return self
 
     def _podman_args(self) -> Sequence[str]:

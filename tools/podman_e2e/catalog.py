@@ -454,7 +454,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     {
         "id": "NGX-COVER-DERIVE",
         "requirement": "Camouflage decoy and certificate lineage",
-        "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",
+        "assertion": "No role derives a cover apex. The Master's is the name the deployment selected: its decision echoes no selection, the selected apex only when that apex resolves to the host itself, refuses the Panel's own name as a conflict and a value that is not a fully qualified domain name as such, and refuses an apex whose records do not resolve here while naming them; its rendered decoy claims the apex pair exactly when its own resolver points there and never carries the first-two-label derivation. A Worker owns no apex at all: the payload it is installed from defines none of the four decision functions, and its camouflage vhost names only the camouflage name its site was rendered for.",
         "topology": ["aio", "multi-node"],
         "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
     },
@@ -469,6 +469,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "id": "NGX-DECOY-ROUTE",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "On both roles the running stream map sends the cover apex and www.<apex> to the loopback listener 127.0.0.1:9443 — and no other name to it — while every VPN and panel name keeps its own local port and an unmatched SNI falls back to the node's own REALITY listener; the camouflage socket is bound to 127.0.0.1 only and refuses a real TCP connection from both client networks that reach 443 on the same host, and an independent client fetching the apex, its www and the REALITY name without REALITY authentication receives the rendered cover page over the installed lineage whose SAN list names both cover names.",
+        "topology": ["multi-node"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
+        "id": "MN-WORKER-EDGE",
+        "requirement": "Camouflage decoy and certificate lineage",
+        "assertion": "The Worker's public 443 is read twice — where the host keeps it and where a client meets it: the primary vhost names only the primary name, serves the rendered cover root with the brand's own 404 page and declares exactly one `/api/` refusal beside its three transport locations, the camouflage vhost carries the site and no location at all, and the Vision vhost exists exactly when the deployment names one, while the stream map sends each configured name to its own loopback port and no name straight to 9443; an independent client fetching the primary name receives the Worker's own front page and every asset it references byte for byte with the MIME type NGINX assigns, an unknown path and the scanned /metrics and /server-status are answered by the site's own 404 document, and the four management paths are closed without any HTTP status; the same client still receives the cover page and the closure while sending the Panel's name in its Host header, over a certificate that names the SNI it asked for and never that header, and a handshake with no SNI at all and an SNI the product never configured both end on the camouflage site over the REALITY lineage; a malformed ClientHello is answered by a closure or a TLS alert and never by an HTTP response, and public 443 still serves the site afterwards.",
         "topology": ["multi-node"],
         "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
     },
@@ -831,6 +838,55 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Independent Panel-only acceptance topology",
     },
     {
+        "id": "PO-FIREWALL",
+        "requirement": "Security and network isolation verification",
+        "assertion": (
+            "A Panel-only host has no Node API to expose: its applied rules carry no allow "
+            "for port 3002 and no listener binds it, and the shipped renderer asked for "
+            "that port and for a port the install never uses answers with no node port at "
+            "all, so no port number can invent one. The SSH ports the helper discovers on "
+            "that host stay reachable from every source, and the same decisions are read "
+            "back after `systemctl restart ufw.service`, the unit a boot runs, with the "
+            "unit still enabled."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "FW-05",
+        "requirement": "Security and network isolation verification",
+        "assertion": (
+            "On the All-in-One host the local Node's port is denied to every source with no "
+            "source-scoped allow beside it, so the Panel reaches it over loopback and nothing "
+            "else does; every SSH port the shipped helper discovers on that host stays "
+            "allowed to every source; the declaration the same helper renders for the "
+            "installed port matches the rules that were applied; the IPv6 half is required "
+            "whenever the kernel offers an address; and the identical decisions are read "
+            "back after `systemctl restart ufw.service` with the unit still enabled. The "
+            "All-in-One installs 3002 and offers no non-default port, so that half is "
+            "reported not applicable rather than rendered and called installed."
+        ),
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "FW-06",
+        "requirement": "Security and network isolation verification",
+        "assertion": (
+            "The pair's two rule sets answer one question: the Master denies its local Node "
+            "port to every source, and the Worker grants that port to exactly the Master "
+            "address it was registered with and to nobody else. The shipped renderer asked "
+            "for the Worker's installed port and for a port the run never used answers with "
+            "the same source-scoped grant and the same deny — the deny after the grant, so "
+            "the one permitted source still connects — and both hosts keep every discovered "
+            "SSH port public, mirror the decision on IPv6 where the kernel offers it, and "
+            "read the same decisions back after the unit a boot runs re-applies them, still "
+            "enabled."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
         "id": "PRE-PROXY-CIDR",
         "requirement": "Independent All-in-One acceptance topology",
         "assertion": "A requested name that resolves to an address inside the dated Cloudflare CIDR snapshot is refused before any certificate request: the preflight check names the domain, the proxied address, and the CIDR it falls in, and HTTP-01 is not attempted. An override GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 is honoured, and an unresolvable name is likewise refused with the resolution failure named.",
@@ -904,6 +960,62 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "id": "MN-WIZARD-FLOW",
         "requirement": "Independent Multi-Node acceptance topology",
         "assertion": "Entering a plan whose second Worker's cover domain repeats a name the plan already holds re-asks that field alone and keeps every earlier answer; the composed batch that follows onboards one Worker and prints it as registered and verified only with the uuid the Panel's own node list answered for it, records the other with its phase and diagnostic, offers the retry for the failed Worker alone, exits with the partial-success code, and returns to the menu, while the Panel's node list stays as it was because the plan was never applied.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "MN-MIGRATE",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "A Worker that still carries the legacy edge — its primary name terminating on 127.0.0.1:9443, so a management path is answered by the site's own 404 page instead of being closed — is re-provisioned through the operator's own `node reapply`: with no terminal and no confirmation the command exits non-zero after printing the preview that names the identity it would serve and the GOWAVE_MIGRATE_EXISTING=yes it needs, streams no payload and leaves the host's stream map byte-identical, while the confirmed run adopts the edge so that the stream map, the three vhosts and the cover site return byte for byte to the digests the product rendered, the management path is closed again, the port 80 vhost still answers that Worker's own HTTP-01 challenge from the client, and the Panel still publishes the same node uuid, profile, inbounds and Host records for that Worker, which is connected again afterwards.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "FW-08",
+        "requirement": "Security and network isolation verification",
+        "assertion": "A reload does not undo the managed ingress: with the policy applied, `ufw reload`, `systemctl reload nginx` and a full restart of the web server leave the IPv4 and IPv6 rule sets and the listening sockets byte-identical to the snapshot taken before them, so a certificate renewal cannot quietly replace a managed policy with an unmanaged one. A reload that exits non-zero, or a rule set or listener list that differs afterwards, fails the case.",
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "FW-07",
+        "requirement": "Security and network isolation verification",
+        "assertion": "Reloading the Worker's firewall ruleset does not cut the control path it runs over: an established multiplexed SSH session from the Master answers `-O check` after the Worker's own ruleset is reloaded from that same session, and the Worker's SSH unit is still active. A refusal that tears the session down, or a session that survives while the transport underneath is dead, fails the case — a fresh login is not evidence, because the policy allows the Master.",
+        "topology": ["multi-node"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "DOT-853",
+        "requirement": "Security and network isolation verification",
+        "assertion": "Closing the encrypted resolver port on an installed host degrades the optional DNS-over-TLS control without ever calling it delivered: the product's own DoT step fails at its verification stage, proves the previous resolver works again, and the host's own report calls the control failed with a verified recovery and a `ready-with-warnings` readiness; the same closed path under the required policy reports the same rollback but a `failed` readiness, so an optional degradation and a refused requirement are not the same outcome. The case removes its firewall chain again, re-establishes the installed policy, re-reads the report as `ready`, and compares the host's IPv4 and IPv6 rule sets with the snapshot it took before the first rule — a product that called DoT delivered, a report that conflated the control with its recovery, or a rule left on the host fails the case.",
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "DOT-RESTORE",
+        "requirement": "Security and network isolation verification",
+        "assertion": "A DNS-over-TLS rollback that cannot be proven working stops every policy: with the encrypted path closed and the step's own post-rollback resolution probe refused, both the best-effort and the required run report an unverified restoration, the host's report calls the DoT control failed with a failed recovery, and readiness is `failed` for both — an unproven rollback is never rounded into a warning. The case then removes its firewall chain and its probe, puts the installed policy back, reads the report as `ready` again and compares the rule sets with its own before-snapshot, so the host is left exactly as the install had it.",
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "NGX-PIN",
+        "requirement": "Independent Multi-Node acceptance topology",
+        "assertion": "Both roles carry the approved NGINX installation and not the distribution build: `dpkg-query -W nginx` on the Master and on the Worker reports exactly the suite-suffixed revision `1.30.8-1~<bookworm|trixie|noble|resolute>`, `nginx -V` shows both a static `--with-stream` and `--with-stream_ssl_preread_module` so the Stream SNI plane is really built in, and the host's APT history holds the download of `nginx_1.30.8-1~<suite>_<arch>.deb`, which the distribution archive cannot produce at that revision. A host left on its archive version, a build without the Stream SNI module, or an install with no record of the approved package fails the case instead of passing as configured.",
+        "topology": ["multi-node"],
+        "promotion_target": "Independent Multi-Node acceptance topology",
+    },
+    {
+        "id": "MN-WORKER-RESUME",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "A Worker that was successfully provisioned and deployed is re-verified on resume: the public TLS certificate for each planned SNI (primary, REALITY camouflage, optional Vision) is verified at the Worker's primary endpoint, and the security report is read back via trusted, non-interactive SSH to confirm role, DoT policy, firewall, Fail2ban, security updates and DNS policy freshness. A TLS or security readback failure holds only that Worker as indeterminate without repeating registration or affecting siblings. No temporary key is installed and no report is written remotely by the readback.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "MN-COMPOSED-MIXED",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "A full mixed-topology deployment (Panel + local Node + 1 remote Worker) runs through the real wizard flow with country entry, installs successfully, then simulates a Worker onboarding failure by breaking SSH connectivity, verifies the failure is clean, restores SSH and retries the Worker, sends SIGTERM during the retry to test interruption handling, restarts the Worker service, and finally verifies the Panel readback shows the Worker as connected with TLS verified, security report ready, and all identities (node name, credentials) preserved across the failure/retry/interrupt/restart cycle.",
         "topology": ["multi-node"],
         "promotion_target": "Distributed Worker VPS Deployment Verification",
     },

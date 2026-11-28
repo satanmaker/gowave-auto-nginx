@@ -237,6 +237,7 @@ be published.
 - **NGX-COVER-DERIVE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-COVER-SITE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-DECOY-ROUTE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
+- **MN-WORKER-EDGE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-COVER-UNRESOLVED** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-WORKER-ACME80** — promotion target: Distributed Worker VPS Deployment Verification
 - **TLS-VERIFY-ANCHORS** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
@@ -277,6 +278,9 @@ be published.
 - **PO-API** — promotion target: Independent Panel-only acceptance topology
 - **PO-SQUAD** — promotion target: Independent Panel-only acceptance topology
 - **PO-SQUAD-REFUSED** — promotion target: Independent Panel-only acceptance topology
+- **PO-FIREWALL** — promotion target: Independent Panel-only acceptance topology
+- **FW-05** — promotion target: Security and network isolation verification
+- **FW-06** — promotion target: Security and network isolation verification
 - **PRE-PROXY-CIDR** — promotion target: All-in-One Master VPS Installation Verification
 - **PRE-PROXY-CIDR-OVERRIDE** — promotion target: All-in-One Master VPS Installation Verification
 - **TLS-LINEAGE** — promotion target: All-in-One Master VPS Installation Verification
@@ -288,6 +292,14 @@ be published.
 - **MN-PARTIAL-SUCCESS** — promotion target: Distributed Worker VPS Deployment Verification
 - **MN-ADD-NODE-REFUSED** — promotion target: Distributed Worker VPS Deployment Verification
 - **MN-WIZARD-FLOW** — promotion target: Distributed Worker VPS Deployment Verification
+- **MN-MIGRATE** — promotion target: Distributed Worker VPS Deployment Verification
+- **FW-08** — promotion target: Security and network isolation verification
+- **FW-07** — promotion target: Security and network isolation verification
+- **DOT-853** — promotion target: Security and network isolation verification
+- **DOT-RESTORE** — promotion target: Security and network isolation verification
+- **NGX-PIN** — promotion target: Independent Multi-Node acceptance topology
+- **MN-WORKER-RESUME** — promotion target: Distributed Worker VPS Deployment Verification
+- **MN-COMPOSED-MIXED** — promotion target: Distributed Worker VPS Deployment Verification
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

@@ -23,6 +23,11 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from tools import pre_push_e2e as gate  # noqa: E402
 
+#: The deadline the manifest declares for this tier. The gate quotes it in its own
+#: verdict, so a test that pinned the number failed the day the tier's budget was
+#: raised while the gate went on being right.
+budget = gate.load_matrix().get("runtime_budget", {}).get("pre_push_total_seconds")
+
 COMMIT = "6be5a9a0c9626933f068ceafe06d24d64cb0db10"
 
 
@@ -98,22 +103,22 @@ class TestPrePushGate(unittest.TestCase):
         self.assertIn("aio passed", out)
         self.assertIn("multi-node passed", out)
         self.assertIn(
-            "both suites took 0.0s of the 7200s tests/cases/matrix.yaml declares "
+            f"both suites took 0.0s of the {budget}s tests/cases/matrix.yaml declares "
             "for the pre-push tier",
             out,
         )
         self.assertIn("every gated suite passed; the push may continue", out)
 
     def test_a_gate_that_outspends_the_declared_tier_budget_blocks_the_push(self):
-        status, out, err, calls = self.run_gate(clock=[0.0, 7201.0])
+        status, out, err, calls = self.run_gate(clock=[0.0, budget + 1.0])
         self.assertEqual(status, 1)
         self.assertEqual(len(calls), 2, "the pair ran; the total is judged afterwards")
-        self.assertIn("past the 7200s the matrix declares", err)
+        self.assertIn(f"past the {budget}s the matrix declares", err)
         self.assertIn("the push is blocked", err)
         self.assertNotIn("every gated suite passed", out)
 
     def test_a_gate_exactly_at_the_declared_total_is_not_over_it(self):
-        status, _out, _err, _calls = self.run_gate(clock=[0.0, 7200.0])
+        status, _out, _err, _calls = self.run_gate(clock=[0.0, float(budget)])
         self.assertEqual(status, 0)
 
     def test_the_gate_refuses_to_run_without_root(self):

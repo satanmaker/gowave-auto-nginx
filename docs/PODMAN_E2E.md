@@ -72,7 +72,11 @@ sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
 | `--vision` | off | Install the optional VLESS Vision inbound. The positive-case count becomes 10 instead of 8 (AIO) or 18/20 instead of 16 (Multi-Node). Refused on `panel-only`, which has no traffic plane to terminate it. |
 | `--worker-vision` | off | Configure the same optional inbound on the Multi-Node Worker. Refused on `aio`, which has no Worker, and on `panel-only`, which has no node. |
 | `--artifact-root` | `artifacts/podman-e2e` | Directory the run's own run directory is created under. |
-| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `4500` (Multi-Node), `4500` (Panel-only) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
+| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `6300` (Multi-Node), `4500` (Panel-only) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
+| `--all-distributions` | off | Run the selected suite concurrently on all four pinned distributions, each in its own run directory; the exit status is `0` only if every cell passes and left a `PASS` result. |
+| `--only CASE[,CASE...]` | every declared case | Run only the named cases, in the suite's declared order. An id the suite does not declare exits `2` before any container is created (also honoured by each cell of `--all-distributions`). |
+| `--keep` | off | Leave the run's hosts, network, volumes and run directory in place and print the run id and how to reuse it. Nothing else about the verdict changes. |
+| `--reuse RUN_ID` | — | Adopt a kept run instead of installing again. The run writes `run-setup.json` (0600) at creation — network plan, role addresses, image references, fixture and secret directories — and `--keep` leaves those resources in place. Adoption verifies every recorded container, both networks with their subnets, the secret directory and the fixture paths, and refuses with the first missing item named, never reinstalling under the name of reuse. The adopted run gets a new artifact directory that records `reused: true` and the source run id, starts no install, and excludes the provisioning cases (naming one explicitly is an error). Chained adoption is refused. |
 | `--require-group` | — | Fail the run unless every case id of a declared group was present and passed. Today the only group is `recovery`. |
 
 Exit status is `0` only when `result.json` says `overall: PASS`; every other
@@ -91,8 +95,18 @@ runs beside the Multi-Node suite). The registration runs through the operator's
 own `node add` against a second clean host, because a Panel-only deployment has
 no local node whose squad could be read.
 
+A data-plane case proves that a request reached the intended host by reading
+that host's own stream access log — `/var/log/nginx/gowave-edge-access.log`, one
+line per connection with the SNI, the protocol, the client address and the port
+— and requiring a line naming the request's SNI. This is the file an operator
+reads after a real deployment, and it is the product's own router that writes it.
+A missing line fails the case instead of returning `INCOMPLETE`. The raw packet
+capture remains only as a fallback for a host that predates the log: inside an
+unprivileged container namespace it can observe nothing at all, so an empty
+capture no longer decides a verdict.
+
 The deadline is the `runtime_budget_seconds` the manifest declares for the
-topology — 2700 s, 4500 s and 4500 s — and it is a ceiling rather than a
+topology — 2700 s, 6300 s and 4500 s — and it is a ceiling rather than a
 default: a run that asks for more wall clock than the matrix promises has left
 the envelope the `pre-push` and `pr` tiers are defined by, so the entrypoint
 refuses it (`--budget-seconds` may only tighten). Every run also executes `GATE-BUDGET`
@@ -102,10 +116,12 @@ back to prove the unexecuted case is named and `overall` is `INCOMPLETE` rather
 than a shorter green.
 
 The tier totals in the same manifest are enforced where the tier runs:
-`runtime_budget.pre_push_total_seconds` (7200 s) is measured across both suites
+`runtime_budget.pre_push_total_seconds` (9600 s) is measured across both suites
 by `tools/pre_push_e2e.py` and blocks the push when exceeded, and
-`runtime_budget.pr_total_seconds` (9000 s) bounds one full wave plus one recovery
-wave of the required checks — `python3 -m tools.podman_e2e.gate --check` refuses
+`runtime_budget.pr_total_seconds` (12600 s) bounds one full wave plus one recovery
+wave of the required checks; the Multi-Node deadline covers the four-distribution
+concurrent mode, where the slowest cell finished at 62-70 minutes —
+`python3 -m tools.podman_e2e.gate --check` refuses
 a job timeout that does not leave those budgets room, because a job GitHub kills
 at its timeout reports nothing at all.
 

@@ -265,7 +265,7 @@ class TestPanelOnlyNginxRendering(unittest.TestCase):
             command = (
                 f'source "{NGINX_SH}" && generate_stream_config {_quote(panel, reality, out, inet6, vision, cover, mode)}'
             )
-            finished = _run_bash(command)
+            finished = _run_bash(command, env={"GOWAVE_COVER_WWW": "yes"})
             self.assertEqual(finished.returncode, 0, finished.stderr)
             return out.read_text(encoding="utf-8")
 
@@ -344,6 +344,22 @@ class TestInstallSourceContract(unittest.TestCase):
             body.index("client.provision_hosts("),
         )
 
+    def test_install_records_the_owned_names_before_issuing_certificates(self):
+        """A run that dies mid-issuance still leaves the selection it made.
+
+        The record is also the only place the role and the SAN sets exist for a
+        later migration: re-deriving them from the transport names is exactly
+        the suffix guess this change removed.
+        """
+        text = GOWAVE_AUTO.read_text(encoding="utf-8")
+        self.assertLess(
+            text.index('record_domain_ownership "$STATE_FILE" master'),
+            text.index("Acquiring Let's Encrypt TLS certificate for Panel"),
+            "ownership must be recorded before the first issuance",
+        )
+        self.assertIn('reality_cert_args+=(-d "$cover_name")', text)
+        self.assertIn("reality_cert_flags+=(--expand)", text)
+
     def test_domain_change_reads_the_recorded_mode(self):
         text = GOWAVE_AUTO.read_text(encoding="utf-8")
         self.assertIn("install_mode=$(installation_mode_from_state)", text)
@@ -354,7 +370,7 @@ class TestInstallSourceContract(unittest.TestCase):
 
 
 class TestInstallProvisioning(unittest.TestCase):
-    def run_install_heredoc(self, mode, vision="", env=""):
+    def run_install_heredoc(self, mode, vision="", env="", state_seed=None):
         body = _heredoc_after(INSTALL_HEREDOC_MARKER)
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -364,6 +380,8 @@ class TestInstallProvisioning(unittest.TestCase):
             script = root / "install_provision.py"
             script.write_text(body, encoding="utf-8")
             state = root / "state.json"
+            if state_seed is not None:
+                state.write_text(json.dumps(state_seed), encoding="utf-8")
             journal = root / "journal.json"
             credentials = root / "credentials.txt"
             log = root / "calls.jsonl"
@@ -379,6 +397,24 @@ class TestInstallProvisioning(unittest.TestCase):
                 state.read_text(encoding="utf-8") if state.exists() else None,
                 credentials.exists(),
             )
+
+    def test_provisioning_preserves_the_domain_ownership_record(self):
+        seed = {
+            "domainOwnership": {
+                "role": "master",
+                "names": {"panel": "panel.example.com", "reality": "cdn.example.com"},
+                "sans": {"panel": ["panel.example.com"], "reality": ["cdn.example.com"]},
+            },
+            "certificateLineages": {"panel": "panel.example.com"},
+        }
+        for mode in ("all-in-one", "panel-only"):
+            with self.subTest(mode=mode):
+                finished, _calls, state, _credentials = self.run_install_heredoc(mode, state_seed=seed)
+                self.assertEqual(finished.returncode, 0, finished.stderr)
+                document = json.loads(state)
+                self.assertEqual(document["domainOwnership"], seed["domainOwnership"])
+                self.assertEqual(document["certificateLineages"], seed["certificateLineages"])
+                self.assertEqual(document["installationMode"], mode)
 
     def test_all_in_one_provisions_the_local_node_in_order(self):
         finished, calls, state, _credentials = self.run_install_heredoc("all-in-one")

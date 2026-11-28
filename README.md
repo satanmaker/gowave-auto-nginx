@@ -155,7 +155,8 @@ A domain argument is a hostname, not a URL, path or IP address.
 | Worker entry | `node1.example.net` | Worker VPS, e.g. `203.0.113.20` | Remote client endpoint, not another Panel UI |
 | Worker camouflage | `cover1.example.net` | Same Worker VPS | Worker REALITY SNI/static decoy |
 | Optional Worker Vision | `vision1.example.net` | Same Worker VPS | Worker's TLS Vision endpoint |
-| Optional apex + `www` cover | `example.com`, `www.example.com` | One chosen owning host | Additional static cover names, enabled only when both resolve here |
+| Optional Master cover apex | `example.com` | The Master VPS you select | Static cover site for the bare address; selected explicitly, never inferred |
+| Optional Master `www` alias | `www.example.com` | Same Master VPS | Second cover name, only when enabled with `GOWAVE_COVER_WWW=yes` (default `no`) |
 
 Use distinct entry, camouflage and optional Vision names for each host. The wizard refuses duplicate
 names in the deployment plan and lets you correct the offending field. A Worker does not reuse the
@@ -164,9 +165,26 @@ separate subdomains and account for the shared issuance budget.
 
 Use **DNS-only** records, not Cloudflare orange-cloud/proxied records: the preflight refuses known
 proxied answers. HTTP-01 validation must reach this host on port 80. Do not add a speculative AAAA
-record; a stale IPv6 answer can break validation and clients despite a correct A record. The current
-optional cover-apex helper derives the last two labels of the entry name; for multi-label public
-suffixes, inspect the offered names rather than assuming public-suffix-aware discovery.
+record; a stale IPv6 answer can break validation and clients despite a correct A record.
+
+**The Master cover apex is selected, not derived.** The reviewed plan picks it, or a positional
+install sets `GOWAVE_COVER_DOMAIN`; `www` is a separate alias (`GOWAVE_COVER_WWW`, default `no`).
+There is no public-suffix guessing: a deployment that selects no apex serves no cover under an
+inferred one, and a selection that is not a hostname, repeats the Panel name, or does not resolve to
+this host is refused with its reason. A Worker has no apex at all: it serves the camouflage site
+under its own camouflage name, which is also its REALITY SNI, so a Worker never claims the Master's
+apex.
+
+DNS-to-host examples:
+
+| Topology | Records | Result |
+| --- | --- | --- |
+| Master with cover, own zone | `panel.example.com`, `cover.example.com`, `example.com`, optional `www.example.com` → `203.0.113.10` | One host owns the apex pair; the cover certificate names the names you selected |
+| Same-zone Worker | `node1.example.com`, `cover1.example.com`, `vision1.example.com` → `203.0.113.20` | Worker issues only its own names; the Master apex/`www` stay on the Master |
+| Worker in its own zone | `node2.example.net`, `cover2.example.net` → `203.0.113.30` | Worker camouflage lives under its own `cover2.example.net`; it does not claim `example.net` or another zone's apex |
+
+Never move the Master apex or its `www` to a Worker: two hosts cannot validate the same HTTP-01
+names, and the certificate would be issued on the wrong machine.
 
 ### Port plan
 
@@ -185,10 +203,17 @@ All ports listed here are TCP. These are roles, not instructions to expose every
 | `9443` | Static decoy/fallback | Loopback, not a separate public management interface |
 | `10001`, `10002`, `10003` | XHTTP, WebSocket, Trojan gRPC backends | Loopback behind NGINX |
 
+On both Master and Worker, `/xhttp-down/` carries VLESS XHTTP `stream-up`. NGINX terminates TLS and forwards this location over cleartext HTTP/2 to Xray at `127.0.0.1:10001` using `grpc_pass`. This is an internal hop, not a gRPC subscription or another public port.
+
+The port-443 stream router writes one line per connection to `/var/log/nginx/gowave-edge-access.log`: the SNI the client sent, the negotiated protocol, the client address and the local port. This is the file to read when you need to know which host carried a connection and under which name. It contains client addresses, so treat it like any other access log; the `gowave-*.log` rotation rule already covers it. The Panel and the transport locations stay unlogged.
+
 The preflight also reserves `3001` and `9444` along with the above managed ports. A free/reserved port
 does not mean a service should be listening on it. On Workers, replicate the Panel-only restriction for
 3002 in the provider firewall; allowing it globally is not required. For strict DoT, outbound TCP 853
 must work. Restrict inbound rules without blocking established outbound connections and ACME/downloads.
+The per-role rule matrix, the conflicts the preflight refuses, the exceptions it preserves and the
+route back from a failed firewall change are documented in
+[Node API ingress and firewall recovery](docs/SETUP_WIZARD.md#node-api-ingress-and-firewall-recovery--входящий-доступ-к-node-api-и-восстановление-файрвола).
 
 ### Certificate policy
 
@@ -209,6 +234,56 @@ not evidence that issuance is available now; other CA limits also apply.
   the five-per-exact-set limit at about five hosts per week; it does not remove the shared budget.
 
 Prepare DNS first, allow propagation, and review the names and count before confirming deployment.
+
+### Browser fallback and what the camouflage listener serves
+
+The camouflage name is where a browser, a scanner or an unauthenticated TLS probe lands; it is not a
+control surface. Over HTTPS on any traffic host it serves the static cover site rendered from the
+bundled assets — the same site on the public listener, on the REALITY fallback through
+`127.0.0.1:9443` and on the Worker's own edge. A known asset comes from the rendered tree, an unknown
+ordinary path returns the site's branded `404` page, and a malformed ClientHello may be closed
+without any HTTP answer at all.
+
+- **No management content on that path.** On the Worker's primary listener `/api/` — management and
+  subscription paths alike — is refused before the static handler, and the decoy listener declares no
+  Panel, API or subscription location at all. An unauthenticated probe never reads control data,
+  however it names the host.
+- **Unknown, absent or mismatched names fall back, they do not escalate.** An SNI the stream map does
+  not list, an absent SNI and a request whose `Host` differs from the presented SNI end in cover or in
+  a closed connection, never in Panel content.
+- **The fallback listeners are not public.** `9443` and the decoy are reachable on loopback only; do
+  not open them at the provider or in the host firewall, and do not read the cover site's
+  availability as evidence that the Panel is healthy.
+
+### Certificate names and who owns them
+
+Each role issues only the names it owns and serves them from the lineage it selected:
+
+| Role | Names in its lineages | Never included |
+| --- | --- | --- |
+| Panel host | `panel_domain`, the camouflage name, optional Vision; the selected cover apex and `www` only when this host owns them | Names of another host |
+| Worker | Its entry name, its camouflage name, optional Vision | The Master's apex, `www` or camouflage name |
+
+An existing certificate is adopted only when it covers the intended name, names the expected issuing
+directory and is still valid; the listener is then rendered from the live path that lineage actually
+uses, not from an assumed directory name. Wrong SANs, an expired leaf, a key that does not match or a
+name the host does not own are refused before activation, and after activation the served certificate
+is read back from the client side. A same-zone Worker renews only its own lineages; the Master's pair
+is never touched by a Worker step.
+
+### Renewal and what a successful install proves
+
+Renewal is HTTP-01 through the port 80 vhost, so that vhost is production state: it serves
+`/.well-known/acme-challenge/` for every name this host owns, redirects other requests on those names
+to their HTTPS endpoint and refuses every other host. Once the production configuration is live, the
+installer runs `certbot renew --dry-run --cert-name <lineage>` for each lineage the run owns, through
+NGINX and the recorded authenticator, before it reports success; a dry run that fails fails the step.
+Later renewals come from `certbot.timer`, and the deploy hook
+`/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` runs `nginx -t` and reloads only when the
+configuration validates.
+
+Do not reinstall to investigate a renewal failure: the remaining CA budget cannot be queried, so read
+the Certbot logs, the renewal configuration and the port 80 path first.
 
 <a id="installation"></a>
 ## 6. Installation
@@ -421,6 +496,80 @@ use the menu's add-node action later. Do not retry an unverified remote result a
 failure: first inspect the actual Panel to avoid conflicting registrations. `node list` shows stored
 state; also check the live Panel inventory and the Worker's service/logs.
 
+<a id="progress-stages"></a>
+## Progress stages, budgets and recovery actions
+
+The wizard and onboarding flow report safe, allowlisted stages with finite budgets. Stages are
+machine-readable markers on stderr; raw credential-bearing output is never used as progress. When
+no controlling terminal exists, safe events go to the documented event sink instead of `/dev/null`.
+
+### Stage catalog and budgets (onboarding SSH path)
+
+| Stage | Budget | Description | Recovery on timeout/failure |
+| --- | --- | --- | --- |
+| `prepare_key` | 2 min | Generate temporary Ed25519 key for bootstrap | Retry; key is disposable |
+| `scan` | 2 min | Read Worker SSH host public key | Verify network/DNS; retry |
+| `fingerprint` | 1 min | Compute SHA256 fingerprint | Retry; local operation |
+| `confirm_fingerprint` | 5 min | Wait for operator fingerprint confirmation | Operator action required |
+| `resolve_ip` | 2 min | DNS resolve Worker address | Fix DNS; retry |
+| `pin_host_key` | 1 min | Pin confirmed host key to known_hosts | Retry; local operation |
+| `prepare_password` | 3 min | Read SSH password for key authorization | Provide password file 0600 |
+| `authorise` | 3 min | Authorize temporary key on Worker | Verify password/key; retry |
+| `start_agent` | 2 min | Load key into SSH agent | Retry; local operation |
+| `country` | 3 min | Collect country entry for GeoIP | Operator input required |
+| `registration` | 2 min | Register Worker in Panel API | Check Panel health; retry |
+| `add_node` | 3 min | Panel node provisioning call | Verify Panel API; retry |
+| `deployment` | 60 min | Full SSH payload deployment | Check network; worker logs; budget notice |
+| `hardening` | 10 min | Prerequisites, firewall, Fail2ban, DoT, sysctl | Check target logs; retry |
+| `acme` | 15 min | Certificates and NGINX configuration | Check DNS/port 80; Certbot logs |
+| `verification` | 5 min | Service checks and security readback | Check service status; SSH access |
+| `revoke` | 2 min | Revoke temporary key on Worker | Automatic; timer cleanup ≤ 2 h |
+| `stop_agent` | 1 min | Unload temporary key from agent | Automatic |
+
+### Multi-node onboarding progress display
+
+During the 60-minute `deployment` stage the wizard prints heartbeat notices:
+```
+Still waiting for worker-1 (stage: hardening).
+```
+The notice shows the last reported stage. A timeout notice appears when a stage exceeds its budget:
+```
+Stage hardening on worker-1 exceeded its budget: 720 seconds elapsed (budget: 10 minutes).
+```
+
+### Wizard exit codes
+
+| Code | Meaning | Action |
+| --- | --- | --- |
+| `0` | All requested components confirmed | Proceed to traffic verification |
+| `1` | Panel failed or pre-deployment check blocked | Inspect Panel logs; do not retry Workers |
+| `2` | Panel ready but ≥1 Worker failed/unconfirmed | Inspect per-Worker result; retry only failed nodes |
+
+### Recovery actions by failed stage
+
+| Failed stage | Evidence to collect | Recovery action |
+| --- | --- | --- |
+| SSH scan/fingerprint | Provider console key, network reachability | Fix network/DNS; confirm key independently |
+| Authorization | Password file 0600, key/agent in root context | Correct credentials; retry |
+| Country entry | Operator input | Re-enter country; plan preserved |
+| Panel registration | Panel API health, `/api/nodes` | Fix Panel; retry node |
+| Provisioning/deployment | Worker service logs, SSH session log | Fix cause; retry failed node |
+| ACME | DNS A/AAAA, port 80, Certbot journal | Fix reachability/CA error; retry |
+| Verification | `systemctl status`, security report JSON | Fix service/control; retry verification |
+| Cleanup/revoke | Worker `authorized_keys`, timer status | Timer auto-cleans ≤ 2 h; verify |
+
+### Important distinctions
+
+- **Registration ≠ data-plane verification:** A Worker reported "registered and verified in the Panel"
+  means the Panel API accepted the registration and local readback matched. You must still verify
+  actual client traffic through the Worker's port 443.
+- **Security report freshness:** The security report is valid for 300 seconds by default. Future or
+  older reports are rejected for readiness checks.
+- **Partial completion:** Exit code 2 means the Panel is ready. Inspect the per-Worker result before
+  retrying; an existing registration with unfinished cleanup is not a reason to register again.
+- **Draft preservation:** The wizard saves accepted answers. On compatible draft, choose Continue,
+  Start over, or Leave without installing. Draft abandonment never uninstalls components.
+
 ### Pinned Xray core
 
 Local and remote node installations stage the digest-verified **Xray 26.11.9** core at
@@ -494,6 +643,25 @@ not assume it updates remote Worker DNS, all stored API Host records, optional V
 previously distributed subscription URLs or client caches. Inspect live records and reissue/reimport
 links as needed. Keep old DNS available until external HTTPS and client verification succeed. If rollback
 is reported incomplete, retain the journal/snapshot and investigate before changing DNS again.
+
+### Replace an existing deployment (explicit migration)
+
+An install, or a `node reapply`, that finds a managed deployment already on the host does not
+overwrite it silently. The installer inspects the recorded identity and what the host actually serves,
+prints the preview of the identity it would adopt — the Worker's primary and camouflage routes, the
+vhosts and the lineages — and waits for you. Nothing mutates before that confirmation.
+
+- At a terminal the confirmation is the prompt's answer; in automation it is
+  `GOWAVE_MIGRATE_EXISTING=yes` in the environment of the same command. Declining leaves the host
+  exactly as it was, and a run with no terminal to ask on exits non-zero instead of guessing.
+- A Worker re-provision is refused for the same reason and names the command to rerun, so an
+  unattended `node reapply` cannot rewrite an edge nobody confirmed.
+- Registration, the node UUID, its profile and the Panel's Host records are reused; a migration does
+  not create a second node for the same host.
+- The confirmed run keeps the transaction that owns it: the ACME snapshot, the before-image and the
+  recovery journal. A step that fails restores the previous routes, vhosts and certificate references
+  rather than leaving half of the new identity live, and a rollback it reports as incomplete keeps its
+  journal for you to inspect instead of being retried blindly.
 
 ### Backup, verify and restore
 
@@ -675,6 +843,37 @@ accept management only from the Panel address and require mTLS; SSH host-key con
 bootstrap trust. A compromised root/Panel account or leaked backup/subscription is outside the protection
 of “hidden” ports or a decoy. The static cover does not make an endpoint invisible or guarantee safety
 from scanning or blocking.
+
+### Security reports and readiness
+
+Every hardened host writes `/var/lib/gowave-auto-nginx/security-report.json`; after a multi-node
+deployment the Master combines those documents into
+`/var/lib/gowave-auto-nginx/security-report-aggregate.json`. Both are built from effective state — the
+live ruleset, the SSH jail, the update timers and the resolver are read back, not restated from the step
+that configured them — and both appear by atomic replacement (private temporary file, `fsync`, rename,
+directory `fsync`) at mode `0600`. Reading an existing report is read-only; a rerun produces a new
+document, never a patched one.
+
+The readiness verdict is the weakest of the aggregate's hosts. A control declared `required` that is not
+`verified` blocks that host; a `best-effort` control can lower readiness to `ready-with-warnings` only
+when its rollback was verified. The aggregate names the host and the control that decided its verdict in
+`decided_by`, and each Worker entry lists its `blocking` and `warnings` controls, so a `failed` verdict is
+never anonymous. A Worker whose report could not be read stays as an explicit `fetch_failed` entry
+instead of disappearing from the document.
+
+Freshness is part of the verdict: a report is evidence for 300 seconds. An older report, or one dated in
+the future, is stale, and an aggregate that would mix a stale host with fresh ones is refused rather
+than published; the refusal names the host and its age. When the Master's own report is outside the
+window it is regenerated from effective state before combining, and a failed regeneration writes no
+aggregate. Stale files may remain on disk as history, but they are not current evidence.
+
+Two limits are deliberate. Security updates: only the distribution security origin is added and
+verified; other APT origins and pinned repositories are preserved, and the report re-verifies that the
+security origin is effective and the periodic timers are enabled — it does not claim to have witnessed a
+preservation it did not observe. DNS-over-TLS: the `dot` control covers the system resolver only.
+Applications that speak DNS themselves bypass it, a network that blocks outbound `853` is a working-DNS
+failure rather than proof of encryption, and DNSSEC validation is a separate control that this policy
+does not enable. Neither DoT nor the firewall promises DPI invisibility or upstream DDoS protection.
 
 Mutations use an exclusive lock, staged/atomic file publication where implemented, snapshots and
 journaling. Handled failures attempt rollback of covered resources; the code can explicitly report

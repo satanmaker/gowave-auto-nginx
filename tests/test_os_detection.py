@@ -137,7 +137,7 @@ class TestOSDetection(unittest.TestCase):
             os_release.write_text('ID=debian\nVERSION_ID="12"\nVERSION_CODENAME=bookworm\n')
             res = self.run_bash_fn("configure_debian_security_apt", str(apt_dir), str(os_release))
             self.assertEqual(res.returncode, 0)
-            conf = (apt_dir / "99zz-gowave-auto-nginx").read_text()
+            conf = (apt_dir / "zz-gowave-auto-nginx").read_text()
             self.assertIn("origin=Debian,label=Debian-Security,codename=bookworm-security", conf)
             self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', conf)
 
@@ -145,7 +145,7 @@ class TestOSDetection(unittest.TestCase):
             os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
             res = self.run_bash_fn("configure_debian_security_apt", str(apt_dir), str(os_release))
             self.assertEqual(res.returncode, 0)
-            conf = (apt_dir / "99zz-gowave-auto-nginx").read_text()
+            conf = (apt_dir / "zz-gowave-auto-nginx").read_text()
             self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', conf)
 
     def test_install_validates_inputs_before_touching_the_host(self):
@@ -177,17 +177,178 @@ class TestOSDetection(unittest.TestCase):
         self.assertIn("python3", bootstrap)
         self.assertIn("iproute2", bootstrap)
 
+    def test_nginx_pin_refusal_paths_do_not_install_packages(self):
+        root = MODULE_PATH.parent
+        script = r'''
+source "$1/tempdir.sh"
+source "$1/nginx_package.sh"
+export TMPDIR="$2"
+mode="$3"
+dpkg() {
+    if [[ "$1" == --print-architecture ]]; then
+        printf 'amd64\n'
+        return 0
+    fi
+    [[ "$mode" == downgrade ]]
+}
+dpkg-query() {
+    [[ "$mode" == downgrade ]] || return 1
+    printf '1.31.10-1~trixie\n'
+}
+curl() { :; }
+gpg() { if [[ "$*" == *--export* ]]; then printf 'key\n'; fi; }
+apt-cache() { printf 'nginx | 1.30.7-1~trixie | https://nginx.org/packages/debian trixie/nginx amd64 Packages\n'; }
+apt-get() {
+    printf '%s\n' "$*" >> "$TMPDIR/apt.log"
+    [[ "$*" == *' update '* && "$mode" != auth ]]
+}
+install_pinned_nginx debian trixie
+'''
+        for mode, diagnostic in (
+            ("downgrade", "Refusing to downgrade"),
+            ("auth", "Could not authenticate"),
+            ("missing", "no distribution fallback is approved"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(["bash", "-c", script, "test", str(root), directory, mode],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                log = Path(directory) / "apt.log"
+                if mode == "downgrade":
+                    self.assertFalse(log.exists())
+                else:
+                    calls = log.read_text().splitlines()
+                    self.assertEqual(len(calls), 1)
+                    self.assertIn(" update ", calls[0])
+                    self.assertIn("Dir::Etc::sourceparts=-", calls[0])
+                self.assertEqual(list(Path(directory).iterdir()), [log] if log.exists() else [])
+
+    def test_the_vendor_fetch_carries_a_retry_budget(self):
+        """One dropped connection to the vendor must not abort a re-apply.
+
+        The signed vendor repository is the only source the pin accepts, so a
+        single failed connection used to fail the whole Worker run and roll a
+        serving host back. The budget is asserted on the commands the module
+        actually runs: the refresh, the download and the install share one
+        options array, so the retry reaches all three.
+        """
+        script = r'''
+source "$1/tempdir.sh"
+source "$1/nginx_package.sh"
+export TMPDIR="$2"
+dpkg() { printf 'amd64\n'; }
+dpkg-query() { return 1; }
+curl() {
+    printf '%s\n' "$*" >> "$TMPDIR/curl.log"
+    local out='' prev=''
+    for arg in "$@"; do
+        [[ "$prev" == -o ]] && out="$arg"
+        prev="$arg"
+    done
+    [[ -n "$out" ]] && printf 'KEY\n' > "$out"
+    return 0
+}
+gpg() { if [[ "$*" == *--export* ]]; then printf 'key\n'; fi; }
+apt-cache() { return 1; }
+apt-get() { printf '%s\n' "$*" >> "$TMPDIR/apt.log"; return 1; }
+install_pinned_nginx debian trixie
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(["bash", "-c", script, "test", str(MODULE_PATH.parent), directory],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0, "an unreachable vendor was reported as installed")
+            self.assertIn("Could not authenticate", result.stderr)
+            curl_call = (Path(directory) / "curl.log").read_text()
+            self.assertIn("--retry 3", curl_call)
+            self.assertIn("--retry-connrefused", curl_call)
+            apt_call = (Path(directory) / "apt.log").read_text()
+            self.assertIn("Acquire::Retries=5", apt_call)
+
+    def test_nginx_pin_checks_package_identity_before_install_and_stream_afterwards(self):
+        script = r'''
+source "$1/tempdir.sh"
+source "$1/nginx_package.sh"
+export TMPDIR="$2"
+mode="$3"
+version=1.30.8-1~trixie
+dpkg() { printf 'amd64\n'; }
+dpkg-query() {
+    [[ -f "$TMPDIR/installed" ]] || return 1
+    printf 'install ok installed %s\n' "$version"
+}
+curl() { :; }
+gpg() { if [[ "$*" == *--export* ]]; then printf 'key\n'; fi; }
+apt-cache() { printf 'nginx | %s | https://nginx.org/packages/debian trixie/nginx amd64 Packages\n' "$version"; }
+apt-get() {
+    case " $* " in
+        *' update '*) ;;
+        *' download nginx:amd64=1.30.8-1~trixie '*) touch nginx_test.deb ;;
+        *' --no-install-recommends '*' install '*) touch "$TMPDIR/installed" ;;
+        *) return 1 ;;
+    esac
+}
+dpkg-deb() {
+    case "$1:${3:-}" in
+        -f:Package) printf 'nginx\n' ;;
+        -f:Version) if [[ "$mode" == wrong-version ]]; then printf '1.30.7\n'; else printf '%s\n' "$version"; fi ;;
+        -f:Architecture) printf 'amd64\n' ;;
+        --fsys-tarfile:) printf 'authenticated binary\n' ;;
+        *) return 1 ;;
+    esac
+}
+tar() { command dd status=none; }
+cmp() { [[ "$(command dd status=none)" == 'authenticated binary' && "$mode" != binary-mismatch ]]; }
+{
+    printf '#!/bin/sh\nprintf "configure arguments: --with-stream"\n'
+    if [[ "$mode" != no-stream ]]; then
+        printf 'printf " --with-stream_ssl_preread_module"\n'
+    fi
+    printf 'printf "\\n"\n'
+} > "$TMPDIR/fake-nginx"
+chmod +x "$TMPDIR/fake-nginx"
+export NGINX_BINARY="$TMPDIR/fake-nginx"
+install_pinned_nginx debian trixie
+'''
+        for mode, diagnostic in (
+            ("verified", "Verified official NGINX"),
+            ("wrong-version", "does not match the approved identity"),
+            ("binary-mismatch", "does not match the authenticated package"),
+            ("no-stream", "lacks the required static Stream SNI support"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(["bash", "-c", script, "test", str(MODULE_PATH.parent), directory, mode],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, int(mode != "verified"), result.stderr)
+                self.assertIn(diagnostic, result.stdout if mode == "verified" else result.stderr)
+                self.assertEqual((Path(directory) / "installed").exists(), mode != "wrong-version")
+
+    def test_install_prerequisites_always_enforces_the_nginx_pin(self):
+        script = f'''
+source "{MODULE_PATH}"
+detect_os() {{ OS_ID=debian; OS_CODENAME=trixie; }}
+check_prerequisites() {{ return 0; }}
+ensure_systemd_resolved() {{ :; }}
+install_pinned_nginx() {{ printf '%s:%s\\n' "$1" "$2"; return "${{PIN_RC:-0}}"; }}
+install_prerequisites
+'''
+        satisfied = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(satisfied.returncode, 0, satisfied.stderr)
+        self.assertIn("debian:trixie", satisfied.stdout)
+        refused = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
+                                 env={**os.environ, "PIN_RC": "1"})
+        self.assertNotEqual(refused.returncode, 0)
+
     def test_required_packages_inventory(self):
         res = self.run_bash_fn("get_required_packages")
         self.assertEqual(res.returncode, 0)
         pkgs = set(res.stdout.strip().splitlines())
         expected = {
-            "nginx-full",
-            "libnginx-mod-stream",
             "certbot",
             "python3",
             "python3-systemd",
             "sqlite3",
+            "gnupg",
             "curl",
             "tar",
             "gzip",

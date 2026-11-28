@@ -160,7 +160,7 @@ report["ufw"] = [line.rstrip() for line in out.splitlines() if line.strip()]
 
 code, out, err = run("iptables", "-S")
 report["iptables_returncode"] = code
-report["iptables_error"] = (err or out).strip()[-400:]
+report["iptables_error"] = ((err or out) if code else "").strip()[-400:]
 report["iptables"] = [line.rstrip() for line in out.splitlines() if line.strip()]
 
 code, out, err = run("iptables", "-L", "-v", "-n", "-x")
@@ -556,9 +556,12 @@ WILDCARD_ADDRESSES = ("0.0.0.0", "*", "::", "[::]")
 
 # Every attempt is a real TCP connection from the container the origin names.
 # The attempts arrive as one JSON document so no value is ever re-quoted by a
-# shell, and every label is reported back with its own outcome.
+# shell, and every label is reported back with its own outcome. An attempt may
+# carry ``payload_b64`` and ``read_reply``: that is how a malformed TLS record is
+# offered to the stream listener and how its answer — or its silence — is read
+# back. The reply is bounded so a socket that never closes cannot hang the probe.
 _TCP_PATHS = r'''
-import json, socket, sys, time
+import base64, json, socket, sys, time
 
 ATTEMPTS = json.loads(sys.argv[1])
 report = []
@@ -591,6 +594,34 @@ for attempt in ATTEMPTS:
             except OSError as exc:
                 entry["banner"] = ""
                 entry["banner_error"] = str(exc)
+        if attempt.get("payload_b64"):
+            payload = base64.b64decode(attempt["payload_b64"])
+            try:
+                connection.settimeout(attempt["timeout"])
+                connection.sendall(payload)
+                entry["sent_bytes"] = len(payload)
+            except OSError as exc:
+                entry["sent_bytes"] = 0
+                entry["payload_error"] = str(exc)
+        if attempt.get("read_reply"):
+            reply = b""
+            closed = False
+            timed_out = False
+            try:
+                while len(reply) < 512:
+                    chunk = connection.recv(512 - len(reply))
+                    if not chunk:
+                        closed = True
+                        break
+                    reply += chunk
+            except TimeoutError:
+                timed_out = True
+            except OSError as exc:
+                entry["reply_error"] = str(exc)
+            entry["reply_bytes"] = len(reply)
+            entry["reply_preview"] = reply.decode("latin-1", "replace").strip()[:200]
+            entry["reply_closed"] = closed
+            entry["reply_timeout"] = timed_out
         connection.close()
     entry["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     report.append(entry)
@@ -627,7 +658,7 @@ report["ufw_error"] = (err or "").strip()[-400:]
 code, out, err = run("iptables", "-S")
 report["rules_returncode"] = code
 report["rules"] = [line.rstrip() for line in out.splitlines() if line.strip()]
-report["rules_error"] = (err or out).strip()[-400:]
+report["rules_error"] = ((err or out) if code else "").strip()[-400:]
 
 code, out, err = run("iptables", "-L", "INPUT", "-v", "-n", "-x")
 report["policy_returncode"] = code
@@ -636,7 +667,7 @@ report["policy"] = [line.rstrip() for line in out.splitlines() if line.strip()]
 code, out, err = run("iptables", "-L", "ufw-user-input", "-v", "-n", "-x")
 report["chain_returncode"] = code
 report["chain"] = [line.rstrip() for line in out.splitlines() if line.strip()]
-report["chain_error"] = (err or out).strip()[-400:]
+report["chain_error"] = ((err or out) if code else "").strip()[-400:]
 
 code, out, err = run("ss", "-ltn")
 report["listeners_returncode"] = code
@@ -663,12 +694,12 @@ report["ufw_default"] = [line.rstrip() for line in out.splitlines() if line.stri
 code, out, err = run("ip6tables", "-S")
 report["ipv6_rules_returncode"] = code
 report["ipv6_rules"] = [line.rstrip() for line in out.splitlines() if line.strip()]
-report["ipv6_rules_error"] = (err or out).strip()[-400:]
+report["ipv6_rules_error"] = ((err or out) if code else "").strip()[-400:]
 
 code, out, err = run("ip6tables", "-L", "ufw6-user-input", "-v", "-n", "-x")
 report["ipv6_chain_returncode"] = code
 report["ipv6_chain"] = [line.rstrip() for line in out.splitlines() if line.strip()]
-report["ipv6_chain_error"] = (err or out).strip()[-400:]
+report["ipv6_chain_error"] = ((err or out) if code else "").strip()[-400:]
 
 # The rendered ``listen [::]`` lines, because a wildcard v6 socket proves the
 # process asked for the v6 stack rather than inheriting an address by accident.
@@ -736,6 +767,15 @@ def parse_tcp_paths(output: str) -> Dict[str, Dict[str, Any]]:
             "banner": entry.get("banner"),
             "detail": entry.get("detail") or entry.get("banner_error") or "",
         }
+        if "sent_bytes" in entry:
+            observed[label]["sent_bytes"] = entry.get("sent_bytes")
+        if "reply_bytes" in entry:
+            observed[label].update({
+                "reply_bytes": entry.get("reply_bytes"),
+                "reply_preview": entry.get("reply_preview") or "",
+                "reply_closed": bool(entry.get("reply_closed")),
+                "reply_timeout": bool(entry.get("reply_timeout")),
+            })
     return observed
 
 

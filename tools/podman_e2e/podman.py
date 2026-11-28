@@ -231,9 +231,24 @@ class Podman:
 
         Diagnostics address the run's containers by name, and the names come from
         the run label rather than from the products: a case can fail before the
-        object that would have named its roles exists.
+        object that would have named its roles exists. An adopted run also lists
+        the kept run's containers, because those are the hosts it is measuring —
+        labelling them with this run's id would be a false claim about who owns
+        them, and omitting them would leave a failed adoption with no state.
         """
-        label = f"gowave.e2e.run={self.context.run_id}"
+        containers = self._containers_by_label(self.context.run_id)
+        adopted = getattr(self.context, "reused_from", None)
+        if isinstance(adopted, str) and adopted and adopted != self.context.run_id:
+            seen = {entry["name"] for entry in containers}
+            containers.extend(
+                entry for entry in self._containers_by_label(adopted)
+                if entry["name"] not in seen
+            )
+        containers.sort(key=lambda entry: entry["name"])
+        return containers
+
+    def _containers_by_label(self, run_id: str) -> List[Dict[str, str]]:
+        label = f"gowave.e2e.run={run_id}"
         listed = self._run(["ps", "-a", "--format", "json", "--filter", f"label={label}"], check=False)
         if listed.returncode != 0:
             return []
@@ -253,7 +268,6 @@ class Podman:
                 "state": str(_get(item, "State") or ""),
                 "status": str(_get(item, "Status") or ""),
             })
-        containers.sort(key=lambda entry: entry["name"])
         return containers
 
     def ensure_image(self, alias: str) -> str:
@@ -304,9 +318,33 @@ class Podman:
             ],
             timeout=operation_timeout(self.context, BUILD_CEILING_SECONDS, f"podman build {tag}"),
         )
-        self.context.add_cleanup(lambda: self._run(["rmi", "-f", tag], check=False))
+        # A kept or adopted run must leave the tag behind: the container a later
+        # case starts (a secondary Worker, an on-demand engine client) is looked
+        # up by this tag, and removing it at exit would leave a cell that looks
+        # alive and cannot be extended.
+        if not getattr(self.context, "keep_resources", False):
+            self.context.add_cleanup(lambda: self._drop_built_image(tag))
         self._built_images.add(tag)
         return tag
+
+    def _drop_built_image(self, tag: str) -> None:
+        """Remove a built tag unless a container of any run still runs it.
+
+        The tags are shared by every cell of a matrix: `gowave-e2e-client` carries
+        the pinned engines for all four, and `gowave-e2e-target:<distribution>` is
+        shared by two cells of the same distribution. `rmi -f` deletes the
+        containers that use the image, so a cell that finished first took a
+        sibling cell's still-serving engine client with it and every later case in
+        that cell answered `no container with name or ID engines-… found`.
+        """
+        in_use = self._run(
+            ["ps", "-a", "--filter", f"ancestor={tag}", "--format", "{{.ID}}"], check=False)
+        if in_use.returncode != 0 or in_use.stdout.strip():
+            # Either a container still runs the image or the question could not be
+            # answered; in both cases a tag left behind is cheaper than a
+            # container removed from under a running cell.
+            return
+        self._run(["rmi", "-f", tag], check=False)
 
     def run(
         self,

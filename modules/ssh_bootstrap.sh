@@ -24,6 +24,10 @@ GOWAVE_SSH_MARKER=""
 GOWAVE_SSH_TIMER_ID=""
 GOWAVE_SSH_LIFETIME_MINUTES=115
 
+# File for tracking per-stage start times (timeout attribution).
+# Created in ssh_bootstrap_onboard_one and cleaned up on exit.
+GOWAVE_SSH_STAGE_TIME_FILE=""
+
 # The node API port `cmd_node add` registers. It is fixed in the entrypoint: a
 # Worker never shares the Panel's 3000, and a Worker on the Panel's own address
 # is forced to the same value.
@@ -46,7 +50,7 @@ GOWAVE_SSH_PROMPT_OUT=/dev/stderr
 # step runs: onboarding captures each node's streams and prints them afterwards,
 # so a notice on stderr would arrive only once the wait it describes is over.
 # There is no terminal in a captured or non-interactive run, and then the
-# machine-readable `PHASE:<id>` marker on stderr is the whole record.
+# machine-readable stage markers on stderr are the whole record.
 GOWAVE_SSH_NOTICE_OUT=/dev/null
 
 _ssh_bootstrap_bind_terminal() {
@@ -73,7 +77,115 @@ ssh_bootstrap_phase_notice() {
     # The format string is a catalog entry, never operator input.
     # shellcheck disable=SC2059
     printf "$text\n" "$node" > "$GOWAVE_SSH_NOTICE_OUT" 2>/dev/null || true
+    # Record stage start time for timeout attribution
+    _ssh_bootstrap_record_stage_start "$id"
     return 0
+}
+
+# Per-stage timeout budgets in minutes. The catalog is the allowlist: a stage
+# not in this map has no budget and no timeout is enforced.
+declare -A _SSH_BOOTSTRAP_STAGE_BUDGETS=(
+    [prepare_key]=2
+    [scan]=2
+    [fingerprint]=1
+    [confirm_fingerprint]=5
+    [resolve_ip]=2
+    [pin_host_key]=1
+    [prepare_password]=3
+    [authorise]=3
+    [start_agent]=2
+    [country]=3
+    [registration]=2
+    [add_node]=3
+    [deployment]=60
+    [hardening]=10
+    [acme]=15
+    [verification]=5
+    [revoke]=2
+    [stop_agent]=1
+)
+
+# Record the start time of a stage for timeout tracking.
+_ssh_bootstrap_record_stage_start() {
+    local id="$1"
+    local budget="${_SSH_BOOTSTRAP_STAGE_BUDGETS[$id]:-0}"
+    if (( budget > 0 )); then
+        printf '%s\t%d\n' "$id" "$(date +%s)" >> "${GOWAVE_SSH_STAGE_TIME_FILE:-/dev/null}" 2>/dev/null || true
+    fi
+}
+
+# Emit a timeout notice for a stage that exceeded its budget. This is called
+# after the SSH session ends so the attribution survives the connection.
+_ssh_bootstrap_emit_stage_timeout() {
+    local id="$1" node="$2" elapsed="$3"
+    local budget="${_SSH_BOOTSTRAP_STAGE_BUDGETS[$id]:-0}"
+    if (( budget > 0 && elapsed > budget * 60 )); then
+        local text
+        text="$(t "wizard.phase.timeout")"
+        if [[ "$text" != "wizard.phase.timeout" ]]; then
+            # shellcheck disable=SC2059
+            printf "$text\n" "$node" "$id" "$elapsed" "$budget" > "$GOWAVE_SSH_NOTICE_OUT" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Check all tracked stages for timeout and emit notices. Call this after any
+# long-running phase or when the SSH session ends.
+_ssh_bootstrap_check_stage_timeouts() {
+    local node="$1"
+    local time_file="${GOWAVE_SSH_STAGE_TIME_FILE:-}"
+    [[ -f "$time_file" ]] || return 0
+    local now
+    now=$(date +%s)
+    while IFS=$'\t' read -r id start; do
+        [[ -n "$id" && -n "$start" ]] || continue
+        local elapsed=$((now - start))
+        _ssh_bootstrap_emit_stage_timeout "$id" "$node" "$elapsed"
+    done < "$time_file"
+    # Clear the file after reporting so timeouts are not re-reported.
+    : > "$time_file"
+}
+
+ssh_bootstrap_worker_progress() {
+    local node="$1" line chunk status pending="" stage=deployment heartbeats=0
+    local -A seen=()
+    while true; do
+        status=0
+        IFS= read -r -t 60 chunk || status=$?
+        pending+="$chunk"
+        if (( status > 128 )); then
+            if [[ -n "$node" && "$GOWAVE_SSH_NOTICE_OUT" != /dev/null ]] && (( heartbeats < 59 )); then
+                heartbeats=$((heartbeats + 1))
+                printf '%s\n' "$(tf wizard.phase.waiting "$node" "$stage")" > "$GOWAVE_SSH_NOTICE_OUT" 2>/dev/null || true
+            fi
+            continue
+        fi
+        if (( status != 0 )) && [[ -z "$pending" ]]; then break; fi
+        line="$pending"
+        pending=""
+        case "$line" in
+            GOWAVE-WORKER-STAGE:hardening | GOWAVE-WORKER-STAGE:acme | GOWAVE-WORKER-STAGE:verification)
+                if [[ -n "$node" && -z "${seen[$line]:-}" ]]; then
+                    seen["$line"]=1
+                    local new_stage="${line#*:}"
+                    # Check timeout for the previous stage before transitioning
+                    if [[ "$stage" != "deployment" && "$stage" != "$new_stage" ]]; then
+                        _ssh_bootstrap_check_stage_timeouts "$node"
+                    fi
+                    stage="$new_stage"
+                    if [[ "$GOWAVE_SSH_NOTICE_OUT" == /dev/null ]]; then
+                        printf '%s\n' "$line" >&2
+                    else
+                        ssh_bootstrap_phase_notice "${line#*:}" "$node"
+                    fi
+                fi
+                ;;
+            GOWAVE-WORKER-STAGE:*) ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done
+    # Final timeout check when SSH session ends
+    _ssh_bootstrap_check_stage_timeouts "$node"
 }
 
 ssh_bootstrap_fingerprint() {
@@ -420,6 +532,13 @@ ssh_bootstrap_onboard_one() {
     local ip="" scanned="" expected="" password_file="" rc=0
     local phase="" node_country=""
 
+    # Initialize per-stage timeout tracking file
+    GOWAVE_SSH_STAGE_TIME_FILE=$(mktemp "${TMPDIR:-/tmp}/gowave-stage-time.XXXXXX")
+    chmod 600 "$GOWAVE_SSH_STAGE_TIME_FILE"
+    if declare -F track_temp_dir >/dev/null 2>&1; then
+        track_temp_dir "$GOWAVE_SSH_STAGE_TIME_FILE"
+    fi
+
     # The terminal is bound before the first stage so every notice below has
     # somewhere the operator is actually looking.
     _ssh_bootstrap_bind_terminal
@@ -429,6 +548,8 @@ ssh_bootstrap_onboard_one() {
         phase="$1"
         printf 'PHASE:%s\n' "$phase" >&2
         ssh_bootstrap_phase_notice "$phase" "$host"
+        # Check for timeouts of previous stages after each phase transition
+        _ssh_bootstrap_check_stage_timeouts "$host"
     }
 
     _ssh_phase "prepare_key"
@@ -453,7 +574,7 @@ ssh_bootstrap_onboard_one() {
 
     _ssh_phase "confirm_fingerprint"
     if ! ssh_bootstrap_confirm_fingerprint "$host" "$expected"; then
-        _release_ssh_temp
+        _release_ssh_temp "$host"
         return 1
     fi
 
@@ -462,7 +583,7 @@ ssh_bootstrap_onboard_one() {
         ip="$node_ip"
     elif ! ip=$(wizard_resolve_ipv4 "$host"); then
         printf '%s\n' "$(tf wizard.dns.failed "$host")" >&2
-        _release_ssh_temp
+        _release_ssh_temp "$host"
         return 1
     fi
 
@@ -471,20 +592,20 @@ ssh_bootstrap_onboard_one() {
 
     _ssh_phase "prepare_password"
     if ! password_file=$(ssh_bootstrap_prepare_password "$host"); then
-        _release_ssh_temp
+        _release_ssh_temp "$host"
         return 1
     fi
 
     _ssh_phase "authorise"
     if ! ssh_bootstrap_authorise "$target" "$port" "$password_file"; then
-        _release_ssh_temp
+        _release_ssh_temp "$host"
         return 1
     fi
 
     _ssh_phase "start_agent"
     if ! ssh_bootstrap_start_agent; then
         ssh_bootstrap_revoke "$target" "$port" "$password_file" || true
-        _release_ssh_temp
+        _release_ssh_temp "$host"
         return 1
     fi
 
@@ -509,19 +630,26 @@ ssh_bootstrap_onboard_one() {
     if [[ -n "$vision" ]]; then
         add_args=(add --vision-domain "$vision" "${node_name:-$host}" "$ip" "$host" "$camouflage")
     fi
+    local worker_progress_host="$host"
     GOWAVE_NODE_COUNTRY="$node_country" \
         SSH_KNOWN_HOSTS="$GOWAVE_SSH_KNOWN_HOSTS" cmd_node "${add_args[@]}" || rc=1
+    local failed_phase=""
+    if (( rc != 0 )); then failed_phase="add_node"; fi
 
     _ssh_phase "revoke"
-    ssh_bootstrap_revoke "$target" "$port" "$password_file" || rc=1
+    if ! ssh_bootstrap_revoke "$target" "$port" "$password_file"; then
+        rc=1
+        failed_phase="${failed_phase:-revoke}"
+    fi
 
     _ssh_phase "stop_agent"
     ssh_bootstrap_stop_agent
-    _release_ssh_temp
+    _release_ssh_temp "$host"
 
     if (( rc == 0 )); then
         printf '%s\n' "$(tf wizard.ssh.registered "$host")"
     else
+        printf 'FAILED-PHASE:%s\n' "$failed_phase" >&2
         printf '%s\n' "$(tf wizard.ssh.failed "$host")" >&2
     fi
     return "$rc"
@@ -530,6 +658,10 @@ ssh_bootstrap_onboard_one() {
 # Release the SSH temp directory immediately after onboarding completes.
 # This ensures passwords and keys are not retained on the Panel host.
 _release_ssh_temp() {
+    # Final timeout check before cleanup so attribution survives the SSH session
+    if [[ -n "${GOWAVE_SSH_STAGE_TIME_FILE:-}" && -f "$GOWAVE_SSH_STAGE_TIME_FILE" ]]; then
+        _ssh_bootstrap_check_stage_timeouts "${1:-unknown}"
+    fi
     if [[ -n "${GOWAVE_SSH_TEMP_ROOT:-}" ]]; then
         if declare -F release_temp_dir >/dev/null 2>&1; then
             release_temp_dir "$GOWAVE_SSH_TEMP_ROOT"
@@ -539,5 +671,11 @@ _release_ssh_temp() {
         GOWAVE_SSH_KNOWN_HOSTS=""
         GOWAVE_SSH_MARKER=""
         GOWAVE_SSH_TIMER_ID=""
+    fi
+    if [[ -n "${GOWAVE_SSH_STAGE_TIME_FILE:-}" && -f "$GOWAVE_SSH_STAGE_TIME_FILE" ]]; then
+        if declare -F release_temp_dir >/dev/null 2>&1; then
+            release_temp_dir "$GOWAVE_SSH_STAGE_TIME_FILE"
+        fi
+        GOWAVE_SSH_STAGE_TIME_FILE=""
     fi
 }

@@ -175,6 +175,73 @@ check_acme_lineage() {
     return 0
 }
 
+# select_acme_lineage NAME TARGET_SERVER [LETSENCRYPT_ROOT]
+#
+# Print the live directory of a lineage that already covers NAME, or nothing when
+# the name has to be issued one of its own. A Worker in a shared zone is often
+# left with a suffixed lineage (`cover2.example.net-0001`); asking certbot for the
+# plain name would issue a second lineage beside it, and the vhost would then
+# serve whichever one its path happened to name. Adoption follows the Master's
+# rules so both roles read the same tree the same way: the renewal config must
+# name TARGET_SERVER, the certificate must not be expired, and it must cover
+# NAME; the exact-name lineage is tried first, the rest in directory order.
+select_acme_lineage() {
+    local name="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local letsencrypt_root="${3:-/etc/letsencrypt}"
+    local live_root="${letsencrypt_root}/live"
+    local renewal_root="${letsencrypt_root}/renewal"
+
+    # A host that has never had a lineage is not an error.
+    [[ -d "$live_root" ]] || return 0
+
+    local -a order=()
+    local entry candidate
+    if [[ -d "${live_root}/${name}" && ! -L "${live_root}/${name}" ]]; then
+        order+=("$name")
+    fi
+    while IFS= read -r entry; do
+        candidate=$(basename -- "$entry")
+        [[ "$candidate" == "$name" ]] && continue
+        order+=("$candidate")
+    done < <(find "$live_root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
+
+    (( ${#order[@]} )) || return 0
+
+    for candidate in "${order[@]}"; do
+        local live_dir="${live_root}/${candidate}"
+        local renewal_conf="${renewal_root}/${candidate}.conf"
+        [[ -s "${live_dir}/fullchain.pem" && -f "$renewal_conf" ]] || continue
+
+        local issued_by="" key val
+        while IFS='=' read -r key val || [[ -n "$key" ]]; do
+            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ "$key" == "server" ]]; then
+                issued_by=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                break
+            fi
+        done < "$renewal_conf"
+        if [[ "$issued_by" != "$target_server" ]]; then
+            echo "Not adopting the ACME lineage $candidate for $name: it was not issued by $target_server." >&2
+            continue
+        fi
+        if ! openssl x509 -checkend 0 -noout -in "${live_dir}/fullchain.pem" >/dev/null 2>&1; then
+            echo "Not adopting the ACME lineage $candidate for $name: its certificate has expired." >&2
+            continue
+        fi
+        local host_check
+        if ! host_check=$(openssl x509 -checkhost "$name" -noout -in "${live_dir}/fullchain.pem" 2>&1); then
+            continue
+        fi
+        [[ "$host_check" == "Hostname $name does match certificate" ]] || continue
+
+        printf '%s\n' "$live_dir"
+        echo "Adopting the ACME lineage $candidate for $name: it covers the name and matches the ACME directory." >&2
+        return 0
+    done
+    return 0
+}
+
 snapshot_acme_lineage() {
     local transaction_id="$1"
     local domain="$2"
@@ -816,6 +883,11 @@ for target in targets:
         current = ""
     if current and isinstance(entry, dict) and entry.get("kind") == "file" and entry.get("sha256") == current:
         continue
+    # The operator confirmed migration: a regular file this product did not
+    # record is adopted (rewritten) instead of refused. Symlinks and directories
+    # are still refused above, so confirmation never writes through a link.
+    if os.environ.get("GOWAVE_ADOPT_UNOWNED") == "1":
+        continue
     refuse(path, "file")
 WORKER_PREFLIGHT_PY
 }
@@ -1143,6 +1215,12 @@ def restore():
     code, saved, _ = run(["iptables-save"])
     if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
         fail("The restored IPv4 ruleset does not match the before-image.")
+    # A dual-stack host filters on two tables, and a restored v4 ruleset proves
+    # nothing about the v6 one the failed install opened.
+    if "ip6tables" in restored:
+        code, saved, _ = run(["ip6tables-save"])
+        if code != 0 or normalized(saved) != normalized(restored["ip6tables"]):
+            fail("The restored IPv6 ruleset does not match the before-image.")
 
 
 if action == "capture":
@@ -2079,6 +2157,10 @@ remote_payload() {
     local panel_ipv6="${PANEL_IPV6:-}"
     local admin_email="${ADMIN_EMAIL:-admin@${worker_domain}}"
     local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+    local -a ssh_command=(ssh)
+    if [[ "${GOWAVE_WORKER_INTERACTIVE_DEPLOYMENT:-0}" == 1 ]]; then
+        ssh_command=(timeout --kill-after=10s 60m ssh)
+    fi
     validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
     local host_key="$host"
     if [[ "$port" != "22" ]]; then
@@ -2124,6 +2206,11 @@ remote_payload() {
         echo "Error: the pinned-artifact helper is missing at $artifact_module." >&2
         return 1
     fi
+    local nginx_package_module="$SCRIPT_DIR/modules/nginx_package.sh"
+    if [[ ! -f "$nginx_package_module" ]]; then
+        echo "Error: the NGINX package policy is missing at $nginx_package_module." >&2
+        return 1
+    fi
 
     # Validate node port and warn on host collisions if worker host matches panel IP
     if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$panel_ip" ]]; then
@@ -2163,6 +2250,10 @@ remote_payload() {
         # materialized with mode 0600 and never placed in argv or logs.
         printf 'export GOWAVE_ACME_TEST_CA_B64=%q\n' "${GOWAVE_ACME_TEST_CA_B64:-}"
         printf 'export GOWAVE_PODMAN_TEST_MODE=%q\n' "${GOWAVE_PODMAN_TEST_MODE:-0}"
+        # An existing Worker's edge identity is rewritten only for a caller that
+        # confirmed the migration preview; `node reapply` sets this after its own
+        # prompt, and a direct payload call stays `no`.
+        printf 'export GOWAVE_MIGRATE_EXISTING=%q\n' "${GOWAVE_MIGRATE_EXISTING:-no}"
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
         # The Worker's re-entrant lease belongs to this host's lock holder, which
         # the dispatching Master holds; it is forwarded only as an export so the
@@ -2183,6 +2274,10 @@ remote_payload() {
         # pinned step calls fetch_verified_artifact, and a payload that carried
         # the call without the helper died on it at the pin.
         cat "$artifact_module"
+
+        # 1d. The approved NGINX package policy travels as the same body the
+        # Master runs, so the Worker selects and verifies the same package.
+        cat "$nginx_package_module"
 
         # 2. Remote helper functions
         cat <<'RUNNER_FUNCS'
@@ -2345,6 +2440,73 @@ check_acme_lineage() {
         fi
     fi
 
+    return 0
+}
+
+# select_acme_lineage NAME TARGET_SERVER [LETSENCRYPT_ROOT]
+#
+# Print the live directory of a lineage that already covers NAME, or nothing when
+# the name has to be issued one of its own. A Worker in a shared zone is often
+# left with a suffixed lineage (`cover2.example.net-0001`); asking certbot for the
+# plain name would issue a second lineage beside it, and the vhost would then
+# serve whichever one its path happened to name. Adoption follows the Master's
+# rules so both roles read the same tree the same way: the renewal config must
+# name TARGET_SERVER, the certificate must not be expired, and it must cover
+# NAME; the exact-name lineage is tried first, the rest in directory order.
+select_acme_lineage() {
+    local name="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local letsencrypt_root="${3:-/etc/letsencrypt}"
+    local live_root="${letsencrypt_root}/live"
+    local renewal_root="${letsencrypt_root}/renewal"
+
+    # A host that has never had a lineage is not an error.
+    [[ -d "$live_root" ]] || return 0
+
+    local -a order=()
+    local entry candidate
+    if [[ -d "${live_root}/${name}" && ! -L "${live_root}/${name}" ]]; then
+        order+=("$name")
+    fi
+    while IFS= read -r entry; do
+        candidate=$(basename -- "$entry")
+        [[ "$candidate" == "$name" ]] && continue
+        order+=("$candidate")
+    done < <(find "$live_root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
+
+    (( ${#order[@]} )) || return 0
+
+    for candidate in "${order[@]}"; do
+        local live_dir="${live_root}/${candidate}"
+        local renewal_conf="${renewal_root}/${candidate}.conf"
+        [[ -s "${live_dir}/fullchain.pem" && -f "$renewal_conf" ]] || continue
+
+        local issued_by="" key val
+        while IFS='=' read -r key val || [[ -n "$key" ]]; do
+            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ "$key" == "server" ]]; then
+                issued_by=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                break
+            fi
+        done < "$renewal_conf"
+        if [[ "$issued_by" != "$target_server" ]]; then
+            echo "Not adopting the ACME lineage $candidate for $name: it was not issued by $target_server." >&2
+            continue
+        fi
+        if ! openssl x509 -checkend 0 -noout -in "${live_dir}/fullchain.pem" >/dev/null 2>&1; then
+            echo "Not adopting the ACME lineage $candidate for $name: its certificate has expired." >&2
+            continue
+        fi
+        local host_check
+        if ! host_check=$(openssl x509 -checkhost "$name" -noout -in "${live_dir}/fullchain.pem" 2>&1); then
+            continue
+        fi
+        [[ "$host_check" == "Hostname $name does match certificate" ]] || continue
+
+        printf '%s\n' "$live_dir"
+        echo "Adopting the ACME lineage $candidate for $name: it covers the name and matches the ACME directory." >&2
+        return 0
+    done
     return 0
 }
 
@@ -2989,6 +3151,11 @@ for target in targets:
         current = ""
     if current and isinstance(entry, dict) and entry.get("kind") == "file" and entry.get("sha256") == current:
         continue
+    # The operator confirmed migration: a regular file this product did not
+    # record is adopted (rewritten) instead of refused. Symlinks and directories
+    # are still refused above, so confirmation never writes through a link.
+    if os.environ.get("GOWAVE_ADOPT_UNOWNED") == "1":
+        continue
     refuse(path, "file")
 WORKER_PREFLIGHT_PY
 }
@@ -3316,6 +3483,12 @@ def restore():
     code, saved, _ = run(["iptables-save"])
     if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
         fail("The restored IPv4 ruleset does not match the before-image.")
+    # A dual-stack host filters on two tables, and a restored v4 ruleset proves
+    # nothing about the v6 one the failed install opened.
+    if "ip6tables" in restored:
+        code, saved, _ = run(["ip6tables-save"])
+        if code != 0 or normalized(saved) != normalized(restored["ip6tables"]):
+            fail("The restored IPv6 ruleset does not match the before-image.")
 
 
 if action == "capture":
@@ -4231,10 +4404,31 @@ cleanup_deploy_hook_manifest() {
 
 setup_system_prereqs() {
     export DEBIAN_FRONTEND=noninteractive
+    local os_id="" os_version="" codename="" key value
     apt-get update -qq
     apt-get install -y --no-install-recommends \
-        nginx-full libnginx-mod-stream certbot python3 python3-systemd \
+        certbot python3 python3-systemd gnupg \
         curl tar gzip openssl ufw fail2ban iproute2 ca-certificates
+    # The Worker installs the same approved NGINX package as the Master: the
+    # distribution's nginx-full is replaced by the pinned official build, so it
+    # is not requested above and the pin owns the package and Stream module.
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        case "$value" in \"*\"|\'*\') value=${value:1:-1} ;; esac
+        case "$key" in
+            ID) os_id=$value ;;
+            VERSION_ID) os_version=$value ;;
+            VERSION_CODENAME) codename=$value ;;
+        esac
+    done < /etc/os-release
+    if [[ -z "$codename" ]]; then
+        case "${os_id}-${os_version}" in
+            ubuntu-24.04) codename="noble" ;;
+            ubuntu-26.04) codename="resolute" ;;
+            debian-12) codename="bookworm" ;;
+            debian-13) codename="trixie" ;;
+        esac
+    fi
+    install_pinned_nginx "$os_id" "$codename" || return 1
 }
 
 # The mutation lease and the ACME lineage snapshots are python3, and every
@@ -4277,22 +4471,90 @@ bootstrap_early_tools() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
 }
 
-configure_dot() {
+materialize_security_helper() {
     # The shared host-security helper is streamed with the payload because the
-    # Worker never receives the project checkout at /opt/gowave-auto-nginx.
-    echo "Configuring strict DNS-over-TLS via systemd-resolved..."
+    # Worker never receives the project checkout at /opt/gowave-auto-nginx. The
+    # path is random per call: a fixed name in /tmp is a file another local
+    # account can pre-create, and this process writes it as root.
     if [[ -z "${SECURITY_HELPER_B64:-}" ]]; then
         log_warn "Host security helper was not delivered to this Worker."
         return 1
     fi
-    local helper=/tmp/gowave-managed-security.py
+    local helper
+    if ! helper=$(mktemp /tmp/gowave-managed-security.XXXXXX); then
+        log_warn "Could not create a path for the host security helper."
+        return 1
+    fi
     if ! printf '%s' "$SECURITY_HELPER_B64" | base64 -d > "$helper"; then
+        rm -f "$helper"
         log_warn "Could not materialize the host security helper."
         return 1
     fi
     chmod 0700 "$helper"
+    printf '%s\n' "$helper"
+}
+
+configure_dot() {
+    local policy="${GOWAVE_DOT_POLICY:-best-effort}"
+    local helper output rc=0 status
+    # The report keeps the recovery outcome this run observed; an attempt that
+    # never happened leaves it unknown, which blocks readiness instead of
+    # reading as a pass.
+    _DOT_RECOVERY=unknown
+    case "$policy" in
+        off|best-effort|required) ;;
+        *)
+            log_warn "Unsupported DNS-over-TLS policy '$policy'; expected off, best-effort or required."
+            return 1
+            ;;
+    esac
+    echo "Configuring DNS-over-TLS policy: $policy..."
+    helper=$(materialize_security_helper) || return 1
+    output=$(GOWAVE_DOT_POLICY="$policy" python3 "$helper" --prepare-dns </dev/null) || rc=$?
+    rm -f "$helper"
+    printf '%s\n' "$output"
+    if [[ "$rc" -eq 0 ]]; then
+        _DOT_RECOVERY=not-needed
+        return 0
+    fi
+    status=$(printf '%s' "$output" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("status", ""))
+except Exception:
+    print("")' 2>/dev/null || true)
+    # The helper already restored and verified the resolver for
+    # `failed_rolled_back`; only a hard requirement or an unproven rollback stops.
+    if [[ "$policy" != "required" && "$status" == "failed_rolled_back" ]]; then
+        _DOT_RECOVERY=verified
+        log_warn "DNS-over-TLS was not applied; the original resolver state was restored and verified."
+        return 0
+    fi
+    log_warn "DNS-over-TLS policy '$policy' was not applied and the resolver rollback was not verified."
+    return 1
+}
+
+configure_worker_fail2ban() {
+    # Mandatory, unlike DoT: a jail that was never configured and read back
+    # leaves the discovered SSH ports protected only by a package install,
+    # which the security report must not call verified SSH protection.
+    echo "Configuring Fail2ban for the discovered SSH ports..."
+    local helper
+    helper=$(materialize_security_helper) || return 1
     local rc=0
-    python3 "$helper" --prepare-dns </dev/null || rc=$?
+    python3 "$helper" --configure-fail2ban </dev/null || rc=$?
+    rm -f "$helper"
+    return "$rc"
+}
+
+configure_worker_security_updates() {
+    # Same policy and the same read-back as the Master. A host that installs
+    # the package but leaves the periodic timers inactive is a host nothing
+    # patches on a schedule.
+    echo "Configuring unattended security updates..."
+    local helper
+    helper=$(materialize_security_helper) || return 1
+    local rc=0
+    python3 "$helper" --configure-apt </dev/null || rc=$?
     rm -f "$helper"
     return "$rc"
 }
@@ -4304,15 +4566,24 @@ configure_worker_dot() {
     else
         _DOT_CREATED_BY_US=1
     fi
-    if declare -F configure_dot >/dev/null 2>&1; then
-        if ! configure_dot </dev/null; then
-            log_warn "Strict DNS-over-TLS setup failed; the Worker resolver remains unhardened."
-            _DOT_CREATED_BY_US=0
-        fi
-    else
-        log_warn "DNS-over-TLS helper unavailable; the Worker resolver remains unhardened."
+    if ! declare -F configure_dot >/dev/null 2>&1; then
         _DOT_CREATED_BY_US=0
+        log_warn "DNS-over-TLS helper unavailable; the Worker resolver remains unhardened."
+        if [[ "${GOWAVE_DOT_POLICY:-best-effort}" == "required" ]]; then
+            log_warn "Required DNS-over-TLS cannot even be attempted; stopping the Worker installation."
+            return 1
+        fi
+        return 0
     fi
+    # configure_dot owns the policy decision: it returns 0 after applying the
+    # policy, after `off`, or after a best-effort failure whose resolver
+    # rollback it verified. A non-zero result is a `required` failure or an
+    # unproven rollback, and neither may finish a Worker installation.
+    if configure_dot </dev/null; then
+        return 0
+    fi
+    log_warn "DNS-over-TLS was not applied and its rollback was not verified; stopping the Worker installation."
+    return 1
 }
 
 configure_host_security() {
@@ -4397,8 +4668,9 @@ configure_host_security() {
     fi
 
     # Xray and Go cache no resolver answers, so a single dropped UDP/53 query
-    # stalls tunnel setup for the full resolver timeout. Strict DoT uses TCP/853
-    # with retransmission and keeps the Worker's data plane reliable.
+    # stalls tunnel setup for the full resolver timeout. Encrypted DNS over
+    # TCP/853 with retransmission keeps the Worker's data plane reliable when
+    # the operator asked for it; `off` leaves the resolver alone.
     configure_worker_dot
 }
 
@@ -4408,6 +4680,16 @@ configure_host_security() {
 kernel_has_ipv6() {
     local if_inet6="${1:-/proc/net/if_inet6}"
     [[ -f "$if_inet6" ]] && grep -q '[^[:space:]]' "$if_inet6" 2>/dev/null
+}
+
+worker_firewall_policy_json() {
+    local ipv6=false
+    if kernel_has_ipv6; then ipv6=true; fi
+    python3 - "${NODE_PORT:?}" "${PANEL_IP:-}" "${PANEL_IPV6:-}" "$ipv6" <<'PY' | python3 -c 'import base64, os; exec(compile(base64.b64decode(os.environ["SECURITY_HELPER_B64"], validate=True), "managed.py", "exec"))' --firewall-policy
+import json, sys
+port, v4, v6, ipv6 = sys.argv[1:]
+json.dump({'role': 'worker', 'node_port': int(port), 'master_sources': [value for value in (v4, v6) if value], 'ipv6': ipv6 == 'true'}, sys.stdout)
+PY
 }
 
 configure_firewall() {
@@ -4429,18 +4711,44 @@ for name, value in (("SSH_PORT", ssh_port), ("NODE_PORT", node_port)):
         raise SystemExit(f"{name} must be a valid TCP port")
 PY
 
-    # Detect an existing unrestricted API-port exception rather than claiming
-    # the new source-specific rule makes an already-open port private.
-    if ufw status | awk -v p="$NODE_PORT/tcp" 'index($0, p) == 1 && $0 ~ /ALLOW[[:space:]]+IN/ && $0 ~ /Anywhere/ {found=1} END {exit !found}'; then
-        echo "Fatal: UFW already contains an unrestricted allow rule for NODE_PORT=$NODE_PORT; remove it manually before retrying." >&2
+    # The rules come from the shared helper, so the ports this Worker opens are
+    # the policy a Master would apply to a Node host — not a hand-written list
+    # that can drift from it. The policy is preflighted against the persisted
+    # UFW state, applied verbatim and read back from the running kernel; a
+    # failure after the first mutation restores the captured baseline.
+    local policy preflight helper preserved rules rc=0
+    if ! policy=$(worker_firewall_policy_json); then
+        echo "Fatal: the Worker firewall policy could not be derived; refusing to change a firewall without one." >&2
         return 1
+    fi
+    helper=$(materialize_security_helper) || return 1
+    # An existing unrestricted NODE_PORT allow is a preflight conflict, so the
+    # new source-specific rule cannot be described as making that port private.
+    if ! preflight=$(printf '%s' "$policy" | python3 -c 'import json,sys
+json.dump(json.load(sys.stdin)["policy"], sys.stdout)' | python3 "$helper" --firewall-preflight /); then
+        rm -f "$helper"
+        printf 'Fatal: %s\n' "$(printf '%s' "$preflight" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("error", "firewall preflight failed"))
+except Exception:
+    print("firewall preflight failed")' 2>/dev/null || echo "firewall preflight failed")" >&2
+        echo "Fatal: the managed Worker ingress conflicts with existing firewall policy; resolve it before retrying." >&2
+        return 1
+    fi
+    preserved=$(printf '%s' "$preflight" | python3 -c 'import json,sys
+try:
+    print(len(json.load(sys.stdin).get("preserved_exceptions", [])))
+except Exception:
+    print(0)' 2>/dev/null || echo 0)
+    if [[ "$preserved" != "0" ]]; then
+        echo "Firewall preflight preserved $preserved unrelated administrator allow rule(s)." >&2
     fi
 
     # What the firewall read before the first rule changes, in the transaction's
-    # own recovery directory: the rollback restores this, not "our four rules
-    # removed from whatever is left". A baseline this install cannot read back
-    # and restore is refused here, before anything is mutated.
-    record_firewall_before_image || return 1
+    # own recovery directory: the rollback restores this, not "our rules removed
+    # from whatever is left". A baseline this install cannot read back and
+    # restore is refused here, before anything is mutated.
+    record_firewall_before_image || { rm -f "$helper"; return 1; }
 
     if ufw status 2>/dev/null | grep -q '^Status: active'; then
         _UFW_WAS_ACTIVE=1
@@ -4449,32 +4757,99 @@ PY
     fi
     _UFW_RULES_CONFIGURED=1
 
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow "$ssh_port/tcp" comment "SSH administration"
-    ufw allow 80/tcp comment "HTTP ACME challenge"
-    ufw allow 443/tcp comment "HTTPS and Xray Stream"
-    if [[ -n "$panel_ip" ]]; then
-        ufw allow proto tcp from "$panel_ip" to any port "$NODE_PORT" comment "GoWave Control Plane IPv4"
+    if ! rules=$(printf '%s' "$policy" | python3 -c 'import json,sys
+policy = json.load(sys.stdin)["policy"]
+for command in policy.get("commands", []):
+    print("\x1f".join(str(token) for token in command))'); then
+        rm -f "$helper"
+        echo "Fatal: the prepared Worker firewall policy is not readable." >&2
+        return 1
     fi
-    if [[ -n "$panel_ipv6" ]]; then
-        ufw allow proto tcp from "$panel_ipv6" to any port "$NODE_PORT" comment "GoWave Control Plane IPv6"
-    fi
+    local -a rule
+    while IFS=$'\x1f' read -r -a rule; do
+        [[ "${#rule[@]}" -gt 0 ]] || continue
+        # The rule is echoed before it runs: an operator reading a failed
+        # install sees the last rule UFW accepted, not only the error.
+        printf 'UFW: %s\n' "${rule[*]}"
+        if [[ "${rule[0]}" == "default" ]]; then
+            if ! ufw "${rule[@]}" </dev/null; then
+                rc=1
+                break
+            fi
+        elif ! ufw "${rule[@]}" comment "GoWave Auto NGINX" </dev/null; then
+            rc=1
+            break
+        fi
+    done <<< "$rules"
+
     # UFW's own declaration has to follow the same host decision the listeners
     # render, or the distro default claims a v6 stack this host does not have
     # (and, where that default is ``no``, leaves a v6 listener unfiltered).
-    if [[ -f "$ufw_default" ]]; then
+    if [[ "$rc" -eq 0 && -f "$ufw_default" ]]; then
         if kernel_has_ipv6; then
             sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
         else
             sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || true
         fi
     fi
-    ufw --force enable
-    ufw status | grep -q '^Status: active$' || {
-        echo "Fatal: UFW did not enter the active state." >&2
+    if [[ "$rc" -eq 0 ]]; then
+        if ! ufw --force enable </dev/null || ! ufw status 2>/dev/null | grep -q '^Status: active$'; then
+            echo "Error: UFW did not enter the active state." >&2
+            rc=1
+        fi
+    fi
+
+    if [[ "$rc" -eq 0 ]]; then
+        local verdict
+        if ! verdict=$(printf '%s' "$policy" | python3 -c 'import json,sys
+json.dump(json.load(sys.stdin)["policy"], sys.stdout)' | python3 "$helper" --firewall-verify /); then
+            printf 'Error: %s\n' "$(printf '%s' "$verdict" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("error", "firewall verification failed"))
+except Exception:
+    print("firewall verification failed")' 2>/dev/null || echo "firewall verification failed")" >&2
+            rc=1
+        fi
+    fi
+    rm -f "$helper"
+
+    if [[ "$rc" -ne 0 ]]; then
+        # One restoration attempt: the outer compensation must not replay it over
+        # a state this attempt already rewrote.
+        _UFW_RULES_CONFIGURED=0
+        if restore_firewall_before_image; then
+            echo "Fatal: the Worker ingress could not be applied and verified; the firewall baseline was restored." >&2
+        else
+            echo "CRITICAL: the Worker ingress failed and the firewall baseline could not be restored; the before-image is retained for operator intervention." >&2
+        fi
         return 1
-    }
+    fi
+}
+
+write_worker_security_report() {
+    # One report per Worker, produced from effective state: the helper reads the
+    # firewall, the jail, the update schedule and the resolver back, so the file
+    # describes this host now instead of restating the steps this run printed.
+    local helper request output rc=0 ipv6=false
+    if kernel_has_ipv6; then ipv6=true; fi
+    helper=$(materialize_security_helper) || return 1
+    request=$(python3 - "${NODE_PORT:-3002}" "${PANEL_IP:-}" "${PANEL_IPV6:-}" \
+        "${GOWAVE_DOT_POLICY:-best-effort}" "${_DOT_RECOVERY:-unknown}" "$ipv6" <<'PY'
+import json, sys
+port, v4, v6, policy, recovery, ipv6 = sys.argv[1:]
+json.dump({'role': 'worker', 'node_port': int(port),
+           'master_sources': [value for value in (v4, v6) if value],
+           'ipv6': ipv6 == 'true', 'dot_policy': policy,
+           'dot_recovery': recovery}, sys.stdout)
+PY
+    ) || { rm -f "$helper"; return 1; }
+    output=$(printf '%s' "$request" | python3 "$helper" --security-report) || rc=$?
+    rm -f "$helper"
+    printf '%s\n' "$output"
+    if [[ "$rc" -ne 0 ]]; then
+        log_warn "This Worker is not ready for deployment; the security report names the control that failed."
+        return 1
+    fi
 }
 
 unpack_cover_reality() {
@@ -4491,18 +4866,11 @@ unpack_cover_reality() {
     _COVER_UNPACKED=1
 }
 
-derive_cover_domain() {
-    local panel_domain="${1:-}"
-    local labels
-    [[ -n "$panel_domain" ]] || return 0
-    IFS='.' read -r -a labels <<< "${panel_domain%.}"
-    local count="${#labels[@]}"
-    if [[ "$count" -lt 3 ]]; then
-        return 0
-    fi
-    printf '%s.%s\n' "${labels[count - 2]}" "${labels[count - 1]}"
-}
-
+# A Worker owns no cover apex. Its camouflage site is served under its own
+# camouflage name, which is also its REALITY SNI, so this payload carries no
+# apex decision at all: there is no suffix to derive and no name a shared zone
+# could lend it. Only the brand helper is needed, because the decoy is rendered
+# from a domain like the Master's is.
 cover_brand_from_domain() {
     local domain="${1:-}"
     local labels label word out=""
@@ -4519,57 +4887,6 @@ cover_brand_from_domain() {
         out+="${word^} "
     done
     printf '%s\n' "${out% }"
-}
-
-# ACME validates the cover domains over port 80 on this host, so they are only
-# usable when both records already resolve to its public IPv4 address. Each name
-# that does not is printed, one per line, so the refusal can point at the record
-# an operator has to fix instead of blaming the pair.
-cover_domains_not_resolving() {
-    local cover_domain="${1:-}"
-    local server_ip="${2:-}"
-    local name resolved
-    [[ -n "$cover_domain" ]] || return 0
-    for name in "$cover_domain" "www.$cover_domain"; do
-        resolved=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
-        if [[ -z "$server_ip" || "$resolved" != "$server_ip" ]]; then
-            printf '%s\n' "$name"
-        fi
-    done
-}
-
-cover_domains_resolve_here() {
-    local cover_domain="${1:-}"
-    local server_ip="${2:-}"
-    [[ -n "$cover_domain" && -n "$server_ip" ]] || return 1
-    [[ -z "$(cover_domains_not_resolving "$cover_domain" "$server_ip")" ]]
-}
-
-# The single cover-site decision, identical to the Master's: the apex on
-# stdout, nothing when the decoy stays off, and the reason on stderr. A domain
-# without a subdomain has no registrable apex, and an empty render would leave
-# the operator guessing which of the two refusals happened.
-cover_domain_for() {
-    local panel_domain="${1:-}"
-    local server_ip="${2:-}"
-    local cover_domain unresolved
-    cover_domain=$(derive_cover_domain "$panel_domain")
-    if [[ -z "$cover_domain" ]]; then
-        if [[ -n "$panel_domain" ]]; then
-            echo "Camouflage apex disabled — $panel_domain has no subdomain, so no cover apex exists." >&2
-        fi
-        return 0
-    fi
-    unresolved=$(cover_domains_not_resolving "$cover_domain" "$server_ip")
-    if [[ -n "$unresolved" ]]; then
-        if [[ "$unresolved" == *$'\n'* ]]; then
-            echo "Camouflage apex disabled — ${unresolved//$'\n'/ / } do not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
-        else
-            echo "Camouflage apex disabled — $unresolved does not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
-        fi
-        return 0
-    fi
-    printf '%s\n' "$cover_domain"
 }
 
 render_cover_site() {
@@ -4614,52 +4931,201 @@ render_cover_site() {
     echo "Rendered worker camouflage site for ${domain:-unknown domain}."
 }
 
+# The edge identity this Worker serves right now, read from the files this
+# product manages: one `sni <name> <backend>` line per stream map entry and one
+# `cert <role> <live directory>` line per listener. An empty answer is a host
+# that serves no Worker edge yet, which is a first install rather than a
+# migration. A managed path that is a symlink or not a regular file is refused
+# instead of followed, exactly as the install refuses to write through one.
+worker_edge_identity() {
+    local stream_file="${1:-/etc/nginx/stream-enabled/gowave-worker-stream.conf}"
+    local conf_dir="${2:-/etc/nginx/conf.d}"
+    python3 - "$stream_file" "$conf_dir" <<'PY'
+import os
+import re
+import sys
+
+stream_file, conf_dir = sys.argv[1:3]
+
+
+def managed(path):
+    if not os.path.lexists(path):
+        return ""
+    if os.path.islink(path) or not os.path.isfile(path):
+        sys.stderr.write(
+            "Error: %s is not a regular file; refusing to read a managed Worker "
+            "listener through it.\n" % path
+        )
+        raise SystemExit(1)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        sys.stderr.write("Error: cannot read %s: %s.\n" % (path, exc.__class__.__name__))
+        raise SystemExit(1)
+
+
+def stream_entries(body):
+    block = re.search(
+        r"map\s+\$ssl_preread_server_name\s+\$worker_dest\s*\{(.*?)\}",
+        body, re.DOTALL,
+    )
+    if not block:
+        return []
+    entries = []
+    for match in re.finditer(r"^\s*(\S+)\s+(127\.0\.0\.1:\d+);", block.group(1), re.MULTILINE):
+        entries.append("sni %s %s" % (match.group(1), match.group(2)))
+    return entries
+
+
+def certificate_directory(body):
+    match = re.search(r"^\s*ssl_certificate\s+([^;]+);", body, re.MULTILINE)
+    if not match:
+        return ""
+    path = match.group(1).strip()
+    return os.path.dirname(path) if path.endswith("/fullchain.pem") else ""
+
+
+for entry in stream_entries(managed(stream_file)):
+    print(entry)
+for role, name in (("worker", "gowave-worker-https.conf"),
+                   ("reality", "gowave-worker-decoy.conf"),
+                   ("vision", "gowave-worker-vision-fallback.conf")):
+    directory = certificate_directory(managed(os.path.join(conf_dir, name)))
+    if directory:
+        print("cert %s %s" % (role, directory))
+PY
+}
+
+# The edge identity this run is about to serve, from the values the controller
+# streamed and the lineages the run selected.
+worker_target_edge_identity() {
+    local worker_live="$1"
+    local reality_live="$2"
+    local vision_live="${3:-}"
+    printf 'sni %s 127.0.0.1:7443\n' "$WORKER_DOMAIN"
+    printf 'sni %s 127.0.0.1:8443\n' "$REALITY_DOMAIN"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        printf 'sni %s 127.0.0.1:8444\n' "$VISION_DOMAIN"
+    fi
+    printf 'sni default 127.0.0.1:8443\n'
+    printf 'cert worker %s\n' "$worker_live"
+    printf 'cert reality %s\n' "$reality_live"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        printf 'cert vision %s\n' "$vision_live"
+    fi
+}
+
+# require_worker_edge_migration_confirmation WORKER_LIVE_DIR REALITY_LIVE_DIR [VISION_LIVE_DIR] [STREAM_FILE] [CONF_DIR]
+#
+# Rewriting an installed Worker's routes and certificate references is a
+# migration, not a repair: it changes what every client of this host reaches.
+# The two identities are therefore printed and compared before the first managed
+# path is touched, and a difference needs the controller's confirmation
+# (GOWAVE_MIGRATE_EXISTING=yes, which `node reapply` sends only after its own
+# prompt). A host that serves nothing yet, or already serves exactly this
+# identity, is not a migration and needs none. The last two arguments name where
+# the managed files live; the install leaves them at their defaults.
+require_worker_edge_migration_confirmation() {
+    local worker_live="$1"
+    local reality_live="$2"
+    local vision_live="${3:-}"
+    local stream_file="${4:-/etc/nginx/stream-enabled/gowave-worker-stream.conf}"
+    local conf_dir="${5:-/etc/nginx/conf.d}"
+    local current desired
+
+    current=$(worker_edge_identity "$stream_file" "$conf_dir") || return 1
+    desired=$(worker_target_edge_identity "$worker_live" "$reality_live" "$vision_live") || return 1
+
+    if [[ -z "$current" ]]; then
+        echo "[MIGRATION] No managed Worker edge is installed on this host; nothing to migrate."
+        return 0
+    fi
+
+    current=$(printf '%s\n' "$current" | LC_ALL=C sort)
+    desired=$(printf '%s\n' "$desired" | LC_ALL=C sort)
+
+    if [[ "$current" == "$desired" ]]; then
+        echo "[MIGRATION] The managed Worker edge already serves this identity; nothing to migrate."
+        return 0
+    fi
+
+    echo "[MIGRATION] Edge identity currently served by this Worker:"
+    printf '%s\n' "$current" | while IFS= read -r entry; do
+        [[ -n "$entry" ]] && printf '[MIGRATION]   %s\n' "$entry"
+    done
+    echo "[MIGRATION] Edge identity this run will serve:"
+    printf '%s\n' "$desired" | while IFS= read -r entry; do
+        [[ -n "$entry" ]] && printf '[MIGRATION]   %s\n' "$entry"
+    done
+
+    if [[ "${GOWAVE_MIGRATE_EXISTING:-no}" == "yes" ]]; then
+        echo "[MIGRATION] Migration confirmed by GOWAVE_MIGRATE_EXISTING=yes."
+        return 0
+    fi
+    echo "Error: this Worker already serves a different edge identity, and nothing may be rewritten without an explicit migration confirmation." >&2
+    echo "Re-run the controller's 'node reapply' for this host: it shows the preview, asks for confirmation and streams GOWAVE_MIGRATE_EXISTING=yes." >&2
+    return 1
+}
+
+# verify_renewal_dry_run LINEAGE [CERTBOT_ARGS...]
+# The issuance that just succeeded says nothing about renewal: the port-80
+# webroot vhost, the authenticator recorded in `renewal/<lineage>.conf` and the
+# deploy hook all take part only when a renewal runs. A dry run revalidates one
+# named lineage through that recorded path while NGINX serves, and it stores no
+# certificate, so a Worker can run it without touching the Master's lineages.
+verify_renewal_dry_run() {
+    local lineage="${1:?a lineage name is required}"
+    shift
+    echo "Verifying renewal of the $lineage lineage with a dry run..."
+    run_certbot renew --dry-run --cert-name "$lineage" --non-interactive "$@"
+}
+
 configure_edge_nginx() {
+    # The live directories are the ones this run selected, passed in rather than
+    # re-derived: a suffixed lineage (`cover2.example.net-0001`) is served from the
+    # path that was checked, and the heredocs below are rendered from that same
+    # value, so no listener points at a lineage the run did not verify.
+    local worker_live="${1:-/etc/letsencrypt/live/$WORKER_DOMAIN}"
+    local reality_live="${2:-/etc/letsencrypt/live/$REALITY_DOMAIN}"
+    local vision_live="${3:-${VISION_DOMAIN:+/etc/letsencrypt/live/$VISION_DOMAIN}}"
+    local worker_lineage reality_lineage vision_lineage
+    worker_lineage=$(basename -- "$worker_live")
+    reality_lineage=$(basename -- "$reality_live")
+    if [[ -n "$vision_live" ]]; then
+        vision_lineage=$(basename -- "$vision_live")
+    fi
+
     mkdir -p /etc/nginx/stream-enabled /etc/nginx/conf.d /var/www/gowave-acme
     chmod 0755 /var/www/gowave-acme
 
-    # Camouflage apex: the bare domain of this Worker serves the static decoy.
-    # ACME validates it over port 80 here, so it requires the apex and www
-    # records to point at this host; the decision names its own refusal, so a
-    # domain without a subdomain is reported instead of rendering nothing.
-    local cover_domain="" cover_server_ip=""
-    if [[ -n "$(derive_cover_domain "$WORKER_DOMAIN")" ]]; then
-        if [[ "${GOWAVE_PODMAN_TEST_MODE:-0}" == "1" ]]; then
-            cover_server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-        else
-            cover_server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
-                              curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
-        fi
-    fi
-    cover_domain=$(cover_domain_for "$WORKER_DOMAIN" "$cover_server_ip")
-    local cover_names=""
-    if [[ -n "$cover_domain" ]]; then
-        cover_names=" $cover_domain www.$cover_domain"
-    fi
+    # This Worker owns no cover apex. Its camouflage site is served under its
+    # own camouflage name on port 443 and under its primary name on the edge
+    # listener, so no apex or `www` name is inferred, requested from ACME or
+    # routed here: a name a shared zone lends the Master stays with the Master.
 
     # Port 80 ACME webroot vhost. It stays in place after issuance: certbot's
     # HTTP-01 renewal revalidates through this same path, so removing it makes
-    # every later `certbot renew` fail with a 404.
-    local cover_http_redirect=""
-    if [[ -n "$cover_domain" ]]; then
-        # Keep the plain-HTTP visit to the camouflage apex as ordinary as the
-        # Master's: redirect to HTTPS instead of dropping the connection.
-        local cover_regex="${cover_domain//./\\.}"
-        cover_http_redirect="        if (\$host ~* ^(${cover_regex}|www\\.${cover_regex})\$) {
-            return 301 https://\$host\$request_uri;
-        }
-"
+    # every later `certbot renew` fail with a 404. A managed name keeps an
+    # ordinary HTTPS visit; a host this Worker was never configured with is
+    # refused, which is also what keeps a shared zone's apex from being served.
+    local managed_http_regex="${WORKER_DOMAIN//./\\.}|${REALITY_DOMAIN//./\\.}"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        managed_http_regex+="|${VISION_DOMAIN//./\\.}"
     fi
     cat > /etc/nginx/conf.d/00-worker-acme-challenge.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Port 80 ACME Challenge
 server {
     listen 80;
-    server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-}$cover_names;
+    server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-};
     location /.well-known/acme-challenge/ {
         root /var/www/gowave-acme;
     }
     location / {
-${cover_http_redirect}        return 444;
+        if (\$host ~* ^(${managed_http_regex})\$) {
+            return 301 https://\$host\$request_uri;
+        }
+        return 444;
     }
 }
 EOF
@@ -4675,22 +5141,17 @@ EOF
 
     echo "Acquiring Let's Encrypt TLS certificate for Worker ($WORKER_DOMAIN)..."
     run_certbot certonly --webroot -w /var/www/gowave-acme \
-        -d "$WORKER_DOMAIN" --cert-name "$WORKER_DOMAIN" \
+        -d "$WORKER_DOMAIN" --cert-name "$worker_lineage" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
         "${certbot_extra_args[@]}"
     _ACME_WORKER_ISSUED=1
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($REALITY_DOMAIN)..."
-    # The camouflage certificate also covers the apex website served by this
-    # Worker, so one lineage backs both the probe fallback and the plain domain.
-    local reality_cert_args=(-d "$REALITY_DOMAIN")
-    local reality_cert_flags=()
-    if [[ -n "$cover_domain" ]]; then
-        reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
-        reality_cert_flags+=(--expand)
-    fi
+    # One lineage backs the probe fallback and the camouflage site this Worker
+    # serves. It names the Worker's own camouflage name only: no apex or `www`
+    # of a shared zone is requested here, so a same-zone Master keeps its pair.
     run_certbot certonly --webroot -w /var/www/gowave-acme \
-        "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$REALITY_DOMAIN" \
+        -d "$REALITY_DOMAIN" --cert-name "$reality_lineage" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
         "${certbot_extra_args[@]}"
     _ACME_REALITY_ISSUED=1
@@ -4698,7 +5159,7 @@ EOF
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         echo "Acquiring Let's Encrypt TLS certificate for Vision ($VISION_DOMAIN)..."
         run_certbot certonly --webroot -w /var/www/gowave-acme \
-            -d "$VISION_DOMAIN" --cert-name "$VISION_DOMAIN" \
+            -d "$VISION_DOMAIN" --cert-name "$vision_lineage" \
             --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
             "${certbot_extra_args[@]}"
         _ACME_VISION_ISSUED=1
@@ -4718,13 +5179,10 @@ EOF
             return 1
         }
     }
-    verify_worker_certificate "$WORKER_DOMAIN"
-    verify_worker_certificate "$REALITY_DOMAIN"
-    if [[ -n "$cover_domain" ]]; then
-        verify_worker_certificate "$cover_domain" "/etc/letsencrypt/live/$REALITY_DOMAIN"
-    fi
+    verify_worker_certificate "$WORKER_DOMAIN" "$worker_live"
+    verify_worker_certificate "$REALITY_DOMAIN" "$reality_live"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        verify_worker_certificate "$VISION_DOMAIN"
+        verify_worker_certificate "$VISION_DOMAIN" "$vision_live"
     fi
 
     # Configure automated ACME reload hook for Worker
@@ -4748,18 +5206,16 @@ EOF
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         worker_vision="    $VISION_DOMAIN 127.0.0.1:8444;"
     fi
-    local worker_cover=""
-    if [[ -n "$cover_domain" ]]; then
-        worker_cover="    $cover_domain 127.0.0.1:9443;
-    www.$cover_domain 127.0.0.1:9443;"
-    fi
     cat > /etc/nginx/stream-enabled/gowave-worker-stream.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Edge Stream
+# Same edge log as the Master: the Worker's 443 is the surface a client meets,
+# so an operator diagnosing "did this node carry the connection" reads here.
+log_format gowave_edge '\$ssl_preread_server_name \$ssl_preread_protocol \$remote_addr \$server_port \$time_iso8601';
+access_log /var/log/nginx/gowave-edge-access.log gowave_edge;
 map \$ssl_preread_server_name \$worker_dest {
     $WORKER_DOMAIN 127.0.0.1:7443;
     $REALITY_DOMAIN 127.0.0.1:8443;
 $worker_vision
-$worker_cover
     default 127.0.0.1:8443;
 }
 
@@ -4792,26 +5248,40 @@ EOF
 server {
     $listen_7443
     server_name $WORKER_DOMAIN;
+    server_tokens off;
+
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
 
-    ssl_certificate /etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$WORKER_DOMAIN/privkey.pem;
+    ssl_certificate $worker_live/fullchain.pem;
+    ssl_certificate_key $worker_live/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
 
+    # The primary name is an ordinary website: the root and every known asset
+    # are the rendered cover site, and an unknown path keeps the brand's own
+    # 404 page instead of a bare server error.
+    root /var/www/gowave-auto-nginx/cover-reality;
+    index index.html;
+    error_page 404 /404.html;
+
+    # No Panel runs on a Worker. Its management and subscription surface is
+    # refused before static handling, so a probe reads no control content and
+    # nothing reaches a transport.
+    location ^~ /api/ {
+        return 444;
+    }
+
     location ^~ /xhttp-down/ {
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_request_buffering off;
+        grpc_pass grpc://127.0.0.1:10001;
         client_max_body_size 0;
         client_body_timeout 1h;
-        proxy_read_timeout 1h;
-        proxy_send_timeout 1h;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_read_timeout 1h;
+        grpc_send_timeout 1h;
+        grpc_set_header Connection "";
+        grpc_set_header Host \$host;
+        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Forwarded-For \$remote_addr;
     }
 
     location = /ws {
@@ -4834,7 +5304,7 @@ server {
     }
 
     location / {
-        return 404;
+        try_files \$uri \$uri/ =404;
     }
 }
 EOF
@@ -4844,13 +5314,13 @@ EOF
 # Managed by GoWave Auto NGINX: Worker Edge Decoy
 server {
     $listen_9443
-    server_name $REALITY_DOMAIN$cover_names;
+    server_name $REALITY_DOMAIN;
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
     ssl_protocols TLSv1.3;
 
-    ssl_certificate /etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$REALITY_DOMAIN/privkey.pem;
+    ssl_certificate $reality_live/fullchain.pem;
+    ssl_certificate_key $reality_live/privkey.pem;
 
     root /var/www/gowave-auto-nginx/cover-reality;
     index index.html;
@@ -4858,7 +5328,7 @@ server {
     access_log /var/log/nginx/gowave-decoy-access.log;
 }
 EOF
-    render_cover_site "/var/www/gowave-auto-nginx/cover-reality" "${cover_domain:-$REALITY_DOMAIN}" || return 1
+    render_cover_site "/var/www/gowave-auto-nginx/cover-reality" "$REALITY_DOMAIN" || return 1
 
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         cat > /etc/nginx/conf.d/gowave-worker-vision-fallback.conf <<EOF
@@ -4881,6 +5351,18 @@ EOF
     nginx -t
     systemctl reload nginx || systemctl restart nginx
     systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate production configuration" >&2; return 1; }
+
+    # The production vhost is live, so this is the path the next renewal takes:
+    # the dry run proves that path answers while storing no certificate. Only the
+    # lineages this Worker owns are named, so a shared zone's Master pair is
+    # never revalidated from here.
+    local owned_lineage
+    for owned_lineage in "$worker_lineage" "$reality_lineage" ${vision_lineage:+"$vision_lineage"}; do
+        verify_renewal_dry_run "$owned_lineage" "${certbot_extra_args[@]}" || {
+            echo "Fatal: the renewal dry run for $owned_lineage failed; this Worker would not renew." >&2
+            return 1
+        }
+    done
     _NGINX_CONFIGS_CREATED=1
 }
 
@@ -5226,7 +5708,7 @@ compensate_remote_worker() {
 
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
-        echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
+        echo "[ROLLBACK] Stopping gowave-node.service before its paths are restored..." >&2
         # Xray is supervised by gowave-node in this product and the upstream
         # installer may leave no unit of its own, so an absent unit is a clean
         # host rather than a failed cleanup: only a unit that exists is stopped.
@@ -5234,7 +5716,13 @@ compensate_remote_worker() {
             if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" ||
                 systemctl is-active --quiet "$unit" 2>/dev/null; then
                 systemctl stop "$unit" 2>/dev/null || rollback_failed=1
-                systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+                # A Worker that was already serving is not being uninstalled:
+                # this run was a re-apply whose Panel registration is unchanged,
+                # and the unit the before-image is about to put back is started
+                # again for it rather than left disabled.
+                if [[ "${_NODE_SERVICE_WAS_ACTIVE:-0}" -ne 1 ]]; then
+                    systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+                fi
             fi
         done
         systemctl daemon-reload 2>/dev/null || rollback_failed=1
@@ -5250,6 +5738,18 @@ compensate_remote_worker() {
     restore_worker_targets_before_image \
         "$host_root" "$(worker_targets_before_image "$state_root" "$_ACME_TX_ID")" ||
         rollback_failed=1
+
+    # 1b. Put the service back the way this run found it. A failed re-apply of a
+    # serving Worker that leaves the host silent is a worse outcome than the
+    # refusal: the Panel still lists the node, so the operator sees a cluster
+    # with a dead member and no message. Only a rollback that restored every
+    # path starts it — a half-restored binary is not started to prove more.
+    if [[ "${_NODE_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]] && [[ "$rollback_failed" -eq 0 ]]; then
+        echo "[ROLLBACK] Restarting the Worker service this run found active..." >&2
+        systemctl enable gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl start gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl is-active --quiet gowave-node.service || rollback_failed=1
+    fi
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
@@ -5276,21 +5776,26 @@ compensate_remote_worker() {
     # 4. Revert ACME certificates
     if [[ -n "${_ACME_TX_ID:-}" ]]; then
         echo "[ROLLBACK] Restoring or cleaning up ACME certificates via snapshot..." >&2
-        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
-        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
+        # Restored under the lineage this run snapshotted: the plain name has no
+        # manifest when a suffixed lineage was adopted, and restoring nothing there
+        # would leave an issued certificate behind a rollback that claims to be done.
+        restore_acme_lineage "$_ACME_TX_ID" "${_WORKER_LINEAGE:-$WORKER_DOMAIN}" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "${_REALITY_LINEAGE:-$REALITY_DOMAIN}" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
         if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
+            restore_acme_lineage "$_ACME_TX_ID" "${_VISION_LINEAGE:-$VISION_DOMAIN}" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
         fi
     else
+        worker_lineage="${_WORKER_LINEAGE:-$WORKER_DOMAIN}"
         if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
-            echo "[ROLLBACK] Deleting ACME certificate for $WORKER_DOMAIN..." >&2
-            certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || rollback_failed=1
-            rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || rollback_failed=1
+            echo "[ROLLBACK] Deleting ACME certificate for $worker_lineage..." >&2
+            certbot delete --cert-name "$worker_lineage" --non-interactive 2>/dev/null || rollback_failed=1
+            rm -rf "/etc/letsencrypt/live/$worker_lineage" "/etc/letsencrypt/archive/$worker_lineage" "/etc/letsencrypt/renewal/$worker_lineage.conf" 2>/dev/null || rollback_failed=1
         fi
+        reality_lineage="${_REALITY_LINEAGE:-$REALITY_DOMAIN}"
         if [[ "${_ACME_REALITY_ISSUED:-0}" -eq 1 ]] && [[ -n "${REALITY_DOMAIN:-}" ]]; then
-            echo "[ROLLBACK] Deleting ACME certificate for $REALITY_DOMAIN..." >&2
-            certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || rollback_failed=1
-            rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || rollback_failed=1
+            echo "[ROLLBACK] Deleting ACME certificate for $reality_lineage..." >&2
+            certbot delete --cert-name "$reality_lineage" --non-interactive 2>/dev/null || rollback_failed=1
+            rm -rf "/etc/letsencrypt/live/$reality_lineage" "/etc/letsencrypt/archive/$reality_lineage" "/etc/letsencrypt/renewal/$reality_lineage.conf" 2>/dev/null || rollback_failed=1
         fi
     fi
 
@@ -5360,7 +5865,7 @@ compensate_remote_worker() {
 
     # 8. Clean temporary files and unset secrets
     unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64
-    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem || rollback_failed=1
+    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.* /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem || rollback_failed=1
 
     if [[ "$rollback_failed" -ne 0 ]]; then
         echo "[ROLLBACK] ERROR: compensating rollback incomplete; one or more cleanup operations failed." >&2
@@ -5388,11 +5893,12 @@ main() {
     _NGINX_CONFIGS_CREATED=0
     _STREAM_INCLUDE_ADDED=0
     _NODE_SERVICE_CONFIGURED=0
+    _NODE_SERVICE_WAS_ACTIVE=0
 
     _COMPENSATED=0
     cleanup_temp_and_secrets() {
         unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64 2>/dev/null || true
-        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem 2>/dev/null || true
+        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.* /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem 2>/dev/null || true
     }
     compensate_once() {
         # One compensation per run. A signal, a failing step and the EXIT trap
@@ -5451,16 +5957,52 @@ main() {
     acquire_mutation_lock
     verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "${_ACME_TX_ID:-}" || return 1
     # Before the first managed path is touched: a unit, a binary or a webroot
-    # this install did not write is not a rollback target.
-    verify_worker_mutation_targets_preflight || return 1
+    # this install did not write is not a rollback target. The confirmed
+    # migration (`GOWAVE_MIGRATE_EXISTING=yes`, which `node reapply` forwards
+    # only after the operator answers) adopts a regular file this product did
+    # not record; an unconfirmed run keeps refusing it.
+    if [[ "${GOWAVE_MIGRATE_EXISTING:-no}" == "yes" ]]; then
+        GOWAVE_ADOPT_UNOWNED=1 verify_worker_mutation_targets_preflight || return 1
+    else
+        verify_worker_mutation_targets_preflight || return 1
+    fi
 
     validate_acme_server "${GOWAVE_ACME_SERVER:-}"
     local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
-    check_acme_lineage "$WORKER_DOMAIN" "$effective_acme_server"
-    check_acme_lineage "$REALITY_DOMAIN" "$effective_acme_server"
+    # The lineage a host already serves is adopted instead of issuing a second one
+    # beside it, exactly as the Master does: a Worker in a shared zone often has
+    # `cover2.example.net-0001`, and certbot named a plain lineage beside it would
+    # leave one name with two answers. The selection is also the path the vhosts
+    # are rendered from, so the listener serves the lineage that was checked.
+    _WORKER_LIVE_DIR=$(select_acme_lineage "$WORKER_DOMAIN" "$effective_acme_server") || return 1
+    _REALITY_LIVE_DIR=$(select_acme_lineage "$REALITY_DOMAIN" "$effective_acme_server") || return 1
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        check_acme_lineage "$VISION_DOMAIN" "$effective_acme_server"
+        _VISION_LIVE_DIR=$(select_acme_lineage "$VISION_DOMAIN" "$effective_acme_server") || return 1
     fi
+    _WORKER_LIVE_DIR="${_WORKER_LIVE_DIR:-/etc/letsencrypt/live/$WORKER_DOMAIN}"
+    _REALITY_LIVE_DIR="${_REALITY_LIVE_DIR:-/etc/letsencrypt/live/$REALITY_DOMAIN}"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        _VISION_LIVE_DIR="${_VISION_LIVE_DIR:-/etc/letsencrypt/live/$VISION_DOMAIN}"
+    fi
+    _WORKER_LINEAGE=$(basename -- "$_WORKER_LIVE_DIR")
+    _REALITY_LINEAGE=$(basename -- "$_REALITY_LIVE_DIR")
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        _VISION_LINEAGE=$(basename -- "$_VISION_LIVE_DIR")
+    fi
+    check_acme_lineage "$WORKER_DOMAIN" "$effective_acme_server" \
+        "/etc/letsencrypt/renewal/$_WORKER_LINEAGE.conf" "$_WORKER_LIVE_DIR"
+    check_acme_lineage "$REALITY_DOMAIN" "$effective_acme_server" \
+        "/etc/letsencrypt/renewal/$_REALITY_LINEAGE.conf" "$_REALITY_LIVE_DIR"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        check_acme_lineage "$VISION_DOMAIN" "$effective_acme_server" \
+            "/etc/letsencrypt/renewal/$_VISION_LINEAGE.conf" "$_VISION_LIVE_DIR"
+    fi
+
+    # Before the snapshots and the before-image: an installed Worker keeps the
+    # routes and certificates it serves until its controller confirms the
+    # rewrite, and this refusal happens while there is nothing to roll back.
+    require_worker_edge_migration_confirmation \
+        "$_WORKER_LIVE_DIR" "$_REALITY_LIVE_DIR" "${_VISION_LIVE_DIR:-}" || return 1
 
     _ACME_TX_ID="${ACME_TX_ID:-worker_install_$(date +%s)}"
     if [[ ! "$_ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
@@ -5471,10 +6013,13 @@ main() {
     # behind: it is reconciled here, before this run records a
     # transaction of its own.
     reconcile_worker_transaction_journals || return 1
-    snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
-    snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
+    # Snapshotted under the lineage name, not the requested one: an adopted lineage
+    # is thereby recorded as pre-existing, which is what keeps the rollback from
+    # deleting a certificate this run did not create.
+    snapshot_acme_lineage "$_ACME_TX_ID" "$_WORKER_LINEAGE"
+    snapshot_acme_lineage "$_ACME_TX_ID" "$_REALITY_LINEAGE"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        snapshot_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"
+        snapshot_acme_lineage "$_ACME_TX_ID" "$_VISION_LINEAGE"
     fi
     # What those inventoried paths held before this transaction writes them: the
     # rollback restores a pre-existing object from these bytes, removes a created
@@ -5482,6 +6027,14 @@ main() {
     # anything it cannot prove.
     record_worker_targets_before_image \
         "/" "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" || return 1
+
+    # Whether this run found the node already serving, which is what tells a
+    # re-apply from a first install when the compensation decides whether the
+    # unit it stopped is disabled or started again. Read before the first
+    # mutation, so nothing this run does can be mistaken for the answer.
+    if systemctl is-active --quiet gowave-node.service 2>/dev/null; then
+        _NODE_SERVICE_WAS_ACTIVE=1
+    fi
 
     # Recorded after the before-image and before the first mutation: a
     # run that dies from here on leaves a journal a later entrypoint can
@@ -5493,22 +6046,33 @@ main() {
     # changes from here on is this transaction's residue, and a rollback
     # cannot undo it.
     record_worker_package_baseline "$_ACME_TX_ID" || return 1
+    printf 'GOWAVE-WORKER-STAGE:hardening\n'
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
+    # Before the firewall, as on the Master: the jail bantime and UFW are two
+    # controls, and a Worker that aborts here has not yet changed its ingress.
+    configure_worker_fail2ban </dev/null
+    configure_worker_security_updates </dev/null
     configure_firewall </dev/null
     umask 022
     unpack_cover_reality </dev/null
-    configure_edge_nginx </dev/null
+    printf 'GOWAVE-WORKER-STAGE:acme\n'
+    configure_edge_nginx "$_WORKER_LIVE_DIR" "$_REALITY_LIVE_DIR" "${_VISION_LIVE_DIR:-}" </dev/null
     umask 077
     printf '%s' "$VERIFY_NODE_MTLS_B64" | base64 -d > /tmp/gowave-verify-node-mtls.py
     chmod 0700 /tmp/gowave-verify-node-mtls.py
     # Pass secret strictly scoped to upstream installer execution only.
     SECRET_KEY="$_NODE_SECRET_KEY" run_upstream_node_installer </dev/null
     unset SECRET_KEY
+    printf 'GOWAVE-WORKER-STAGE:verification\n'
     systemctl is-active --quiet gowave-node.service
     printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT" --mode crypto-only
     nginx -t
     systemctl is-active --quiet nginx
+
+    # The report is written once every control it covers has been applied and
+    # read back: a Worker whose ingress or jail drifted is not a finished host.
+    write_worker_security_report </dev/null
 
     # Every package-mutating step is behind us, so the delta between the
     # baseline and the host now is what this run left installed.
@@ -5533,7 +6097,7 @@ main() {
 }
 main "$@" </dev/null
 REMOTE_EOF
-    } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
+    } | "${ssh_command[@]}" -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
 }
 
 # Standalone remote rollback mechanism callable on failure or deprovisioning
@@ -6657,10 +7221,23 @@ fi
 # 3. Clean ACME certificates
 if [[ -n "${ACME_TX_ID:-}" ]]; then
     echo "[ROLLBACK] Restoring ACME lineages via snapshot for transaction $ACME_TX_ID..." >&2
-    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
-    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
-    if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
+    # The snapshot names the lineage, not the requested name: an adopted suffixed
+    # lineage (`cover2.example.net-0001`) is recorded under its own directory, and
+    # asking for the plain name would find no manifest and restore nothing. The
+    # journal is written after the snapshots, so a transaction without any is a
+    # rollback that cannot finish, not one with nothing to do.
+    acme_snapshot_root="/var/lib/gowave-auto-nginx/recovery/$ACME_TX_ID/acme"
+    restored_acme_lineage=0
+    if [[ -d "$acme_snapshot_root" ]]; then
+        for acme_snapshot in "$acme_snapshot_root"/*/; do
+            [[ -d "$acme_snapshot" ]] || continue
+            restored_acme_lineage=1
+            restore_acme_lineage "$ACME_TX_ID" "$(basename -- "$acme_snapshot")" 2>/dev/null || rollback_failed=1
+        done
+    fi
+    if [[ "$restored_acme_lineage" -eq 0 ]]; then
+        echo "[ROLLBACK] ERROR: transaction $ACME_TX_ID has no ACME snapshot to restore." >&2
+        rollback_failed=1
     fi
 else
     # Without the original transaction ID there is no trustworthy snapshot
@@ -6934,6 +7511,12 @@ def restore():
     code, saved, _ = run(["iptables-save"])
     if code != 0 or normalized(saved) != normalized(restored.get("iptables", "")):
         fail("The restored IPv4 ruleset does not match the before-image.")
+    # A dual-stack host filters on two tables, and a restored v4 ruleset proves
+    # nothing about the v6 one the failed install opened.
+    if "ip6tables" in restored:
+        code, saved, _ = run(["ip6tables-save"])
+        if code != 0 or normalized(saved) != normalized(restored["ip6tables"]):
+            fail("The restored IPv6 ruleset does not match the before-image.")
 
 
 if action == "capture":
@@ -6989,7 +7572,7 @@ if [[ -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]] &&
     rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1
     systemctl restart systemd-resolved 2>/dev/null || rollback_failed=1
 fi
-rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh || rollback_failed=1
+rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.* /tmp/gowave-node-install-*.sh || rollback_failed=1
 sysctl --system 2>/dev/null || rollback_failed=1
 
 # Delete the ACME snapshot only after every rollback action has succeeded.

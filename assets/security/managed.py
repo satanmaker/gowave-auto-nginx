@@ -3,31 +3,67 @@ Project-owned drop-ins only, transactional file/service rollback.
 """
 import json
 import hashlib
+import ipaddress
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import re
+import secrets
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
 import time
 
 MARKER = '# Managed by GoWave Auto NGINX: VPS Security\n'
-DOT = MARKER + '''[Resolve]
+# The owner every managed project path must carry. A test that runs the helper
+# against a disposable root it created itself sets this to its own effective
+# uid; on a host the value is root and is never changed.
+PROJECT_OWNER_UID = 0
+DOT_BODY = '''[Resolve]
 DNS=
 DNS=1.1.1.1#one.one.one.one 1.0.0.1#one.one.one.one 8.8.8.8#dns.google 8.8.4.4#dns.google
 FallbackDNS=
 Domains=
 Domains=~.
-DNSOverTLS=yes
+DNSOverTLS={mode}
 DNSSEC=no
 LLMNR=no
 MulticastDNS=no
 Cache=yes
 DNSStubListener=yes
 '''
+# `required` fails the host, `best-effort` lets resolution fall back to plain
+# DNS when 853 is blocked, and `off` leaves the resolver alone. The default is
+# best-effort because a blocked 853 must not cost an operator the install.
+DOT_POLICIES = ('off', 'best-effort', 'required')
+DOT_MODES = {'best-effort': 'opportunistic', 'required': 'yes'}
+DEFAULT_DOT_POLICY = 'best-effort'
+
+
+def dot_policy(value=None):
+    """Resolve the requested policy: the argument, then the environment, then the default."""
+    policy = (value if value is not None else os.environ.get('GOWAVE_DOT_POLICY', '')).strip().lower()
+    if not policy:
+        policy = DEFAULT_DOT_POLICY
+    if policy not in DOT_POLICIES:
+        # The value is echoed because the operator supplied it; a policy name is
+        # not a secret and a refusal that hides it is not actionable.
+        raise ValueError('Unsupported DNS-over-TLS policy: ' + policy + '; expected one of ' + ', '.join(DOT_POLICIES))
+    return policy
+
+
+def dot_content(policy):
+    """The managed drop-in for a policy that writes one."""
+    if policy not in DOT_MODES:
+        raise ValueError('Unsupported DNS-over-TLS policy: ' + str(policy))
+    return MARKER + DOT_BODY.format(mode=DOT_MODES[policy])
+
+
+DOT = dot_content('required')
 FILES = ('/etc/fail2ban/jail.d/90-gowave-auto-nginx.local',
-         '/etc/apt/apt.conf.d/99zz-gowave-auto-nginx',
+         '/etc/apt/apt.conf.d/zz-gowave-auto-nginx',
          '/etc/systemd/system/apt-daily.timer.d/90-gowave-auto-nginx.conf',
          '/etc/systemd/system/apt-daily-upgrade.timer.d/90-gowave-auto-nginx.conf',
          '/etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf')
@@ -58,6 +94,240 @@ def ssh_ports(effective, socket_listen=''):
     if not ports or any(not 1 <= port <= 65535 for port in ports):
         raise ValueError('Cannot determine effective SSH ports')
     return sorted(ports)
+
+
+def firewall_policy(role, ports, node_port=3002, master_sources=(), ipv6=False):
+    if role not in {'panel-only', 'aio', 'worker'} or type(ipv6) is not bool:
+        raise ValueError('Invalid firewall role or family')
+    if not isinstance(ports, (list, tuple)) or not ports:
+        raise ValueError('Discovered SSH ports are required')
+    if any(type(port) is not int or not 1 <= port <= 65535 for port in ports):
+        raise ValueError('Invalid SSH port')
+    if type(node_port) is not int or not 1 <= node_port <= 65535:
+        raise ValueError('Invalid Node API port')
+    protected = [3000, 3001, 7443, 8443, 8444, 9443, 9444, 10001, 10002, 10003]
+    if set(ports) & set(protected) or (role != 'panel-only' and node_port in set(ports) | {80, 443} | set(protected)):
+        raise ValueError('SSH or Node API port conflicts with managed listeners')
+    sources = []
+    for source in master_sources:
+        address = ipaddress.ip_address(source)
+        if address.is_unspecified or address.is_multicast or address.is_loopback:
+            raise ValueError('Invalid Master source address')
+        if address.version == 6 and not ipv6:
+            raise ValueError('IPv6 Master source requires enabled IPv6')
+        sources.append(str(address))
+    if role == 'worker' and not sources:
+        raise ValueError('Worker requires explicit Master sources')
+    if role != 'worker' and sources:
+        raise ValueError('Master source exceptions are Worker-only')
+    commands = [['default', 'deny', 'incoming'], ['default', 'allow', 'outgoing']]
+    commands.extend(['allow', f'{port}/tcp'] for port in sorted(set(ports) | {80, 443}))
+    commands.extend(['deny', f'{port}/tcp'] for port in protected)
+    if role == 'worker':
+        commands.extend(['allow', 'proto', 'tcp', 'from', source, 'to', 'any', 'port', str(node_port)]
+                        for source in sorted(set(sources)))
+    if role != 'panel-only':
+        commands.append(['deny', f'{node_port}/tcp'])
+    return {'role': role, 'ipv6': ipv6, 'ssh_ports': sorted(set(ports)),
+            'node_port': None if role == 'panel-only' else node_port,
+            'master_sources': sorted(set(sources)), 'internal_ports': protected,
+            'commands': commands}
+
+
+def _input_rules(content, family):
+    """Every rule of the `ufw-user-input` (IPv4) or `ufw6-user-input` (IPv6) chain.
+
+    Preflight, post-apply verification and conflict classification read rules
+    through this parser, so a rule one of them understands cannot be invisible
+    to another. ufw names the IPv6 chain `ufw6-user-input`; reading it with the
+    IPv4 name makes every IPv6 rule look absent, which the live acceptance run
+    caught as an all-family-6 "not effective" verdict. `supported` says whether
+    the rule stayed inside the constructs this module models; an unsupported
+    allow is refused rather than guessed at.
+    """
+    chain = 'ufw6-user-input' if family == 6 else 'ufw-user-input'
+    prefix = '-A ' + chain + ' '
+    entries = []
+    for number, line in enumerate(content.splitlines(), 1):
+        if not line.startswith(prefix):
+            continue
+        tokens = shlex.split(line)
+        if '-j' not in tokens:
+            raise ValueError('Unrecognized UFW input rule')
+        target = tokens[tokens.index('-j') + 1]
+        if target not in {'ACCEPT', 'DROP', 'REJECT', 'LOG', 'RETURN'}:
+            raise ValueError('Unsupported UFW input jump')
+        for option in ('-s', '-d', '-p', '-j', '--dport', '--dports', '-i', '--comment'):
+            if option in tokens and tokens.index(option) + 1 >= len(tokens):
+                raise ValueError('Incomplete UFW input rule')
+        # ``comment`` is a construct this module writes itself, so a rule that
+        # carries one is still a rule it understands: refusing them would make
+        # the second run of this installer reject its own firewall.
+        supported_tokens = {'-A', chain, '-p', 'tcp', 'all', '6', '-m', 'multiport',
+                            'comment', '-s', '-d', '-j', 'ACCEPT', 'DROP', 'REJECT', 'LOG', 'RETURN',
+                            '--dport', '--dports', '-i', '--syn', '--comment'}
+        value_options = {'-s', '-d', '--dport', '--dports', '-i', '--comment'}
+        values = {tokens[index + 1] for index, token in enumerate(tokens[:-1]) if token in value_options}
+        entry = {'family': family, 'line': number, 'target': target, 'protocol': 'tcp',
+                 'ports': None, 'source': None, 'interface': None,
+                 'supported': all(token in supported_tokens | values for token in tokens)}
+        protocol = tokens[tokens.index('-p') + 1] if '-p' in tokens else 'all'
+        if protocol not in {'tcp', 'all', '6'}:
+            entry['protocol'] = protocol
+            entries.append(entry)
+            continue
+        if '-i' in tokens:
+            entry['interface'] = tokens[tokens.index('-i') + 1]
+        option = '--dports' if '--dports' in tokens else '--dport'
+        if option in tokens:
+            ports = set()
+            for item in tokens[tokens.index(option) + 1].split(','):
+                bounds = item.split(':')
+                if len(bounds) not in {1, 2} or any(not value.isdigit() for value in bounds):
+                    raise ValueError('Unsupported UFW destination port expression')
+                low, high = int(bounds[0]), int(bounds[-1])
+                if not 1 <= low <= high <= 65535:
+                    raise ValueError('Invalid UFW destination port range')
+                ports.update(range(low, high + 1))
+            entry['ports'] = ports
+        if '-s' in tokens:
+            network = ipaddress.ip_network(tokens[tokens.index('-s') + 1], strict=False)
+            if network.version != family:
+                raise ValueError('UFW source family mismatch')
+            entry['source'] = network
+        entries.append(entry)
+    return entries
+
+
+def _public_allow(entry):
+    """An allow that reaches every host, not one whitelisted source."""
+    source = entry['source']
+    return (entry['target'] == 'ACCEPT' and entry['protocol'] == 'tcp'
+            and entry['interface'] != 'lo'
+            and (source is None or source.prefixlen < source.max_prefixlen))
+
+
+def firewall_conflicts(policy, rules, active_managers=()):
+    """Classify persisted ufw-user-input ACCEPT rules before mutating UFW."""
+    if active_managers:
+        raise ValueError('Competing firewall manager is active')
+    conflicts, exceptions = [], []
+    protected = set(policy['internal_ports'])
+    if policy['node_port'] is not None:
+        protected.add(policy['node_port'])
+    for family, content in rules.items():
+        if family not in {4, 6}:
+            raise ValueError('Invalid firewall rule family')
+        for entry in _input_rules(content, family):
+            if entry['target'] != 'ACCEPT':
+                continue
+            located = {'family': entry['family'], 'line': entry['line']}
+            if entry['protocol'] != 'tcp':
+                exceptions.append(located)
+                continue
+            if not entry['supported']:
+                raise ValueError('Unsupported UFW allow rule; manual inspection required')
+            if entry['interface'] == 'lo':
+                continue
+            selected = protected if entry['ports'] is None else protected & entry['ports']
+            if not selected:
+                # The rules this policy writes are not somebody else's grant: a
+                # rerun that reported its own SSH and web allows as preserved
+                # exceptions would tell the operator about rules it just wrote.
+                public = set(policy['ssh_ports']) | {80, 443}
+                if entry['ports'] is not None and entry['ports'] <= public:
+                    continue
+                exceptions.append(located)
+                continue
+            source = entry['source']
+            allowed_master = (
+                policy['role'] == 'worker' and selected == {policy['node_port']}
+                and source is not None and source.num_addresses == 1
+                and str(source.network_address) in policy['master_sources']
+            )
+            if not allowed_master:
+                conflicts.append({**located, 'ports': sorted(selected)})
+    return {'conflicts': conflicts, 'preserved_exceptions': exceptions}
+
+
+def inspect_firewall_conflicts(policy, root=Path('/')):
+    managers = [name for name in ('firewalld.service', 'nftables.service')
+                if command('systemctl', 'is-active', name, check=False) == 'active']
+    rules = {}
+    for family, filename in ((4, 'user.rules'), (6, 'user6.rules')):
+        path = root / 'etc' / 'ufw' / filename
+        if path.is_symlink():
+            raise ValueError('Unsafe UFW rules file')
+        if path.exists():
+            rules[family] = path.read_text()
+        elif family == 4 or policy['ipv6']:
+            raise ValueError('Cannot inspect persisted UFW rules')
+    result = firewall_conflicts(policy, rules, managers)
+    if result['conflicts']:
+        raise ValueError('Existing UFW allow conflicts with managed listener isolation: ' + json.dumps(result['conflicts']))
+    return result
+
+
+def firewall_effective(policy, dumps, status_verbose='', declaration=''):
+    """Read the live firewall back against the policy that was applied.
+
+    A successful `ufw allow` says UFW accepted the command; it does not say the
+    kernel filters that port. This compares the ruleset the host is running,
+    including the second family on a dual-stack host, with the policy the
+    preflight approved.
+    """
+    if status_verbose.splitlines()[:1] != ['Status: active']:
+        raise ValueError('UFW did not enter the active state')
+    defaults = {}
+    for line in status_verbose.splitlines():
+        if not line.startswith('Default:'):
+            continue
+        for part in line[len('Default:'):].split(','):
+            words = part.split()
+            if len(words) >= 2:
+                defaults[words[1].strip('()')] = words[0]
+    if defaults.get('incoming') != 'deny' or defaults.get('outgoing') != 'allow':
+        raise ValueError('UFW defaults are not deny incoming and allow outgoing')
+    declared = re.search(r'^IPV6=(\w+)$', declaration, re.M)
+    if declared is not None and (declared.group(1) == 'yes') != policy['ipv6']:
+        raise ValueError('UFW IPv6 declaration does not follow the listener decision')
+    families = [4] + ([6] if policy['ipv6'] else [])
+    missing = []
+    for family in families:
+        if family not in dumps:
+            raise ValueError('IPv' + str(family) + ' ruleset was not read')
+        content = dumps[family]
+        chains = dict(re.findall(r'^:([A-Za-z0-9_-]+) (\S+) ', content, re.M))
+        if chains.get('INPUT') != 'DROP' or chains.get('OUTPUT') != 'ACCEPT':
+            missing.append({'family': family, 'rule': 'default policy'})
+        rules = [entry for entry in _input_rules(content, family) if entry['supported']]
+        for port in sorted(set(policy['ssh_ports']) | {80, 443}):
+            if not any(_public_allow(entry) and (entry['ports'] is None or port in entry['ports'])
+                       for entry in rules):
+                missing.append({'family': family, 'rule': 'allow ' + str(port)})
+        denied = set(policy['internal_ports'])
+        if policy['node_port'] is not None:
+            denied.add(policy['node_port'])
+        for port in sorted(denied):
+            if not any(entry['target'] in {'DROP', 'REJECT'} and entry['protocol'] == 'tcp'
+                       and (entry['ports'] is None or port in entry['ports']) for entry in rules):
+                missing.append({'family': family, 'rule': 'deny ' + str(port)})
+        if policy['role'] == 'worker':
+            for source in policy['master_sources']:
+                network = ipaddress.ip_network(source, strict=False)
+                if network.version != family:
+                    continue
+                if not any(entry['target'] == 'ACCEPT' and entry['source'] == network
+                           and (entry['ports'] is None or policy['node_port'] in entry['ports'])
+                           for entry in rules):
+                    missing.append({'family': family, 'rule': 'allow ' + source})
+    if missing:
+        raise ValueError('Firewall policy is not effective: ' + json.dumps(missing))
+    conflicts = firewall_conflicts(policy, {family: dumps[family] for family in families})
+    if conflicts['conflicts']:
+        raise ValueError('Live firewall still exposes protected ports: ' + json.dumps(conflicts['conflicts']))
+    return {'status': 'success', 'defaults': defaults,
+            'preserved_exceptions': conflicts['preserved_exceptions']}
 
 
 def password_warning(effective):
@@ -105,21 +375,49 @@ def global_servers(dns):
     return global_block[1].split() if global_block else []
 
 
-def preflight(root=Path('/'), files=FILES, services=SERVICES):
-    for filename in files:
-        path = root / filename.lstrip('/')
-        if path.is_symlink() or (path.exists() and (not path.is_file() or not path.read_text().startswith(MARKER))):
-            raise ValueError('Unowned project configuration path: ' + filename)
-        if path.exists() and (path.stat().st_uid != 0 or path.stat().st_mode & 0o022):
-            raise ValueError('Unsafe owner/permissions of project configuration: ' + filename)
-    for service in services:
-        if command('systemctl', 'is-enabled', service, check=False) not in ('enabled', 'disabled', 'static', 'not-found', ''):
-            raise ValueError('Custom/masked service enable state preserved: ' + service)
+def os_identity(root=Path('/')):
+    """The supported OS identifier, refused when the release is not in the gate."""
     info = dict(line.strip().split('=', 1) for line in (root / 'etc/os-release').read_text().splitlines() if '=' in line)
     os_id, version = (info.get(k, '').strip('"') for k in ('ID', 'VERSION_ID'))
     if (os_id, version) not in (('ubuntu', '24.04'), ('ubuntu', '26.04'), ('debian', '12'), ('debian', '13')):
         raise ValueError('Unsupported OS for VPS Security: ' + f'{os_id} {version}')
     return os_id
+
+
+def preflight(root=Path('/'), files=FILES, services=SERVICES):
+    for filename in files:
+        path = root / filename.lstrip('/')
+        if path.is_symlink() or (path.exists() and (not path.is_file() or not path.read_text().startswith(MARKER))):
+            raise ValueError('Unowned project configuration path: ' + filename)
+        if path.exists() and (path.stat().st_uid != PROJECT_OWNER_UID or path.stat().st_mode & 0o022):
+            raise ValueError('Unsafe owner/permissions of project configuration: ' + filename)
+    for service in services:
+        if command('systemctl', 'is-enabled', service, check=False) not in ('enabled', 'disabled', 'static', 'not-found', ''):
+            raise ValueError('Custom/masked service enable state preserved: ' + service)
+    return os_identity(root)
+
+
+def platform_owns_resolv(root=Path('/')):
+    """Whether `/etc/resolv.conf` is supplied by the platform, not this host's own file.
+
+    A container runtime bind-mounts the resolver file, so it is a path this
+    helper must not unlink: the kernel answers EBUSY, and the platform owns it.
+    The DoT policy is the systemd-resolved drop-in either way; the stub link is
+    only a convenience where the host owns the path. A symlink is never treated
+    as platform-owned — it is the form this helper (or the distro) writes, and
+    replacing it with the same target is harmless.
+    """
+    resolv = Path(root) / 'etc' / 'resolv.conf'
+    try:
+        if resolv.is_symlink() or not resolv.exists():
+            return False
+        if os.path.ismount(resolv):
+            return True
+        # A bind mount whose file comes from another filesystem differs in
+        # device from the directory holding it, even when ismount() is silent.
+        return resolv.stat().st_dev != resolv.parent.stat().st_dev
+    except OSError:
+        return False
 
 
 class Transaction:
@@ -128,7 +426,7 @@ class Transaction:
         self.temp = tempfile.TemporaryDirectory(prefix='gowave-security-')
         os.chmod(self.temp.name, 0o700)
         self.saved = {}
-        paths = (*files, '/etc/resolv.conf') if FILES[-1] in files else files
+        paths = (*files, '/etc/resolv.conf') if FILES[-1] in files and not platform_owns_resolv(root) else files
         for index, filename in enumerate(paths):
             path = root / filename.lstrip('/')
             backup = Path(self.temp.name) / str(index)
@@ -154,6 +452,11 @@ class Transaction:
             directory.chmod(0o755)
         path.write_text(text)
         path.chmod(0o644)
+
+    def remove(self, filename):
+        """Remove a managed file; the constructor already saved whatever it replaced."""
+        path = self.root / filename.lstrip('/')
+        path.unlink(missing_ok=True)
 
     def save_dns(self, directory):
         directory = Path(directory)
@@ -209,6 +512,10 @@ class Transaction:
 
     def rollback(self):
         for filename, backup in self.saved.items():
+            if filename == '/etc/resolv.conf' and platform_owns_resolv(self.root):
+                # The platform supplied the path; unlinking it is EBUSY and the
+                # platform's own file is already the correct restoration.
+                continue
             path = self.root / filename.lstrip('/')
             path.unlink(missing_ok=True)
             if backup is not None:
@@ -259,13 +566,22 @@ def verify_fail2ban(ports):
         raise ValueError('SSH jail ports not effective')
 
 
-def verify_apt(os_id, previous_origins):
+def verify_apt(os_id, previous_origins=None):
+    """Check effective unattended-upgrade policy.
+
+    `previous_origins` is the pre-install dump from `configure_apt`: only that
+    step can prove an administrator's origins survived, because only it saw
+    them before the managed policy was written. A report-time check passes
+    `None` and proves what a fresh host read can prove — the required origin
+    is effective and nothing disabled the schedule — without claiming a
+    preservation it did not witness.
+    """
     apt = command('apt-config', 'dump')
     if 'Unattended-Upgrade::Automatic-Reboot "false";' not in apt:
         raise ValueError('Automatic reboot false policy not effective')
     origins = apt_origins(apt)
     required = ('Origins-Pattern', re.search(r'Origins-Pattern \{ "([^"]+)"', apt_config(os_id))[1])
-    if required not in origins or not previous_origins <= origins:
+    if required not in origins or (previous_origins is not None and not previous_origins <= origins):
         raise ValueError('Required security origin missing or existing APT origins changed')
     for key in ('Enable', 'Update-Package-Lists', 'Unattended-Upgrade'):
         if 'APT::Periodic::' + key + ' "1";' not in apt:
@@ -278,11 +594,36 @@ def verify_apt(os_id, previous_origins):
             raise ValueError('APT timer not effective')
 
 
-def verify_dns():
+def verify_firewall(policy, root=Path('/')):
+    """Read the live ruleset back for a policy this host is supposed to run.
+
+    Shared by `--firewall-verify` and the report so a later readback cannot
+    drift from the one the install trusted.
+    """
+    dumps = {4: command('iptables-save')}
+    if policy['ipv6']:
+        dumps[6] = command('ip6tables-save')
+    status_verbose = command('ufw', 'status', 'verbose')
+    declaration_path = Path(root) / 'etc' / 'default' / 'ufw'
+    declaration = ''
+    if declaration_path.is_file() and not declaration_path.is_symlink():
+        declaration = declaration_path.read_text()
+    return firewall_effective(policy, dumps, status_verbose, declaration)
+
+
+def verify_dns(policy=None):
+    policy = dot_policy(policy)
+    if policy == 'off':
+        # Nothing of ours is written under this policy, so there is no mode to
+        # read back; only resolution itself is provable.
+        command('resolvectl', 'flush-caches')
+        command('resolvectl', 'query', '--cache=no', 'cloudflare.com')
+        command('getent', 'ahosts', 'debian.org')
+        return
     mode = command('busctl', 'get-property', 'org.freedesktop.resolve1',
                    '/org/freedesktop/resolve1', 'org.freedesktop.resolve1.Manager', 'DNSOverTLS')
-    if mode != 's "yes"':
-        raise ValueError('Effective global DNSOverTLS is not strict')
+    if mode != f's "{DOT_MODES[policy]}"':
+        raise ValueError('Effective global DNSOverTLS is not ' + policy)
     dns = command('resolvectl', 'dns')
     global_dns = global_servers(dns)
     if global_dns != ['1.1.1.1#one.one.one.one', '1.0.0.1#one.one.one.one', '8.8.8.8#dns.google', '8.8.4.4#dns.google']:
@@ -293,7 +634,8 @@ def verify_dns():
     command('getent', 'ahosts', 'debian.org')
 
 
-def prepare_dns(root=Path('/'), state=None):
+def prepare_dns(root=Path('/'), state=None, policy=None):
+    policy = dot_policy(policy)
     preflight(root, files=FILES[-1:], services=SERVICES[-1:])
     command('getent', 'ahosts', 'debian.org')
     txn = Transaction(root, services=('systemd-resolved.service',), files=FILES[-1:])
@@ -304,18 +646,32 @@ def prepare_dns(root=Path('/'), state=None):
         stage = 'installing systemd-resolved'
         command('apt-get', '-o', 'DPkg::Lock::Timeout=300', '-o', 'Dpkg::Options::=--force-confdef',
                 '-o', 'Dpkg::Options::=--force-confold', '--no-remove', '--no-install-recommends', '-y', 'install', 'systemd-resolved')
-        stage = 'writing DNS drop-in and stub link'
-        txn.write(FILES[4], DOT)
+        if policy == 'off':
+            # Disabling DoT removes a drop-in an earlier run wrote; it must not
+            # leave this install's resolver servers behind as hidden policy.
+            stage = 'removing the managed DNS drop-in'
+            txn.remove(FILES[4])
+        else:
+            stage = 'writing DNS drop-in and stub link'
+            txn.write(FILES[4], dot_content(policy))
         resolv = root / 'etc/resolv.conf'
-        resolv.unlink(missing_ok=True)
-        resolv.symlink_to('/run/systemd/resolve/stub-resolv.conf')
+        platform_resolver = platform_owns_resolv(root)
+        if not platform_resolver:
+            resolv.unlink(missing_ok=True)
+            resolv.symlink_to('/run/systemd/resolve/stub-resolv.conf')
         stage = 'starting systemd-resolved'
         command('systemctl', 'daemon-reload')
         command('systemctl', 'enable', 'systemd-resolved.service')
         command('systemctl', 'restart', 'systemd-resolved.service')
-        stage = 'strict DoT verification'
-        verify_dns()
-        return {'status': 'configured', 'dot': 'configured', 'warnings': [DOT_WARNING]}
+        stage = 'DNS-over-TLS verification'
+        verify_dns(policy)
+        warnings = [] if policy == 'off' else [DOT_WARNING]
+        if platform_resolver:
+            warnings.append('/etc/resolv.conf is owned by the platform (a mount point); '
+                            'the stub link was left as provided, and the resolved drop-in '
+                            'carries the DoT policy.')
+        return {'status': 'configured', 'dot': policy, 'policy': policy,
+                'recovery': 'not-needed', 'warnings': warnings}
     except Exception as error:
         status = 'failed_rolled_back'
         rollback_error = ''
@@ -325,7 +681,9 @@ def prepare_dns(root=Path('/'), state=None):
         except Exception as failure:
             status = 'failed_unverified'
             rollback_error = '; rollback error: ' + str(failure)
-        return {'status': status, 'dot': status, 'warnings': ['DNS preparation failed during ' + stage + ': ' + str(error) + '; rollback=' + status + rollback_error, 'Package installation is not rolled back; original DNS/service state was restored only if verified.']}
+        return {'status': status, 'dot': status, 'policy': policy,
+                'recovery': 'verified' if status == 'failed_rolled_back' else 'failed',
+                'warnings': ['DNS preparation failed during ' + stage + ': ' + str(error) + '; rollback=' + status + rollback_error, 'Package installation is not rolled back; original DNS/service state was restored only if verified.']}
     finally:
         txn.temp.cleanup()
 
@@ -335,9 +693,14 @@ def rollback_dns_checkpoint(state, root=Path('/')):
     try:
         resolv = root / 'etc/resolv.conf'
         policy = root / FILES[-1].lstrip('/')
+        # Any document this helper can have written is adoptable; an `off` run
+        # leaves no document at all, which is equally canonical.
+        managed = {dot_content(name) for name in DOT_MODES}
         if (not resolv.is_symlink() or os.readlink(resolv) != '/run/systemd/resolve/stub-resolv.conf'
-                or policy.is_symlink() or not policy.is_file() or policy.stat().st_uid != 0
-                or policy.stat().st_mode & 0o022 or policy.read_text() != DOT):
+                or policy.is_symlink()
+                or (policy.exists() and (not policy.is_file() or policy.stat().st_uid != 0
+                                         or policy.stat().st_mode & 0o022
+                                         or policy.read_text() not in managed))):
             raise ValueError('Prepared DNS no longer has canonical project ownership')
         txn = Transaction.load_dns(state, root)
         txn.rollback()
@@ -409,6 +772,11 @@ def configure_apt(root=Path('/')):
     origins = apt_origins(command('apt-config', 'dump'))
     txn = Transaction(root, files=FILES[1:4], services=SERVICES[1:3])
     try:
+        # A policy file without the package is a promise nothing keeps: the
+        # timers below only run unattended-upgrades when it is installed.
+        command('apt-get', '-o', 'DPkg::Lock::Timeout=300', '-o', 'Dpkg::Options::=--force-confdef',
+                '-o', 'Dpkg::Options::=--force-confold', '--no-remove', 'install', '-y',
+                '--no-install-recommends', 'unattended-upgrades')
         txn.write(FILES[1], apt_config(os_id))
         txn.write(FILES[2], timer('02:30'))
         txn.write(FILES[3], timer('02:50'))
@@ -431,6 +799,169 @@ def configure_apt(root=Path('/')):
         txn.temp.cleanup()
 
 
+REPORT_PATH = '/var/lib/gowave-auto-nginx/security-report.json'
+REPORT_ROLES = ('aio', 'panel-only', 'worker')
+REPORT_RECOVERY = ('not-needed', 'verified', 'failed', 'unknown')
+
+
+def report_time():
+    """A UTC timestamp with a timezone, which is what the report schema accepts."""
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def report_host_id(root=Path('/')):
+    """A stable host identity: the machine id, else the kernel node name."""
+    for candidate in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+        path = Path(root) / candidate.lstrip('/')
+        if path.is_file() and not path.is_symlink():
+            value = path.read_text(encoding='utf-8').strip()
+            if re.fullmatch(r'[0-9a-fA-F]{32}', value):
+                return value.lower()
+    name = os.uname().nodename
+    if not re.fullmatch(r'[a-zA-Z0-9._-]{1,253}', name):
+        raise ValueError('Host identity is not a safe report value')
+    return name
+
+
+def _control(policy, status, reason, recovery):
+    return {'policy': policy, 'status': status, 'reason_code': reason,
+            'recovery': recovery, 'evidence_codes': [reason]}
+
+
+def security_report(request, root=Path('/')):
+    """Build a per-host report from effective state, one control at a time.
+
+    Every control is read back here rather than copied from the step that
+    configured it: a report is a claim about this moment, and the timestamp is
+    what makes a later rerun issue fresh evidence instead of reciting stale
+    success. A control that cannot be read back is `failed` even if its
+    configuration step once reported success, and it keeps the recovery outcome
+    this run observed — `unknown` when the run proved none, which blocks
+    readiness instead of being rounded to a pass.
+
+    Returns the report and the safe human warnings, in that order.
+    """
+    root = Path(root)
+    if not isinstance(request, dict):
+        raise ValueError('Invalid security report request')
+    role = request.get('role')
+    if role not in REPORT_ROLES:
+        raise ValueError('Unsupported host role for a security report: ' + str(role))
+    policy = dot_policy(request.get('dot_policy'))
+    recovery = request.get('dot_recovery', 'unknown')
+    if recovery not in REPORT_RECOVERY:
+        raise ValueError('Unsupported DNS recovery outcome: ' + str(recovery))
+    node_port = request.get('node_port')
+    if node_port is not None and (type(node_port) is not int or not 1 <= node_port <= 65535):
+        raise ValueError('Invalid Node API port for a security report')
+    sources = request.get('master_sources') or []
+    if not isinstance(sources, list) or not all(isinstance(value, str) for value in sources):
+        raise ValueError('Invalid Master source list for a security report')
+    ipv6 = request.get('ipv6', False)
+    if type(ipv6) is not bool:
+        raise ValueError('Invalid IPv6 decision for a security report')
+    os_id = os_identity(root)
+
+    controls = {}
+    warnings = []
+    checks = (
+        ('firewall', 'FW_APPLIED', 'FW_NOT_EFFECTIVE',
+         lambda: verify_firewall(firewall_policy(role=role, ports=inspect_ssh_ports(),
+                                                 # A Panel-only policy carries no Node
+                                                 # exception; the role decides that, not
+                                                 # the port, which stays valid input.
+                                                 node_port=3002 if node_port is None else node_port,
+                                                 master_sources=sources,
+                                                 ipv6=ipv6), root)),
+        ('ssh_protection', 'JAIL_ACTIVE', 'JAIL_NOT_EFFECTIVE',
+         lambda: verify_fail2ban(inspect_ssh_ports())),
+        ('security_updates', 'APT_EFFECTIVE', 'APT_NOT_EFFECTIVE',
+         lambda: verify_apt(os_id)),
+    )
+    for name, applied, failure, check in checks:
+        try:
+            check()
+        except Exception as error:
+            controls[name] = _control('required', 'failed', failure, 'unknown')
+            warnings.append(name + ': ' + str(error))
+        else:
+            controls[name] = _control('required', 'verified', applied, 'not-needed')
+
+    try:
+        verify_dns(policy)
+    except Exception as error:
+        controls['dot'] = _control(policy, 'failed', 'DOT_NOT_EFFECTIVE', recovery)
+        warnings.append('dot: ' + str(error))
+    else:
+        if policy == 'off':
+            controls['dot'] = _control('off', 'skipped', 'DOT_DISABLED', 'not-needed')
+        else:
+            controls['dot'] = _control(policy, 'verified', 'DOT_APPLIED', 'not-needed')
+
+    revision = (os.environ.get('GOWAVE_INSTALLER_REVISION') or '').strip()
+    if not re.fullmatch(r'[a-zA-Z0-9._-]{1,64}', revision):
+        revision = 'local'
+    report = {'schema_version': 1, 'host_id': report_host_id(root), 'role': role,
+              'installer_revision': revision,
+              'observed_at': report_time(), 'controls': controls}
+    return report, warnings
+
+
+def report_readiness(report):
+    """The same reduction `modules/security_report.py` applies on the Panel.
+
+    It is duplicated here because this helper is streamed to a Worker without
+    the project tree; `tests/test_security_report.py` compares the two verdicts
+    so the copies cannot drift.
+    """
+    warning = False
+    for control in report['controls'].values():
+        if control['policy'] == 'required' and control['status'] != 'verified':
+            return 'failed'
+        if control['recovery'] in ('failed', 'unknown'):
+            return 'failed'
+        if control['policy'] == 'best-effort' and control['status'] != 'verified':
+            if control['status'] == 'failed' and control['recovery'] != 'verified':
+                return 'failed'
+            warning = True
+    return 'ready-with-warnings' if warning else 'ready'
+
+
+def write_security_report(report, path=None, root=Path('/')):
+    """Write the report atomically, 0600, inside a directory this install owns.
+
+    An existing shared parent keeps its mode when it is root-owned and not
+    group/world-writable; a directory this call creates is 0700. Either way the
+    file appears by rename, so a reader never sees a half-written report.
+    """
+    target = Path(path) if path is not None else Path(root) / REPORT_PATH.lstrip('/')
+    directory = target.parent
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if directory.is_symlink() or info.st_uid != PROJECT_OWNER_UID or info.st_mode & 0o022:
+        raise ValueError('Unsafe security report directory: ' + str(directory))
+    payload = json.dumps(report, sort_keys=True).encode() + b'\n'
+    temporary = directory / ('.' + target.name + '.' + secrets.token_hex(8) + '.tmp')
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        handle = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return target
+
+
 if __name__ == '__main__':
     result = {'status': 'unknown'}
     try:
@@ -440,17 +971,48 @@ if __name__ == '__main__':
         elif sys.argv[1:] == ['--ssh-ports']:
             ports = inspect_ssh_ports()
             result = {'status': 'success', 'ports': ports}
+        elif sys.argv[1:2] == ['--firewall-preflight'] and len(sys.argv) in (2, 3):
+            policy = json.load(sys.stdin)
+            root = Path(sys.argv[2]) if len(sys.argv) == 3 else Path('/')
+            result = {'status': 'success', **inspect_firewall_conflicts(policy, root)}
+        elif sys.argv[1:2] == ['--firewall-verify'] and len(sys.argv) in (2, 3):
+            policy = json.load(sys.stdin)
+            root = Path(sys.argv[2]) if len(sys.argv) == 3 else Path('/')
+            result = verify_firewall(policy, root)
+        elif sys.argv[1:] == ['--firewall-policy']:
+            request = json.load(sys.stdin)
+            if not isinstance(request, dict) or set(request) != {'role', 'node_port', 'master_sources', 'ipv6'}:
+                raise ValueError('Invalid firewall policy request')
+            result = {'status': 'success', 'policy': firewall_policy(ports=inspect_ssh_ports(), **request)}
         elif sys.argv[1:] == ['--configure-fail2ban']:
             result = configure_fail2ban()
         elif sys.argv[1:] == ['--configure-apt']:
             result = configure_apt()
         elif len(sys.argv) in (2, 3) and sys.argv[1] == '--prepare-dns':
-            result = prepare_dns(state=Path(sys.argv[2]) if len(sys.argv) == 3 else None)
+            result = prepare_dns(state=Path(sys.argv[2]) if len(sys.argv) == 3 else None, policy=dot_policy())
         elif len(sys.argv) == 3 and sys.argv[1] == '--rollback-dns':
             result = rollback_dns_checkpoint(Path(sys.argv[2]))
+        elif sys.argv[1:2] == ['--worker-security-readback'] and len(sys.argv) == 6:
+            port, ipv4, ipv6, policy = sys.argv[2:]
+            with open('/proc/net/if_inet6', encoding='ascii') as interfaces:
+                has_ipv6 = bool(interfaces.read().strip())
+            report, _ = security_report({
+                'role': 'worker', 'node_port': int(port), 'dot_policy': policy,
+                'master_sources': [value for value in (ipv4, ipv6) if value],
+                'ipv6': has_ipv6,
+            })
+            print(json.dumps(report))
+            sys.exit(0)
+        elif sys.argv[1:] == ['--security-report']:
+            report, warnings = security_report(json.load(sys.stdin))
+            readiness = report_readiness(report)
+            path = write_security_report(report)
+            result = {'status': readiness, 'readiness': readiness, 'report': str(path),
+                      'controls': {name: control['status'] for name, control in report['controls'].items()},
+                      'warnings': warnings}
         else:
             raise ValueError(f'Unknown arguments: {sys.argv[1:]}')
     except Exception as error:
         result = {'status': 'failed', 'error': str(error)}
     print(json.dumps(result))
-    sys.exit(0 if result.get('status') in ('configured', 'compatible', 'success') else 1)
+    sys.exit(0 if result.get('status') in ('configured', 'compatible', 'success', 'ready', 'ready-with-warnings') else 1)

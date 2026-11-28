@@ -29,6 +29,9 @@ from modules.api_client import (
     mihomo_x25519_enabled,
     parse_core_version,
     reality_fingerprint,
+    read_admin_credentials,
+    reapply_node_identity,
+    resume_live_inventory,
     _extract_list,
     PROFILE_LABELS,
     country_flag,
@@ -1581,6 +1584,28 @@ class TestHostReconciliation(unittest.TestCase):
             known_host_uuids=known, country=country,
         )
 
+    def test_resume_associations_require_exact_profile_node_and_inbound_coverage(self):
+        client = GoWaveClient(self.base_url)
+        node = {
+            "uuid": "node-ams",
+            "configProfile": {"activeConfigProfileUuid": "profile-ams",
+                              "activeInbounds": [{"uuid": "inb-reality"}]},
+        }
+        host = self.legacy_reality_host()
+        client.list_nodes = lambda: [node]
+        def read_hosts(method, endpoint):
+            self.assertEqual((method, endpoint), ("GET", "/api/hosts"))
+            return {"response": {"hosts": [host]}}
+        client.request = read_hosts
+        self.assertTrue(client.verify_node_associations("node-ams", "profile-ams", ["host-legacy"]))
+        self.assertFalse(client.verify_node_associations("node-ams", "other", ["host-legacy"]))
+        self.assertFalse(client.verify_node_associations("node-ams", "profile-ams", ["missing"]))
+        host["nodes"] = ["node-ams", "node-other"]
+        self.assertFalse(client.verify_node_associations("node-ams", "profile-ams", ["host-legacy"]))
+        host["nodes"] = ["node-ams"]
+        node["configProfile"]["activeInbounds"].append({"uuid": "inb-ws"})
+        self.assertFalse(client.verify_node_associations("node-ams", "profile-ams", ["host-legacy"]))
+
     def legacy_reality_host(self, uuid="host-legacy", remark="VLESS-REALITY@ams-01", node="node-ams"):
         record = {
             "uuid": uuid,
@@ -1665,6 +1690,116 @@ class TestHostReconciliation(unittest.TestCase):
         self.assertEqual(set(MockGoWaveServer.hosts), {"host-a", "host-b"})
         for uuid, record in snapshot.items():
             self.assertEqual(MockGoWaveServer.hosts[uuid]["remark"], record["remark"])
+
+    # -- Resume reconciliation -----------------------------------------------
+    #
+    # A resume compares the recorded identity with what the Panel answers. The
+    # inventory is the live half of that comparison, and the re-apply is the
+    # repair it names for drift. Both write through recorded UUIDs only.
+
+    def resume_temporary(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name)
+
+    def resume_credentials(self):
+        path = self.resume_temporary() / "credentials.txt"
+        path.write_text("ADMIN_USERNAME=admin\nADMIN_PASSWORD=securepass1234567890\n", encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_resume_inventory_reads_nodes_hosts_and_the_panel_state_schema(self):
+        MockGoWaveServer.nodes = {}
+        MockGoWaveServer.profiles = {}
+        MockGoWaveServer.squads = {}
+        MockGoWaveServer.profiles["profile-ams"] = {
+            "name": "GoWave Worker ams-01 Profile",
+            "config": json.dumps({"inbounds": [{"tag": "vless-reality-ams-01"}]}),
+        }
+        MockGoWaveServer.nodes["node-ams"] = {
+            "name": "ams-01", "address": "203.0.113.7", "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-ams",
+                "activeInbounds": [{"uuid": "inb-profile-ams-1"}],
+            },
+        }
+        self.legacy_reality_host(uuid="host-ams")
+        state_path = self.resume_temporary() / "state.json"
+        state_path.write_text(json.dumps({"schemaVersion": 2}), encoding="utf-8")
+
+        inventory = resume_live_inventory(
+            self.resume_credentials(), state_path=state_path,
+            base_url=self.base_url, profile_uuids=["profile-ams"],
+        )
+
+        self.assertTrue(inventory["reachable"])
+        self.assertEqual(inventory["schema_version"], 2)
+        self.assertEqual([node["uuid"] for node in inventory["nodes"]], ["node-ams"])
+        self.assertEqual([host["uuid"] for host in inventory["hosts"]], ["host-ams"])
+        self.assertEqual(inventory["profiles"],
+                         [{"uuid": "profile-ams", "inbounds": ["inb-profile-ams-1"]}])
+
+    def test_a_state_file_that_is_not_the_installers_is_refused(self):
+        link = self.resume_temporary() / "state.json"
+        link.symlink_to("/etc/passwd")
+        with self.assertRaises(api_client.GoWaveAPIError):
+            resume_live_inventory(
+                self.resume_credentials(), state_path=link, base_url=self.base_url)
+
+    def test_reapplying_a_drifted_node_never_creates_a_second_node(self):
+        MockGoWaveServer.nodes = {}
+        MockGoWaveServer.profiles = {}
+        MockGoWaveServer.squads = {"squad-ams": {"name": "Default MVP Squad"}}
+        MockGoWaveServer.profiles["profile-ams"] = {
+            "name": "GoWave Worker ams-01 Profile",
+            "config": json.dumps({"inbounds": [{"tag": "vless-reality-ams-01"}]}),
+        }
+        # The Panel holds the recorded node, but it points at another profile:
+        # that is exactly the drift the resume re-applies.
+        MockGoWaveServer.nodes["node-ams"] = {
+            "name": "ams-01", "address": "203.0.113.7", "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-other",
+                "activeInbounds": [{"uuid": "inb-other"}],
+            },
+        }
+        host = self.legacy_reality_host(uuid="host-ams")
+        host["inbound"]["configProfileInboundUuid"] = "inb-profile-ams-1"
+        host["address"] = "stale.example.com"
+        state_path = self.resume_temporary() / "state.json"
+        state_path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "panelDomain": "panel.example.com",
+            "realityDomain": "cdn.example.com",
+            "squadUuid": "squad-ams",
+            "nodes": [{
+                "name": "ams-01", "address": "203.0.113.7", "port": 3002,
+                "workerDomain": "ams.example.com", "realityDomain": "cdn.example.com",
+                "uuid": "node-ams", "profileUuid": "profile-ams",
+                "hostUuids": ["host-ams"],
+            }],
+        }), encoding="utf-8")
+        journal = self.resume_temporary() / "journal.json"
+
+        result = reapply_node_identity(
+            self.resume_credentials(), state_path, "node-ams",
+            journal_path=journal, base_url=self.base_url,
+        )
+
+        self.assertEqual(len(MockGoWaveServer.nodes), 1,
+                         "the re-apply registered a second node instead of updating the recorded one")
+        self.assertIn("node-ams", MockGoWaveServer.nodes)
+        self.assertEqual(
+            MockGoWaveServer.nodes["node-ams"]["configProfile"]["activeConfigProfileUuid"],
+            "profile-ams")
+        active = MockGoWaveServer.nodes["node-ams"]["configProfile"]["activeInbounds"]
+        self.assertEqual(
+            [item["uuid"] if isinstance(item, dict) else item for item in active],
+            ["inb-profile-ams-1"])
+        self.assertEqual(len(MockGoWaveServer.hosts), 1,
+                         "the re-apply created a second Host record")
+        self.assertEqual(result["host_uuids"], ["host-ams"])
+        self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["state"], "PROVISION_COMMITTED")
 
     def test_a_recorded_uuid_settles_an_otherwise_ambiguous_ownership(self):
         self.legacy_reality_host(uuid="host-a", remark="VLESS-REALITY-Vision@ams-01")

@@ -80,13 +80,19 @@ class FakeSession:
 class FakeBackend(ingress.Backend):
     """Stands in for `podman exec`, recording what would have been run."""
 
-    def __init__(self, summaries=None, identity_error="", capture_errors=None):
+    def __init__(self, summaries=None, identity_error="", capture_errors=None,
+                 edge_lines=None):
         self.summaries = summaries or {}
         self.identity_error = identity_error
         self.capture_errors = capture_errors or {}
+        # `edge_lines` is the stream router's log: when it is a mapping of
+        # container -> appended text, the witness reads the log instead of
+        # capturing packets, which is the production path.
+        self.edge_lines = edge_lines
         self.sessions = []
         self.runs = []
         self.deadlines = []
+        self.tails = []
 
     def spawn_probe(self, container, argv, timeout=ingress.SUMMARY_TIMEOUT_SECONDS):
         self.deadlines.append(float(timeout))
@@ -96,6 +102,16 @@ class FakeBackend(ingress.Backend):
 
     def run(self, container, argv, timeout=60):
         self.runs.append((container, list(argv)))
+        argv = list(argv)
+        if argv[:2] == ["test", "-f"]:
+            present = self.edge_lines is not None
+            return subprocess.CompletedProcess(argv, 0 if present else 1, "", "")
+        if argv[:2] == ["wc", "-l"]:
+            return subprocess.CompletedProcess(argv, 0, "0 " + argv[2] + "\n", "")
+        if argv[:2] == ["tail", "-n"]:
+            self.tails.append((container, argv))
+            text = (self.edge_lines or {}).get(container, "")
+            return subprocess.CompletedProcess(argv, 0, text, "")
         if self.identity_error:
             payload = {"error": self.identity_error, "detail": "the client could not connect"}
         else:
@@ -280,7 +296,7 @@ class TestMeasure(unittest.TestCase):
                                       engine="client-container", port=443, intended="master")
         self.assertEqual(measurement.client, CLIENT)
         self.assertEqual(measurement.addresses, {"master": CLIENT})
-        peer_runs = [argv for _container, argv in backend.runs]
+        peer_runs = [argv for _container, argv in backend.runs if "--scope" in argv]
         self.assertTrue(peer_runs)
         for argv in peer_runs:
             self.assertIn("--scope", argv)
@@ -423,6 +439,49 @@ class TestEvidenceAndRequire(unittest.TestCase):
     def test_incomplete_raises_the_case_incomplete_state(self):
         with self.assertRaises(CaseIncomplete):
             ingress.require("PKT-02", {"verdict": ingress.INCOMPLETE, "reason": "no identity"})
+
+
+class TestEdgeLogWitness(unittest.TestCase):
+    """The production witness: the stream router's own access log.
+
+    A raw packet capture observes nothing in an unprivileged namespace, while
+    the log line is what an operator reads after a real deployment. The line
+    carries the SNI, so the verdict is about the routing decision rather than
+    about an address that differs between the control and data networks.
+    """
+
+    SNI = "reality.testbed.internal"
+
+    def verdict(self, lines):
+        backend = FakeBackend(edge_lines=lines)
+        measurement = ingress.measure(
+            lambda: {"sni": self.SNI, "status": 200, "delivered": True},
+            backend=backend, hosts=fake_hosts("master", "worker"),
+            engine="client-container", port=443, intended="master",
+        )
+        return ingress.evaluate(measurement), backend
+
+    def test_a_logged_connection_on_the_intended_host_passes(self):
+        result, backend = self.verdict({"master-container": f"{self.SNI} TLSv1.3 203.0.114.11 443\n"})
+        self.assertEqual(result["verdict"], ingress.PASS, result["reason"])
+        self.assertEqual(result["intended_matched"], 1)
+        captures = [s for s in backend.sessions if "packets" in s.argv]
+        self.assertFalse(captures, "the packet probe must not run when the log exists")
+        self.assertTrue(any(argv[:2] == ["test", "-f"] for _c, argv in backend.runs))
+
+    def test_a_connection_logged_on_the_other_host_fails(self):
+        result, _backend = self.verdict({"worker-container": f"{self.SNI} TLSv1.3 203.0.114.11 443\n"})
+        self.assertEqual(result["verdict"], ingress.FAIL, result["reason"])
+        self.assertEqual(result["other_matched"], 1)
+
+    def test_an_empty_edge_log_is_incomplete_and_says_so(self):
+        result, _backend = self.verdict({})
+        self.assertEqual(result["verdict"], ingress.INCOMPLETE, result["reason"])
+        self.assertIn("edge log holds no line", result["reason"])
+
+    def test_a_line_for_another_name_does_not_count(self):
+        result, _backend = self.verdict({"master-container": "other.testbed.internal TLSv1.3 203.0.114.11 443\n"})
+        self.assertEqual(result["verdict"], ingress.INCOMPLETE, result["reason"])
 
 
 if __name__ == "__main__":

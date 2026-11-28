@@ -16,10 +16,12 @@ COVER_SOFT="${GOWAVE_COVER_SOFT:-#e7f3ee}"
 COVER_HEADLINE="${GOWAVE_COVER_HEADLINE:-Plan the work, keep the context, move on.}"
 COVER_LEDE="${GOWAVE_COVER_LEDE:-Projects, notes and next steps in one calm place, with just enough structure to keep everyone oriented.}"
 
-# The cover site is served on the registrable apex of the deployment domain, so
-# a browser that reaches for the bare domain lands on a plausible static site
-# instead of a certificate error. Only domains with a subdomain part qualify:
-# for a two-label deployment domain the apex *is* the public entry point.
+# Legacy read-only candidate: the registrable apex of a transport domain, as the
+# installer used to guess it. Nothing decides a cover site from this any more --
+# the last-two-label rule names whatever zone a transport happens to sit in, so
+# a panel hosted in a zone it does not own asked for a certificate it could never
+# pass. It stays for migration readback, which shows the old value as evidence
+# and waits for confirmation instead of adopting it.
 derive_cover_domain() {
     local panel_domain="${1:-}"
     local labels
@@ -52,51 +54,106 @@ cover_brand_from_domain() {
     printf '%s\n' "${out% }"
 }
 
-# ACME validates the cover domains over port 80 on this host, so they are only
-# usable when both records already resolve to its public IPv4 address. Each name
-# that does not is printed, one per line, so the refusal can point at the record
-# an operator has to fix instead of blaming the pair.
+# The www alias of the cover apex is a name of its own, not an assumption: a
+# record that points at another host would make HTTP-01 answer somewhere else.
+# GOWAVE_COVER_WWW carries the operator's choice, and an unreadable value is
+# refused instead of defaulting to a name nobody selected.
+cover_alias_enabled() {
+    case "${GOWAVE_COVER_WWW:-no}" in
+        y|Y|yes|YES|true|1) printf 'yes\n' ;;
+        ''|n|N|no|NO|false|0) printf 'no\n' ;;
+        *)
+            echo "Error: GOWAVE_COVER_WWW must be yes or no, not '${GOWAVE_COVER_WWW}'." >&2
+            return 1
+            ;;
+    esac
+}
+
+# Every name the cover site answers to. Certificates, port 80, the stream map
+# and the decoy vhost all read this list, so a selected alias cannot reach one
+# of them and miss another.
+cover_site_names() {
+    local cover_domain="${1:-}"
+    local alias
+    [[ -n "$cover_domain" ]] || return 0
+    alias=$(cover_alias_enabled) || return 1
+    printf '%s\n' "$cover_domain"
+    if [[ "$alias" == "yes" ]]; then
+        printf 'www.%s\n' "$cover_domain"
+    fi
+}
+
+# ACME validates the cover names over port 80 on this host, so each one is only
+# usable when its own record resolves here. A host that advertises IPv6 passes
+# its address too: an AAAA that points elsewhere sends that client's challenge
+# to another machine, and a name published only over IPv4 while the host has an
+# AAAA of its own is the same hole from the other side. Each name that does not
+# match is printed, one per line, so the refusal can point at the record an
+# operator has to fix instead of blaming the pair.
 cover_domains_not_resolving() {
     local cover_domain="${1:-}"
     local server_ip="${2:-}"
-    local name resolved
+    local server_ipv6="${3:-}"
+    local name names resolved resolved6
     [[ -n "$cover_domain" ]] || return 0
-    for name in "$cover_domain" "www.$cover_domain"; do
+    names=$(cover_site_names "$cover_domain") || return 1
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
         resolved=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
         if [[ -z "$server_ip" || "$resolved" != "$server_ip" ]]; then
             printf '%s\n' "$name"
+            continue
         fi
-    done
+        if [[ -n "$server_ipv6" ]]; then
+            resolved6=$(getent ahostsv6 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
+            if [[ -z "$resolved6" || "$resolved6" != "$server_ipv6" ]]; then
+                printf '%s\n' "$name"
+            fi
+        fi
+    done <<< "$names"
 }
 
 cover_domains_resolve_here() {
     local cover_domain="${1:-}"
     local server_ip="${2:-}"
+    local server_ipv6="${3:-}"
     [[ -n "$cover_domain" && -n "$server_ip" ]] || return 1
-    [[ -z "$(cover_domains_not_resolving "$cover_domain" "$server_ip")" ]]
+    [[ -z "$(cover_domains_not_resolving "$cover_domain" "$server_ip" "$server_ipv6")" ]]
 }
 
 # The single cover-site decision: the apex to use on stdout, nothing when the
-# decoy stays off, and a reason on stderr either way. A deployment domain
-# without a subdomain has no registrable apex to camouflage, so saying so is
-# the refusal -- an empty render would leave the operator guessing.
+# operator selected none, and a reason on stderr either way. The apex is an
+# owned name from GOWAVE_COVER_DOMAIN -- the documented non-interactive input,
+# which the wizard sets from the reviewed plan. There is no suffix fallback: a
+# deployment that names no cover apex serves no cover site rather than asking
+# for a certificate for a zone it may not own.
 cover_domain_for() {
     local panel_domain="${1:-}"
     local server_ip="${2:-}"
-    local cover_domain unresolved
-    cover_domain=$(derive_cover_domain "$panel_domain")
+    local server_ipv6="${3:-}"
+    local cover_domain="${GOWAVE_COVER_DOMAIN:-}"
+    local panel_name unresolved
     if [[ -z "$cover_domain" ]]; then
-        if [[ -n "$panel_domain" ]]; then
-            echo "Camouflage apex disabled — $panel_domain has no subdomain, so no cover apex exists." >&2
-        fi
         return 0
     fi
-    unresolved=$(cover_domains_not_resolving "$cover_domain" "$server_ip")
+    cover_domain="${cover_domain,,}"
+    cover_domain="${cover_domain%.}"
+    if [[ ! "$cover_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+        echo "Error: GOWAVE_COVER_DOMAIN '$cover_domain' is not a fully qualified domain name." >&2
+        return 1
+    fi
+    panel_name="${panel_domain,,}"
+    panel_name="${panel_name%.}"
+    if [[ -n "$panel_name" && "$cover_domain" == "$panel_name" ]]; then
+        echo "Error: the cover apex and the Panel domain are the same name; the Panel keeps its own route." >&2
+        return 1
+    fi
+    unresolved=$(cover_domains_not_resolving "$cover_domain" "$server_ip" "$server_ipv6") || return 1
     if [[ -n "$unresolved" ]]; then
         if [[ "$unresolved" == *$'\n'* ]]; then
-            echo "Camouflage apex disabled — ${unresolved//$'\n'/ / } do not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+            echo "Camouflage apex disabled — ${unresolved//$'\n'/ } do not resolve to ${server_ip:-this host}${server_ipv6:+ ($server_ipv6)}, so HTTP-01 would fail." >&2
         else
-            echo "Camouflage apex disabled — $unresolved does not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+            echo "Camouflage apex disabled — $unresolved does not resolve to ${server_ip:-this host}${server_ipv6:+ ($server_ipv6)}, so HTTP-01 would fail." >&2
         fi
         return 0
     fi
@@ -221,15 +278,24 @@ generate_stream_config() {
 
     # The camouflage apex terminates on the decoy listener directly: no reason
     # to expose an Xray fingerprint on a name that is meant to look like a
-    # plain static website.
-    local cover_entry=""
+    # plain static website. The alias is selected, not assumed, so the map
+    # carries exactly the names the certificate was issued for.
+    local cover_entry="" cover_name
     if [[ -n "$cover_domain" ]]; then
-        cover_entry="    $cover_domain 127.0.0.1:9443;
-    www.$cover_domain 127.0.0.1:9443;"
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            cover_entry+="    $cover_name 127.0.0.1:9443;"$'\n'
+        done < <(cover_site_names "$cover_domain")
     fi
 
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Port 443 Stream SNI Router
+# The edge log is the operator's own view of this layer: one line per
+# connection, naming the SNI the client sent and where it came from. The Panel
+# and the transport locations below keep their logging off, so this file names
+# edge connections rather than every proxied request.
+log_format gowave_edge '\$ssl_preread_server_name \$ssl_preread_protocol \$remote_addr \$server_port \$time_iso8601';
+access_log /var/log/nginx/gowave-edge-access.log gowave_edge;
 map \$ssl_preread_server_name \$sni_backend {
     $panel_domain 127.0.0.1:7443;
 $reality_entry
@@ -275,7 +341,11 @@ generate_bootstrap_acme_vhost() {
         server_names="$server_names $vision_domain"
     fi
     if [[ -n "$cover_domain" ]]; then
-        server_names="$server_names $cover_domain www.$cover_domain"
+        local cover_name
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            server_names="$server_names $cover_name"
+        done < <(cover_site_names "$cover_domain")
     fi
 
     cat > "$out_file" <<EOF
@@ -322,9 +392,16 @@ generate_production_http_vhost() {
         redirect_regex="${redirect_regex}|${vision_domain}"
     fi
     if [[ -n "$cover_domain" ]]; then
-        local cover_regex="${cover_domain//./\\.}"
-        server_names="$server_names $cover_domain www.$cover_domain"
-        redirect_regex="${redirect_regex}|${cover_regex}|www\\.${cover_regex}"
+        # The redirect must name the same set the certificate covers: an alias
+        # that was not selected falls through to the 444 refusal instead of
+        # pointing a browser at a name this host has no certificate for.
+        local cover_name cover_regex
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            cover_regex="${cover_name//./\\.}"
+            server_names="$server_names $cover_name"
+            redirect_regex="${redirect_regex}|${cover_regex}"
+        done < <(cover_site_names "$cover_domain")
     fi
 
     cat > "$out_file" <<EOF
@@ -542,18 +619,16 @@ ${client_ip_clears}
 
     # Inbound: VLESS XHTTP TLS
     location ^~ /xhttp-down/ {
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_request_buffering off;
+        grpc_pass grpc://127.0.0.1:10001;
         client_max_body_size 0;
         client_body_timeout 1h;
-        proxy_read_timeout 1h;
-        proxy_send_timeout 1h;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
-${client_ip_clears}
+        grpc_read_timeout 1h;
+        grpc_send_timeout 1h;
+        grpc_set_header Connection "";
+        grpc_set_header Host \$host;
+        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears//proxy_set_header/grpc_set_header}
         access_log off;
     }
 
@@ -600,9 +675,12 @@ generate_decoy_vhost() {
         # rendered: an unsubstituted template is an obvious tell.
         render_cover_site "$cover_root" "${cover_domain:-$reality_domain}" || return 1
     fi
-    local cover_names=""
+    local cover_names="" cover_name
     if [[ -n "$cover_domain" ]]; then
-        cover_names=" $cover_domain www.$cover_domain"
+        while IFS= read -r cover_name; do
+            [[ -n "$cover_name" ]] || continue
+            cover_names="$cover_names $cover_name"
+        done < <(cover_site_names "$cover_domain")
     fi
     local listen_directive
     listen_directive=$(render_nginx_listen_ssl_http2 "127.0.0.1:9443" "proxy_protocol" "$nginx_bin")
@@ -1115,6 +1193,20 @@ run_certbot() {
     certbot "$@"
 }
 
+# verify_renewal_dry_run LINEAGE [CERTBOT_ARGS...]
+# The issuance that just succeeded says nothing about renewal: the port-80
+# webroot vhost, the authenticator recorded in `renewal/<lineage>.conf` and the
+# deploy hook all take part only when a renewal runs. A dry run revalidates one
+# named lineage through that recorded path while NGINX serves, and it stores no
+# certificate, so it changes nothing a host already has — including lineages
+# this product does not own.
+verify_renewal_dry_run() {
+    local lineage="${1:?a lineage name is required}"
+    shift
+    echo "Verifying renewal of the $lineage lineage with a dry run..."
+    run_certbot renew --dry-run --cert-name "$lineage" --non-interactive "$@"
+}
+
 validate_acme_server() {
     local server="${1:-}"
     if [[ -z "$server" ]]; then
@@ -1342,6 +1434,96 @@ state["certificateLineages"] = lineages
 atomic_write_state(state, state_path)
 PY
     echo "Recorded the selected certificate lineages in $state_file."
+}
+
+# record_domain_ownership STATE_FILE ROLE PANEL_NAME REALITY_NAME VISION_NAME COVER_NAME COVER_WWW
+#
+# Records which owned name serves which role and which certificate carries it,
+# so a migration or resume reads the selection instead of re-deriving an apex
+# from a transport name. Nothing here is a secret: names and the alias choice
+# are exactly what the operator already sees on the review screen.
+record_domain_ownership() {
+    local state_file="$1"
+    local role="$2"
+    local panel_name="$3"
+    local reality_name="$4"
+    local vision_name="${5:-}"
+    local cover_name="${6:-}"
+    local cover_www="${7:-no}"
+
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "$state_file" "$role" "$panel_name" "$reality_name" "$vision_name" \
+        "$cover_name" "$cover_www" <<'PY'
+import json
+import os
+import sys
+
+from modules.api_client import atomic_write_state
+
+(state_path, role, panel_name, reality_name,
+ vision_name, cover_name, cover_www) = sys.argv[1:8]
+state = {}
+if os.path.exists(state_path):
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+if not isinstance(state, dict):
+    raise SystemExit("state.json is not an object; refusing to record domain ownership.")
+if role not in {"master", "worker"}:
+    raise SystemExit("domain ownership records a master or a worker role.")
+cover_alias = "www." + cover_name if cover_name and cover_www == "yes" else ""
+names = {"panel": panel_name, "reality": reality_name}
+if vision_name:
+    names["vision"] = vision_name
+if cover_name:
+    names["cover"] = cover_name
+if cover_alias:
+    names["coverAlias"] = cover_alias
+sans = {"panel": [panel_name], "reality": [reality_name]}
+if cover_name:
+    sans["reality"] += [name for name in (cover_name, cover_alias) if name]
+if vision_name:
+    sans["vision"] = [vision_name]
+state["domainOwnership"] = {"role": role, "names": names, "sans": sans}
+atomic_write_state(state, state_path)
+PY
+    echo "Recorded domain ownership for $role in $state_file."
+}
+
+# The domain names this host recorded when it was installed, one TAB-separated
+# line: panel, reality, vision, cover apex, cover alias choice. A domain change
+# repoints the Panel and REALITY names only; the cover apex stays the name that
+# was recorded, because it may be the only owned name the deployment has. Prints
+# nothing when no ownership was ever recorded or the file is unreadable.
+recorded_domain_names() {
+    local state_file="$1"
+    [[ -f "$state_file" ]] || return 0
+    python3 - "$state_file" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        state = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if not isinstance(state, dict):
+    raise SystemExit(0)
+ownership = state.get("domainOwnership")
+if not isinstance(ownership, dict):
+    raise SystemExit(0)
+names = ownership.get("names")
+if not isinstance(names, dict):
+    raise SystemExit(0)
+cover = names.get("cover") if isinstance(names.get("cover"), str) else ""
+alias = "yes" if cover and names.get("coverAlias") else "no"
+print("\t".join([
+    names.get("panel") or "",
+    names.get("reality") or "",
+    names.get("vision") or "",
+    cover,
+    alias,
+]))
+PY
 }
 
 snapshot_acme_lineage() {

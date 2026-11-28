@@ -30,9 +30,12 @@ from . import (
     client_image,
     client_trust,
     diagnostics,
+    dot_policy,
     environment_gate,
+    firewall_runtime,
     hook_ownership,
     ingress,
+    ingress_matrix,
     matrix,
     operator_access,
     ownership,
@@ -90,13 +93,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Mirrors get_required_packages in modules/os.sh. The harness keeps its own copy
 # so a case can never be satisfied by asking the product what it installed; a
 # nonroot test fails if the two lists drift apart.
+# NGINX is not here on purpose: the installer pins the official build, which
+# replaces the distribution's nginx-full/nginx-common, so listing either would
+# demand the archive package back. NGX-PIN reads the installed package instead.
 REQUIRED_PACKAGES: Sequence[str] = (
-    "nginx-full",
-    "libnginx-mod-stream",
     "certbot",
     "python3",
     "python3-systemd",
     "sqlite3",
+    "gnupg",
     "curl",
     "tar",
     "gzip",
@@ -1807,6 +1812,26 @@ class AioProduct:
             )
         return self.host
 
+    def adopt(self, host: "topology.AioTopology", source_run_id: str = "") -> None:
+        """Attach a kept run's installed host instead of installing one.
+
+        The outcome is the provenance of the earlier run, not a claim that this
+        process observed an install: it records zero duration and names the run it
+        came from, so an artifact cannot mistake adoption for a second install.
+        """
+        if self.host is not None:
+            raise AssertionError(
+                f"{self.install_case_id}: the host is installed once per run and reused by later cases"
+            )
+        self.host = host
+        self.outcome = topology.InstallOutcome(
+            returncode=0,
+            stdout="",
+            stderr="",
+            duration=0.0,
+            command=f"adopted from run {source_run_id}" if source_run_id else "adopted kept host",
+        )
+
     # ---------------------------------------------------------------- versions
     def installed_versions(self) -> Dict[str, Any]:
         """What the three installed binaries say they are, read once per run.
@@ -3478,6 +3503,12 @@ def case_idempotent(product: AioProduct) -> Dict[str, Any]:
             "the repeated install rotated the credentials the served subscription carries, so "
             "every client that already imported it would stop working")
 
+    # The second install restarts the node, and the Panel answers before it has
+    # an endpoint again: a transfer attempted in that window comes back 503 with
+    # no endpoint report, which is the propagation lag every other data-plane case
+    # waits out. Measuring it here read as a product verdict (GitHub run
+    # 46114497205), so the case waits the same way they do.
+    product.wait_tunnel_ready("AIO-IDEMPOTENT")
     facts = product.traffic_facts("AIO-IDEMPOTENT", "traffic")
     expected = product.inbound_count * len(TRAFFIC_ENGINES)
     require("AIO-IDEMPOTENT", int(facts.get("transfer_count") or 0) == expected,
@@ -7332,6 +7363,42 @@ def wait_past_capture_window(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _hide_edge_log(host: Any) -> List[Any]:
+    """Move the stream router's access log aside on every ingress host.
+
+    The capture is the fallback witness, so a case about a capture that cannot
+    account for a request has to measure a host that keeps no edge log. The file
+    is renamed rather than truncated: NGINX keeps writing to the descriptor it
+    already holds, and the restore returns the same lines under the same name.
+    """
+    moved = []
+    for entry in host.ingress_hosts():
+        hidden = f"{ingress.EDGE_LOG}.pkt-02"
+        result = host.podman.exec_bash(
+            entry.container,
+            f"if [ -f {ingress.EDGE_LOG} ]; then mv {ingress.EDGE_LOG} {hidden}; fi",
+            check=False, timeout=60,
+        )
+        if result.returncode != 0:
+            _restore_edge_log(host, moved)
+            raise AssertionError(
+                f"{PKT_INCOMPLETE_CASE_ID}: could not set the fallback state on "
+                f"{entry.container}: {(result.stderr or result.stdout or '')[-300:]}"
+            )
+        moved.append((entry.container, hidden))
+    return moved
+
+
+def _restore_edge_log(host: Any, moved: Any) -> None:
+    """Put every renamed log back, whatever happened to the request."""
+    for container, hidden in moved or []:
+        host.podman.exec_bash(
+            container,
+            f"if [ -f {hidden} ]; then mv {hidden} {ingress.EDGE_LOG}; fi",
+            check=False, timeout=60,
+        )
+
+
 def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
     """PKT-02: evidence that is unavailable makes the case INCOMPLETE, not a pass.
 
@@ -7363,20 +7430,30 @@ def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
         wait_past_capture_window(PKT_SLOW_REQUEST_SECONDS)
         return request()
 
-    degradations = {
-        "no_capture_tool": product.bracket_request(
-            request, inbound, probe_script=PKT_MISSING_PROBE,
-        ),
-        "no_identity": product.bracket_request(
-            request, inbound, identity_port=PKT_SILENT_PORT,
-        ),
-        "window_expired": product.bracket_request(
-            slow_request, inbound, window=PKT_SHORT_WINDOW_SECONDS,
-        ),
-        "foreign_source_only": product.bracket_request(
-            request, inbound, identity_engine=host.client_name,
-        ),
-    }
+    # The four degradations are about the packet capture, which is the fallback
+    # witness: since the stream router writes its own access log, a host that
+    # logs every connection would answer PASS for a capture that saw nothing.
+    # The case therefore measures the state the fallback exists for — a host
+    # that predates the log — by moving the file aside for the duration and
+    # putting it back in the same order NGINX had it.
+    hidden = _hide_edge_log(host)
+    try:
+        degradations = {
+            "no_capture_tool": product.bracket_request(
+                request, inbound, probe_script=PKT_MISSING_PROBE,
+            ),
+            "no_identity": product.bracket_request(
+                request, inbound, identity_port=PKT_SILENT_PORT,
+            ),
+            "window_expired": product.bracket_request(
+                slow_request, inbound, window=PKT_SHORT_WINDOW_SECONDS,
+            ),
+            "foreign_source_only": product.bracket_request(
+                request, inbound, identity_engine=host.client_name,
+            ),
+        }
+    finally:
+        _restore_edge_log(host, hidden)
 
     verdicts = {}
     reasons = {}
@@ -7403,9 +7480,17 @@ def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
     require(PKT_INCOMPLETE_CASE_ID, not degradations["foreign_source_only"].identity_error,
             "the wrong-vantage run could not identify the client at all, so a differing address "
             f"was never the reason: {degradations['foreign_source_only'].identity_detail}")
-    require(PKT_INCOMPLETE_CASE_ID, bool(foreign["foreign"]),
-            "the foreign-source run recorded no non-matching source address, so it did not "
-            "reproduce an address the target reports differently from the one it captured")
+    # The address the target reports differently from the one the capture saw is
+    # only reproducible where the fallback capture actually sees segments. On a
+    # host whose own datapath keeps them away it answers INCOMPLETE for that
+    # reason instead, which is still the sentence this case is about — an
+    # invented PASS is what it refuses, and the routing failure the address
+    # attribution guards is asserted through the edge log by MN-PKT-03.
+    if foreign["intended_captured"]:
+        require(PKT_INCOMPLETE_CASE_ID, bool(foreign["foreign"]),
+                "the foreign-source run captured "
+                f"{foreign['intended_captured']} segment(s) and none of them came from an address "
+                "other than the client's, so it did not reproduce a differing address")
 
     persisted = host.podman.exec(
         host.target_name,
@@ -10074,14 +10159,24 @@ def case_fail_step(product: AioProduct) -> Dict[str, Any]:
     }
 
 
-def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
+def cases(
+    podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False,
+    adopted: Optional[topology.AioTopology] = None, source_run_id: str = "",
+) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
     The data-plane cases are generated from the protocol/client matrix, so the
     selected Vision configuration decides their number (8 without the optional
     inbound, 10 with it) and no case id is written by hand.
+
+    ``adopted`` is a kept run's host rebuilt from its setup record. It takes the
+    place the install case would have filled, so every later case addresses the
+    hosts that already exist; the install case itself stays declared (the suite is
+    the same suite) and an adopting run refuses to select it.
     """
     product = AioProduct(podman, distribution, vision=vision)
+    if adopted is not None:
+        product.adopt(adopted, source_run_id)
     data_plane = [
         (matrix.case_id(product.matrix, "aio", str(inbound["id"]), client), inbound, client)
         for inbound, client in matrix.tuples(product.matrix, vision)
@@ -10225,6 +10320,21 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(acme_mode.CASE_ID, "aio",
              lambda context: acme_mode.case_arbitrary_directory_is_refused(product, context),
              timeout_seconds=300),
+        # The ingress contract under a reload: the rules and listeners the
+        # install case just proved must survive `ufw reload` and a web-server
+        # restart, because a certificate renewal restarts them in production.
+        Case(firewall_runtime.RULES_SURVIVE_RELOAD_CASE_ID, "aio",
+             lambda context: firewall_runtime.case_rules_survive_reload(product),
+             timeout_seconds=firewall_runtime.RELOAD_TIMEOUT_SECONDS),
+        # The one optional control the matrix can break on a live host: an
+        # unreachable encrypted resolver has to degrade visibly, and a rollback
+        # nobody can prove has to stop the host rather than warn about it.
+        Case(dot_policy.DOT_BLOCKED_CASE_ID, "aio",
+             lambda context: dot_policy.case_blocked_encrypted_path(product),
+             timeout_seconds=dot_policy.DOT_CASE_TIMEOUT_SECONDS),
+        Case(dot_policy.DOT_RESTORE_CASE_ID, "aio",
+             lambda context: dot_policy.case_unverifiable_restoration(product),
+             timeout_seconds=dot_policy.DOT_CASE_TIMEOUT_SECONDS),
         Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
@@ -10418,6 +10528,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              lambda context: firewall_image.case_panel_firewall_policy_is_preserved(
                  product, context),
              timeout_seconds=300),
+        # The same rule set read as an ingress decision: the local Node's port is
+        # denied to every source, the operator's SSH ports stay public, the
+        # declaration matches what was applied, and both readings agree after the
+        # unit a reboot runs re-applies the files.
+        Case(ingress_matrix.AIO_CASE_ID, "aio",
+             lambda context: ingress_matrix.case_aio_ingress(product, context),
+             timeout_seconds=ingress_matrix.POLICY_TIMEOUT_SECONDS
+             + 2 * ingress_matrix.FACTS_TIMEOUT_SECONDS),
         # The paths this transaction writes: a pre-existing object comes back
         # from the before-image, a created one is removed only while the
         # ownership record still proves it, and anything else is preserved with

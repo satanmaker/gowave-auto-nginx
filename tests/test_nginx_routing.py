@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -239,7 +240,10 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("location ^~ /api/ {", c)
             self.assertIn("location / {", c)
             self.assertIn("location ^~ /xhttp-down/ {", c)
-            self.assertIn("proxy_pass http://127.0.0.1:10001;", c)
+            xhttp = nginx_block(c, "location ^~ /xhttp-down/")
+            self.assertIn("grpc_pass grpc://127.0.0.1:10001;", xhttp)
+            self.assertNotIn("proxy_pass", xhttp)
+            self.assertIn('grpc_set_header Connection "";', xhttp)
             self.assertIn("location = /ws {", c)
             self.assertIn("proxy_pass http://127.0.0.1:10002;", c)
             self.assertIn("location /trojan-grpc {", c)
@@ -253,7 +257,8 @@ class TestNginxRouting(unittest.TestCase):
             self.assertLess(c.index("map $request_uri $gowave_sub_path_bad {"),
                             c.index("server {"), "the path map must precede the server block")
             self.assertNotIn("proxy_add_x_forwarded_for", c)
-            self.assertEqual(c.count("proxy_set_header X-Forwarded-For $remote_addr;"), 5)
+            self.assertEqual(c.count("proxy_set_header X-Forwarded-For $remote_addr;"), 4)
+            self.assertIn("grpc_set_header X-Forwarded-For $remote_addr;", xhttp)
 
     def test_panel_vhost_hands_the_panel_only_the_peer_address(self):
         """Every header the Panel prefers over the socket is answered by the edge.
@@ -280,6 +285,7 @@ class TestNginxRouting(unittest.TestCase):
             )
             for header in locations:
                 block = nginx_block(c, header)
+                directive = "grpc_set_header" if header == "location ^~ /xhttp-down/" else "proxy_set_header"
                 for name in panel_surface.PANEL_CLIENT_IP_HEADERS:
                     expected = (
                         "$remote_addr"
@@ -287,13 +293,13 @@ class TestNginxRouting(unittest.TestCase):
                         else '""'
                     )
                     self.assertIn(
-                        f"proxy_set_header {name} {expected};", block,
+                        f"{directive} {name} {expected};", block,
                         f"{header} does not hand the Panel {name!r} as {expected}",
                     )
                 # Nothing the Panel trusts may arrive from the client itself.
                 self.assertNotRegex(
                     block,
-                    r"proxy_set_header\s+(?:"
+                    rf"{directive}\s+(?:"
                     + "|".join(re.escape(name) for name in panel_surface.PANEL_CLIENT_IP_HEADERS)
                     + r")\s+\$http_",
                 )
@@ -520,15 +526,24 @@ class TestNginxRouting(unittest.TestCase):
                 )
                 self.assertNotEqual(res.returncode, 0, "cover site must stay disabled")
 
-    def test_cover_domain_for_names_every_refusal(self):
-        """The decoy decision returns the apex or says why it cannot."""
+    def test_cover_domain_for_takes_the_selected_apex(self):
+        """The cover apex is the name the operator selected, never a suffix guess."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "bin"
             fake_bin.mkdir()
             getent = fake_bin / "getent"
             getent.write_text(
                 "#!/usr/bin/env bash\n"
+                'family="${1}"\n'
                 'name="${2}"\n'
+                'if [[ "$family" == "ahostsv6" ]]; then\n'
+                '    if [[ "${FAKE_UNRESOLVED6:-}" == "$name" ]]; then\n'
+                "        exit 2\n"
+                "    fi\n"
+                '    [[ -n "${FAKE_RESOLVED6:-}" ]] || exit 2\n'
+                '    printf \'%s\\n\' "${FAKE_RESOLVED6} STREAM ${name}"\n'
+                "    exit 0\n"
+                "fi\n"
                 'if [[ -n "${FAKE_UNRESOLVED:-}" && "$name" == "$FAKE_UNRESOLVED" ]]; then\n'
                 "    exit 2\n"
                 "fi\n"
@@ -538,62 +553,109 @@ class TestNginxRouting(unittest.TestCase):
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
-            def run(domain, server_ip="", resolved="203.0.113.10", unresolved=""):
-                environment["FAKE_RESOLVED"] = resolved
-                environment["FAKE_UNRESOLVED"] = unresolved
+            def run(panel, server_ip="", resolved="203.0.113.10", unresolved="",
+                    cover="", www="no", server_ipv6="", resolved6="",
+                    unresolved6=""):
+                environment.update({
+                    "FAKE_RESOLVED": resolved,
+                    "FAKE_UNRESOLVED": unresolved,
+                    "FAKE_RESOLVED6": resolved6,
+                    "FAKE_UNRESOLVED6": unresolved6,
+                    "GOWAVE_COVER_DOMAIN": cover,
+                    "GOWAVE_COVER_WWW": www,
+                })
                 return subprocess.run(
                     ["bash", "-c",
-                     f'source "{NGINX_SH}" && cover_domain_for "{domain}" "{server_ip}"'],
+                     f'source "{NGINX_SH}" && cover_domain_for "{panel}" "{server_ip}" "{server_ipv6}"'],
                     capture_output=True, text=True, env=environment,
                 )
 
-            # A registrable apex that both names resolve to.
+            # No selected apex means no cover site: nothing is inferred from the
+            # Panel domain, and the silence is not a refusal to explain.
             res = run("panel.example.com", "203.0.113.10")
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertEqual(res.stdout.strip(), "example.com")
+            self.assertEqual(res.stdout, "")
             self.assertEqual(res.stderr, "")
 
-            # The last two labels win, however deep the deployment domain is.
-            res = run("a.panel.sub.example.org", "203.0.113.10")
-            self.assertEqual(res.stdout.strip(), "example.org")
-
-            # No subdomain: nothing to derive, and the refusal names the cause.
-            res = run("example.com", "203.0.113.10")
+            # An explicit apex is used exactly as selected, however many labels
+            # its public suffix has -- the last-two-label rule is gone.
+            res = run("panel.example.co.uk", "203.0.113.10", cover="example.co.uk")
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertEqual(res.stdout, "")
-            self.assertIn("example.com has no subdomain", res.stderr)
+            self.assertEqual(res.stdout.strip(), "example.co.uk")
+            self.assertEqual(res.stderr, "")
 
-            # A single label is refused the same way instead of silently.
-            res = run("localhost", "")
-            self.assertEqual(res.returncode, 0, res.stderr)
+            # The Panel's own name cannot double as the cover apex.
+            res = run("panel.example.com", "203.0.113.10", cover="panel.example.com")
+            self.assertEqual(res.returncode, 1)
             self.assertEqual(res.stdout, "")
-            self.assertIn("localhost has no subdomain", res.stderr)
+            self.assertIn("same name", res.stderr)
 
-            # An apex that does not resolve is a different, named refusal.
-            res = run("panel.example.com", "203.0.113.10", resolved="198.51.100.7")
-            self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertEqual(res.stdout, "")
-            self.assertIn("do not resolve to 203.0.113.10", res.stderr)
+            # A value that is not a hostname is refused before any lookup.
+            res = run("panel.example.com", "203.0.113.10", cover="not_a_name")
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("not a fully qualified domain name", res.stderr)
 
-            # Half of the pair is named on its own, so the operator knows which
-            # record to fix rather than re-checking both.
+            # An apex that does not resolve is a named refusal, and the cover
+            # site stays off rather than asking for a challenge it cannot pass.
             res = run("panel.example.com", "203.0.113.10",
-                      unresolved="www.example.com")
+                      cover="example.com", resolved="198.51.100.7")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertIn("does not resolve to 203.0.113.10", res.stderr)
+
+            # The selected alias is checked on its own record, so the refusal
+            # points at the name that has to be fixed.
+            res = run("panel.example.com", "203.0.113.10",
+                      cover="example.com", www="yes", unresolved="www.example.com")
             self.assertEqual(res.stdout, "")
             self.assertIn("Camouflage apex disabled — www.example.com does not resolve "
                           "to 203.0.113.10", res.stderr)
 
-            res = run("panel.example.com", "203.0.113.10", unresolved="example.com")
-            self.assertEqual(res.stdout, "")
-            self.assertIn("Camouflage apex disabled — example.com does not resolve "
-                          "to 203.0.113.10", res.stderr)
+            # Without the alias selection the www record is not consulted at all.
+            res = run("panel.example.com", "203.0.113.10",
+                      cover="example.com", unresolved="www.example.com")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "example.com")
             self.assertNotIn("www.example.com", res.stderr)
 
-            # No domain at all is not an error and not a refusal to explain.
-            res = run("", "")
+            # A host that advertises IPv6 has to publish it for the cover too:
+            # an AAAA pointing elsewhere sends that client's challenge away.
+            res = run("panel.example.com", "203.0.113.10", cover="example.com",
+                      server_ipv6="2001:db8::10", resolved6="2001:db8::99")
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout, "")
-            self.assertEqual(res.stderr, "")
+            self.assertIn("example.com does not resolve to 203.0.113.10", res.stderr)
+
+            res = run("panel.example.com", "203.0.113.10", cover="example.com",
+                      server_ipv6="2001:db8::10", resolved6="2001:db8::10")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "example.com")
+
+    def test_the_cover_alias_is_selected_not_assumed(self):
+        """www is a second owned name: off unless the operator asked for it."""
+        cases = (
+            ("", "example.com\n"),
+            ("no", "example.com\n"),
+            ("yes", "example.com\nwww.example.com\n"),
+        )
+        for choice, expected in cases:
+            with self.subTest(choice=choice):
+                res = subprocess.run(
+                    ["bash", "-c", f'source "{NGINX_SH}" && cover_site_names "example.com"'],
+                    capture_output=True, text=True,
+                    env={**os.environ, "GOWAVE_COVER_WWW": choice},
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(res.stdout, expected)
+
+        # A value nobody defined is refused instead of silently becoming "no".
+        res = subprocess.run(
+            ["bash", "-c", f'source "{NGINX_SH}" && cover_site_names "example.com"'],
+            capture_output=True, text=True,
+            env={**os.environ, "GOWAVE_COVER_WWW": "maybe"},
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("must be yes or no", res.stderr)
 
     def test_render_cover_site_substitutes_every_placeholder(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -632,7 +694,10 @@ class TestNginxRouting(unittest.TestCase):
                 f'generate_production_http_vhost "panel.example.com" "reality.example.com" "{http}" "{inet6}" "" "example.com" && '
                 f'generate_decoy_vhost "reality.example.com" "{decoy}" nginx "{cover_dir}" "example.com"'
             )
-            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            res = subprocess.run(
+                ["bash", "-c", cmd], capture_output=True, text=True,
+                env={**os.environ, "GOWAVE_COVER_WWW": "yes"},
+            )
             self.assertEqual(res.returncode, 0, res.stderr)
 
             # The apex terminates on the decoy listener, not on the Xray fallback.
@@ -650,6 +715,30 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("error_page 404 /404.html;", decoy_conf)
             self.assertTrue((cover_dir / "index.html").exists())
             self.assertNotIn("{{", (cover_dir / "index.html").read_text())
+
+    def test_a_cover_without_the_alias_never_names_www(self):
+        """Leaving www unselected keeps it out of every rendered name list."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            inet6 = tmp / "if_inet6"
+            stream = tmp / "stream.conf"
+            http = tmp / "http.conf"
+            decoy = tmp / "decoy.conf"
+            cmd = (
+                f'source "{NGINX_SH}" && '
+                f'generate_stream_config "panel.example.com" "reality.example.com" "{stream}" "{inet6}" "" "example.com" && '
+                f'generate_production_http_vhost "panel.example.com" "reality.example.com" "{http}" "{inet6}" "" "example.com" && '
+                f'generate_decoy_vhost "reality.example.com" "{decoy}" nginx "{tmp}/cover" "example.com"'
+            )
+            res = subprocess.run(
+                ["bash", "-c", cmd], capture_output=True, text=True,
+                env={**os.environ, "GOWAVE_COVER_WWW": "no"},
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            for path in (stream, http, decoy):
+                self.assertNotIn("www.example.com", path.read_text(), path.name)
+                self.assertNotIn("www\\.example\\.com", path.read_text(), path.name)
+            self.assertIn("example.com 127.0.0.1:9443;", stream.read_text())
 
     def test_generate_bootstrap_acme_vhost(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -889,6 +978,59 @@ class TestNginxRouting(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn(f"REQUESTS_CA_BUNDLE={ca_file}", res.stdout)
             self.assertIn(f"SSL_CERT_FILE={ca_file}", res.stdout)
+
+    def test_renewal_dry_run_proves_one_named_lineage(self):
+        """A dry run stores nothing, so it names only the lineages this run owns."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            calls = tmp / "calls.log"
+            fake_certbot = bin_dir / "certbot"
+            fake_certbot.write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{calls}"\n'
+                'exit "${FAKE_CERTBOT_STATUS:-0}"\n'
+            )
+            fake_certbot.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            command = (f'source "{NGINX_SH}" && verify_renewal_dry_run '
+                       '"cover2.example.net-0001" '
+                       '"--server" "https://acme-v02.api.letsencrypt.org/directory"')
+            result = subprocess.run(["bash", "-c", command],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Verifying renewal of the cover2.example.net-0001 lineage",
+                          result.stdout)
+            argv = calls.read_text().splitlines()
+            self.assertEqual(len(argv), 1, argv)
+            self.assertIn("renew --dry-run", argv[0])
+            self.assertIn("--cert-name cover2.example.net-0001", argv[0])
+            self.assertIn("--non-interactive", argv[0])
+            self.assertIn("--server https://acme-v02.api.letsencrypt.org/directory", argv[0])
+            self.assertNotIn("certonly", argv[0],
+                             "a dry run renews, it does not issue")
+
+            env["FAKE_CERTBOT_STATUS"] = "7"
+            refused = subprocess.run(["bash", "-c", command],
+                                     capture_output=True, text=True, env=env)
+            self.assertEqual(refused.returncode, 7,
+                             "the dry run's status has to fail the step it belongs to")
+
+    def test_the_install_verifies_renewal_after_the_production_config_serves(self):
+        """A dry run against the bootstrap vhost would prove a path that is gone."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        body = script[script.index("cmd_install() {"):]
+        body = body[:body.index("\n}\n")]
+        production = body.index('generate_panel_https_vhost "$panel_domain"')
+        live = body.index("reload_nginx_strict", production)
+        dry_run = body.index("verify_renewal_dry_run")
+        self.assertLess(live, dry_run, "the renewal path is the live production vhost")
+        self.assertLess(dry_run, body.index("# Step 6: GoWave Panel Native Installation"))
+        self.assertIn('for owned_lineage in "$panel_lineage" "$reality_lineage" '
+                      '${vision_lineage:+"$vision_lineage"}; do', body)
 
     def test_check_acme_lineage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1479,6 +1621,139 @@ class TestNginxRouting(unittest.TestCase):
             res_foreign = subprocess.run(["bash", "-c", cmd_foreign], capture_output=True, text=True)
             self.assertNotEqual(res_foreign.returncode, 0)
             self.assertIn("exists without an ownership manifest", res_foreign.stderr)
+
+
+class TestDomainOwnership(unittest.TestCase):
+    """The recorded ownership is what a migration or resume reads back.
+
+    A cover apex is a name the operator selected, not a suffix the installer
+    guesses, so the record must carry the role, the alias choice and the SAN
+    sets the certificates were issued for. Reading the same selection back is
+    what keeps a later domain change from inventing a different apex.
+    """
+
+    def run_nginx(self, *command):
+        script = " ".join(shlex.quote(str(part)) for part in command)
+        return subprocess.run(
+            ["bash", "-c", f'source "{NGINX_SH}" && {script}'],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT), "SCRIPT_DIR": str(REPO_ROOT)},
+        )
+
+    def record(self, state, *args):
+        return self.run_nginx("record_domain_ownership", state, *args)
+
+    def recorded(self, state):
+        finished = self.run_nginx("recorded_domain_names", state)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        if not finished.stdout:
+            return None
+        return finished.stdout.rstrip("\n").split("\t")
+
+    def test_a_master_records_roles_names_and_sans(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            state.write_text(json.dumps({"panelUuid": "kept"}), encoding="utf-8")
+
+            finished = self.record(
+                state, "master", "panel.example.com", "cdn.example.com",
+                "vision.example.com", "example.co.uk", "yes",
+            )
+            self.assertEqual(finished.returncode, 0, finished.stderr)
+
+            data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(data["domainOwnership"]["role"], "master")
+            self.assertEqual(
+                data["domainOwnership"]["names"],
+                {
+                    "panel": "panel.example.com",
+                    "reality": "cdn.example.com",
+                    "vision": "vision.example.com",
+                    "cover": "example.co.uk",
+                    "coverAlias": "www.example.co.uk",
+                },
+            )
+            # The cover names are SANs of the REALITY certificate, which is the
+            # one the decoy and its HTTP-01 answers are served under.
+            self.assertEqual(
+                data["domainOwnership"]["sans"],
+                {
+                    "panel": ["panel.example.com"],
+                    "reality": ["cdn.example.com", "example.co.uk", "www.example.co.uk"],
+                    "vision": ["vision.example.com"],
+                },
+            )
+            self.assertEqual(data["panelUuid"], "kept")
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+    def test_a_worker_records_its_two_names_without_a_cover(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            finished = self.record(state, "worker", "edge.example.com", "edge-cdn.example.com")
+            self.assertEqual(finished.returncode, 0, finished.stderr)
+
+            ownership = json.loads(state.read_text(encoding="utf-8"))["domainOwnership"]
+            self.assertEqual(ownership["role"], "worker")
+            self.assertEqual(
+                ownership["names"],
+                {"panel": "edge.example.com", "reality": "edge-cdn.example.com"},
+            )
+            self.assertEqual(
+                ownership["sans"],
+                {"panel": ["edge.example.com"], "reality": ["edge-cdn.example.com"]},
+            )
+
+    def test_a_cover_without_the_alias_has_no_www_san(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            finished = self.record(
+                state, "master", "panel.example.com", "cdn.example.com", "", "example.co.uk", "no",
+            )
+            self.assertEqual(finished.returncode, 0, finished.stderr)
+
+            ownership = json.loads(state.read_text(encoding="utf-8"))["domainOwnership"]
+            self.assertEqual(ownership["names"]["cover"], "example.co.uk")
+            self.assertNotIn("coverAlias", ownership["names"])
+            self.assertEqual(
+                ownership["sans"]["reality"], ["cdn.example.com", "example.co.uk"]
+            )
+
+    def test_an_unknown_role_is_refused_without_touching_the_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            original = {"domainOwnership": {"role": "master", "names": {}, "sans": {}}}
+            state.write_text(json.dumps(original), encoding="utf-8")
+
+            finished = self.record(state, "gateway", "panel.example.com", "cdn.example.com")
+            self.assertNotEqual(finished.returncode, 0)
+            self.assertIn("master or a worker role", finished.stderr)
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8")), original)
+
+    def test_the_recorded_selection_is_read_back_for_a_domain_change(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            finished = self.record(
+                state, "master", "panel.example.com", "cdn.example.com", "", "example.co.uk", "yes",
+            )
+            self.assertEqual(finished.returncode, 0, finished.stderr)
+
+            self.assertEqual(
+                self.recorded(state),
+                ["panel.example.com", "cdn.example.com", "", "example.co.uk", "yes"],
+            )
+
+    def test_nothing_is_read_back_from_a_state_that_records_no_ownership(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            missing = Path(tmpdir) / "absent.json"
+            self.assertIsNone(self.recorded(missing))
+
+            state.write_text(json.dumps({"schemaVersion": 2}), encoding="utf-8")
+            self.assertIsNone(self.recorded(state))
+
+            state.write_text("{not json", encoding="utf-8")
+            self.assertIsNone(self.recorded(state))
 
 
 if __name__ == "__main__":

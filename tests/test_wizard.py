@@ -9,8 +9,10 @@ against the shipped scripts, where a lookup could be added outside a function
 a test can call.
 """
 import fcntl
+import json
 import os
 import pty
+from datetime import datetime, timezone
 import re
 import select
 import shlex
@@ -410,6 +412,8 @@ DUMP_PLAN = (
     "printf 'variant=%s\\n' \"$GOWAVE_PLAN_VARIANT\"\n"
     "printf 'panel=%s\\n' \"$GOWAVE_PLAN_PANEL_NAME\"\n"
     "printf 'camouflage=%s\\n' \"$GOWAVE_PLAN_CAMOUFLAGE_NAME\"\n"
+    "printf 'cover=%s\\n' \"$GOWAVE_PLAN_COVER_NAME\"\n"
+    "printf 'cover_www=%s\\n' \"$GOWAVE_PLAN_COVER_WWW\"\n"
     "printf 'vision=%s\\n' \"$GOWAVE_PLAN_VISION_NAME\"\n"
     "printf 'email=%s\\n' \"$GOWAVE_PLAN_EMAIL\"\n"
     "printf 'local_label=%s\\n' \"$GOWAVE_PLAN_LOCAL_LABEL\"\n"
@@ -506,6 +510,27 @@ class TestCollectPlan(unittest.TestCase):
         self.assertEqual(nodes, [])
         self.assertIn("missing.example.com", stderr)
         self.assertNotIn("These names do not resolve: panel.example.com", stderr)
+
+    def test_an_unresolvable_name_re_asks_only_its_own_field(self):
+        """A name the resolver cannot answer sends the operator back to that field."""
+        verdict, values, nodes, stderr = self._collect(
+            "en\n1\npanel.example.com\nmissing.example.com\nn\nlocal-01\n"
+            "admin@example.com\nn\n"
+            # The failed check routes to the camouflage field alone.
+            "cdn.example.com\n",
+            failing=("missing.example.com",),
+        )
+        self.assertEqual(verdict, "COLLECTED")
+        self.assertEqual(values["panel"], "panel.example.com")
+        self.assertEqual(values["camouflage"], "cdn.example.com")
+        self.assertEqual(values["email"], "admin@example.com")
+        self.assertEqual(values["local_label"], "local-01")
+        self.assertEqual(nodes, [])
+        self.assertIn("missing.example.com", stderr)
+        self.assertIn("Back to Panel camouflage domain (REALITY SNI)", stderr)
+        # The card that already answered is not asked again.
+        self.assertEqual(stderr.count("Panel domain ("), 1)
+        self.assertEqual(stderr.count("A node name is required."), 0)
 
     def test_a_rejected_variant_answer_and_a_bad_node_count_repeat_the_question(self):
         verdict, values, _, _ = self._collect(
@@ -621,10 +646,55 @@ class TestCollectPlan(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Panel (local-01): panel=panel.example.com", result.stdout)
-        self.assertIn("node 1 (ams-01): panel=node1.example.com", result.stdout)
-        self.assertIn("node 2 (fra-01): panel=node2.example.com", result.stdout)
+        self.assertIn("node 1 (ams-01): transport=node1.example.com", result.stdout)
+        self.assertIn("node 2 (fra-01): transport=node2.example.com", result.stdout)
         self.assertEqual(result.stdout.count("(ams-01)"), 1)
         self.assertEqual(result.stdout.count("(fra-01)"), 1)
+        # A Worker's first name is its transport, never a Panel: the summary has
+        # to keep the role the operator saw when the question was asked.
+        for line in result.stdout.splitlines():
+            if line.startswith(("  node 1", "  node 2")):
+                self.assertNotIn("panel=", line)
+
+    def test_a_worker_with_vision_shows_three_names_and_two_without(self):
+        """Vision is a third owned name; its absence leaves the other two."""
+        with tempfile.TemporaryDirectory() as directory:
+            with_vision = bash(
+                SOURCE_WIZARD
+                + "wizard_collect_plan >/dev/null || exit 1\n"
+                + "wizard_plan_summary\n",
+                stdin=(
+                    "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\n"
+                    "admin@example.com\n1\n"
+                    "node1.example.com\ncdn1.example.com\ny\nxtls1.example.com\nams-01\nn\n"
+                ),
+                env={"GOWAVE_WIZARD_RESOLVER": write_resolver(directory)},
+            )
+            without_vision = bash(
+                SOURCE_WIZARD
+                + "wizard_collect_plan >/dev/null || exit 1\n"
+                + "wizard_plan_summary\n",
+                stdin=(
+                    "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\n"
+                    "admin@example.com\n1\n"
+                    "node1.example.com\ncdn1.example.com\nn\nams-01\nn\n"
+                ),
+                env={"GOWAVE_WIZARD_RESOLVER": write_resolver(directory)},
+            )
+        self.assertEqual(with_vision.returncode, 0, with_vision.stderr)
+        self.assertEqual(without_vision.returncode, 0, without_vision.stderr)
+
+        three = "transport=node1.example.com camouflage=cdn1.example.com vision=xtls1.example.com"
+        two = "transport=node1.example.com camouflage=cdn1.example.com vision=none"
+        self.assertIn(three, with_vision.stdout)
+        self.assertIn(two, without_vision.stdout)
+        # The questions themselves name the role each answer serves, so a
+        # Worker name is never introduced as a Panel.
+        for result in (with_vision, without_vision):
+            self.assertIn("XHTTP, WS and gRPC", result.stderr)
+            self.assertIn("no Panel runs here", result.stderr)
+        self.assertIn("REALITY SNI", with_vision.stderr)
+        self.assertIn("REALITY SNI", without_vision.stderr)
 
 
 class TestVariantMenu(unittest.TestCase):
@@ -787,6 +857,57 @@ class TestInteractiveMenu(unittest.TestCase):
         os.write(master, b"0\n")
         self.assertEqual(process.wait(timeout=30), 0)
 
+    def test_worker_summary_stays_visible_until_enter_in_both_languages(self):
+        for language, pause, fragments in (
+            ("en", "Press Enter to return to the menu", (
+                "registered and verified in the Panel", "could not confirm Worker security",
+                "a Panel on another host cannot confirm it", "failed (phase: revoke",
+            )),
+            ("ru", "Нажмите Enter, чтобы вернуться в меню", (
+                "зарегистрирован и подтверждён панелью", "Не удалось подтвердить настройки безопасности",
+                "удалённая панель отсюда не может это подтвердить", "неудача (phase: revoke",
+            )),
+        ):
+            with self.subTest(language=language):
+                script = f'source {shlex.quote(str(GOWAVE_AUTO))}\n' + r'''
+trap - ERR
+render() {
+    local -a rows=(
+        $'worker-ok\tVERIFIED\tuuid-good'
+        $'worker-security\tUNVERIFIED\tsecurity'
+        $'worker-inventory\tUNVERIFIED\tunreadable'
+        $'worker-cleanup\tFAILED\trevoke\tcleanup incomplete'
+    )
+    _print_onboarding_summary rows panel.example.com
+    return 2
+}
+menu_action render
+printf 'REDRAW\n'
+'''
+                master, slave = pty.openpty()
+                try:
+                    with subprocess.Popen(
+                        ["bash", "-c", script], stdin=slave, stdout=slave, stderr=slave,
+                        env={**os.environ, "GOWAVE_WIZARD_LANG": language},
+                        preexec_fn=self._attach_controlling_terminal,
+                    ) as process:
+                        os.close(slave)
+                        slave = -1
+                        try:
+                            held = self._read_until(master, pause.encode()).decode()
+                            for fragment in fragments:
+                                self.assertIn(fragment, held)
+                            self.assertNotIn("REDRAW", held)
+                            os.write(master, b"\n")
+                            self._read_until(master, b"REDRAW")
+                            self.assertEqual(process.wait(timeout=10), 0)
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                finally:
+                    self._close_quietly(master)
+                    self._close_quietly(slave)
+
     def test_end_of_input_leaves_the_menu_cleanly(self):
         master, process = self._spawn()
         self._read_until(master, b"Select option")
@@ -809,6 +930,117 @@ class TestInteractiveMenu(unittest.TestCase):
         self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertIn("GoWave Auto NGINX Service Status", stdout)
         self.assertNotIn("Press Enter", stdout + stderr)
+
+
+class TestMenuActionStrictness(unittest.TestCase):
+    """A menu-startable mutation keeps its own errexit; the menu outlives it.
+
+    Two claims hold at once: a mandatory step that fails inside a menu-started
+    action stops the steps behind it, and that failure never ends the session. A
+    shell function called from an OR-list inherits errexit switched off, so the
+    shipped `menu_action` runs the action in a subshell that re-arms
+    `set -Eeuo pipefail` and takes the options it needs as its own. These tests
+    drive that wrapper and read both halves from what the action printed.
+    """
+
+    FAILURE = "The action exited with status %s."
+
+    @staticmethod
+    def source(extra):
+        return f"source {shlex.quote(str(GOWAVE_AUTO))}\n{extra}"
+
+    def test_a_failed_local_install_is_named_and_the_next_action_runs(self):
+        script = self.source(
+            "clear() { :; }\n"
+            "cmd_status() { printf 'STATUS-OK\\n'; return 0; }\n"
+            "cmd_install() { printf 'LOCAL\\n'; return 5; }\n"
+            "main_menu\n"
+            "main_menu\n"
+        )
+        result = bash(script, stdin="2\n1\n", env={"GOWAVE_WIZARD_LANG": "en"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LOCAL", result.stdout)
+        self.assertIn(self.FAILURE % 5, result.stderr)
+        self.assertIn("STATUS-OK", result.stdout,
+                      "the menu did not accept a second action after the first one failed")
+        self.assertEqual(result.stdout.count("GoWave Auto NGINX Manager"), 2,
+                         "the menu was not shown again after the failed action")
+
+    def test_a_failing_firewall_step_stops_the_payload_and_compensates_once(self):
+        script = self.source(
+            "install_local() { printf 'LOCAL\\n'; apply_firewall; printf 'LOCAL-AFTER\\n'; }\n"
+            "apply_firewall() { printf 'FIREWALL\\n'; return 4; }\n"
+            "deploy_payload() { printf 'PAYLOAD\\n'; }\n"
+            "cmd_install() {\n"
+            "    trap 'printf \"COMPENSATED\\n\"' EXIT\n"
+            "    trap 'printf \"ERR-TRAP\\n\"' ERR\n"
+            "    install_local\n"
+            "    deploy_payload\n"
+            "}\n"
+            "menu_action cmd_install\n"
+            "printf 'ALIVE=%s\\n' \"$?\"\n"
+        )
+        result = bash(script, env={"GOWAVE_WIZARD_LANG": "en"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FIREWALL", result.stdout)
+        self.assertNotIn("LOCAL-AFTER", result.stdout,
+                         "a step behind the failing firewall call still ran")
+        self.assertNotIn("PAYLOAD", result.stdout,
+                         "the payload was deployed after the firewall step failed")
+        self.assertEqual(result.stdout.count("COMPENSATED"), 1,
+                         "the compensation did not run exactly once")
+        self.assertEqual(result.stdout.count("ERR-TRAP"), 1,
+                         "the ERR trap did not see the nested failure")
+        self.assertIn(self.FAILURE % 4, result.stderr)
+        self.assertIn("ALIVE=0", result.stdout)
+
+    def test_a_failing_payload_step_reports_its_own_code(self):
+        script = self.source(
+            "install_local() { printf 'LOCAL\\n'; return 0; }\n"
+            "deploy_payload() { printf 'PAYLOAD\\n'; return 7; }\n"
+            "cmd_install() { trap 'printf \"COMPENSATED\\n\"' EXIT;"
+            " install_local; deploy_payload; }\n"
+            "menu_action cmd_install\n"
+        )
+        result = bash(script, env={"GOWAVE_WIZARD_LANG": "en"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PAYLOAD", result.stdout)
+        self.assertIn(self.FAILURE % 7, result.stderr)
+        self.assertEqual(result.stdout.count("COMPENSATED"), 1,
+                         "a failed payload ran its compensation more than once")
+
+    def test_the_real_firewall_step_refuses_inside_the_wrapper_without_a_payload(self):
+        # `firewall_apply_policy` is the product's own step, not a fixture: with
+        # nothing prepared it refuses instead of guessing the managed ingress,
+        # and the payload behind it must stay undeployed.
+        script = self.source(
+            "deploy_payload() { printf 'PAYLOAD\\n'; return 0; }\n"
+            "cmd_install() { firewall_apply_policy; deploy_payload; }\n"
+            "menu_action cmd_install\n"
+            "printf 'ALIVE=%s\\n' \"$?\"\n"
+        )
+        result = bash(script, env={"GOWAVE_WIZARD_LANG": "en"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no firewall policy was prepared", result.stderr)
+        self.assertNotIn("PAYLOAD", result.stdout,
+                         "the payload was deployed after the real firewall step refused")
+        self.assertIn(self.FAILURE % 1, result.stderr)
+        self.assertIn("ALIVE=0", result.stdout)
+
+    def test_the_menu_keeps_its_own_errexit_after_a_failed_action(self):
+        script = self.source(
+            "cmd_install() { return 9; }\n"
+            "menu_action cmd_install\n"
+            "printf 'BEFORE\\n'\n"
+            "false\n"
+            "printf 'AFTER\\n'\n"
+        )
+        result = bash(script, env={"GOWAVE_WIZARD_LANG": "en"})
+        self.assertIn("BEFORE", result.stdout)
+        self.assertNotIn("AFTER", result.stdout,
+                         "the wrapper left the menu's own errexit switched off")
+        self.assertEqual(result.returncode, 1,
+                         "a failure after the action did not end the sourced script")
 
 
 class TestCertificateBudget(unittest.TestCase):
@@ -1087,13 +1319,46 @@ class TestOnboardingOutcomes(unittest.TestCase):
 
     VERIFIER = "wizard_verify_node_registration() { printf 'uuid-%s' \"$1\"; return 0; }\n"
 
-    def onboard(self, outcomes, stdin="2\n", callee=None, verifier=VERIFIER):
+    def test_results_are_private_and_persisted_before_rendering(self):
+        result, _survived = self.onboard(
+            {"worker-ok": True, "worker-bad": True},
+            extra='''_print_onboarding_summary() {
+    local path="$GOWAVE_STATE_DIR/wizard_node_results"
+    [[ "$(stat -c %a "$path")" == 600 && "$(wc -l < "$path")" == 2 ]] && printf 'SUMMARY_SAVED\\n'
+}
+''',
+        )
+        self.assertIn("SUMMARY_SAVED", result.stdout, result.stderr)
+        self.assertIn("RC=0", result.stdout)
+
+    def test_a_failed_result_write_keeps_the_old_summary_and_stops_retry(self):
+        result, _survived = self.onboard(
+            {"worker-ok": True, "worker-bad": False},
+            extra='''printf 'previous result\\n' > "$GOWAVE_STATE_DIR/wizard_node_results"
+sync() { return 1; }
+_print_onboarding_summary() {
+    local previous
+    read -r previous < "$GOWAVE_STATE_DIR/wizard_node_results"
+    [[ "$previous" == 'previous result' ]] && printf 'SUMMARY_VISIBLE\\n'
+}
+_offer_selective_retry() { printf 'RETRY_CALLED\\n'; }
+''',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("SUMMARY_VISIBLE", result.stdout)
+        self.assertIn("RC=2", result.stdout)
+        self.assertIn("Could not save the node results", result.stderr)
+        self.assertNotIn("RETRY_CALLED", result.stdout)
+
+    def onboard(self, outcomes, stdin="2\n", callee=None, verifier=VERIFIER, extra=""):
         """Run the loop over two Workers; ``outcomes`` maps name to success.
 
         ``callee`` replaces the generated stub with a body that models the SSH
         hop's own side effects — the real one tracks a key directory of its own.
         ``verifier`` replaces the Panel readback, which would otherwise read a
-        real Panel that never saw the stub's node.
+        real Panel that never saw the stub's node. ``extra`` is prepended to the
+        script for stubs the case owns — the retry inspection, which would
+        otherwise find neither a journal nor an SSH server.
         """
         stubs = [
             "ssh_bootstrap_onboard_one() {",
@@ -1120,6 +1385,7 @@ class TestOnboardingOutcomes(unittest.TestCase):
             + SOURCE_WIZARD
             + "GOWAVE_STATE_DIR=$(mktemp -d)\n"
             + self.PLAN
+            + extra
             + "\n".join(stubs)
             + "\n"
             + verifier
@@ -1158,26 +1424,135 @@ class TestOnboardingOutcomes(unittest.TestCase):
         self.assertNotIn("Some nodes failed", result.stdout)
         self.assertNotIn("installation again", result.stdout, "a complete run carried a retry line")
 
-    def test_every_node_failing_exits_one_without_a_retry_offer(self):
-        result, _survived = self.onboard({"worker-ok": False, "worker-bad": False})
+    def test_every_node_failing_is_partial_and_still_offers_the_batch(self):
+        # The Panel is deployed and serving, so this is a partial run, not a
+        # Panel failure: 1 belongs to a Panel that did not deploy. The retry is
+        # offered for the whole batch because rerunning the installation would
+        # repeat Panel work that already succeeded.
+        result, _survived = self.onboard({"worker-ok": False, "worker-bad": False}, stdin="3\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("RC=1", result.stdout)
+        self.assertIn("RC=2", result.stdout)
         self.assertIn("Registered and verified in the Panel: 0 of 2.", result.stdout)
         self.assertIn(
             "No node was registered. The Panel is installed and serving;",
             result.stdout,
             "an all-failed run did not say what remains",
         )
-        self.assertNotIn("Some nodes failed", result.stdout)
+        offer = result.stdout.split("Some nodes failed. Select a node to retry, or skip:", 1)[1]
+        self.assertIn("  1) worker-ok", offer)
+        self.assertIn("  2) worker-bad", offer)
+        self.assertIn("Retry skipped.", offer)
+
+    def test_a_retry_that_repairs_every_node_ends_the_run_clean(self):
+        # Both nodes failed at the first pass; each confirmed retry verifies its
+        # node. The final code is read from the records the retries wrote, not
+        # from the first pass, so the repaired batch exits zero.
+        callee = (
+            "ssh_bootstrap_onboard_one() {\n"
+            '  local counter="$GOWAVE_STATE_DIR/attempt-$1" attempt=0\n'
+            '  [[ -f "$counter" ]] && attempt=$(cat "$counter")\n'
+            '  attempt=$((attempt + 1))\n'
+            '  printf \'%s\\n\' "$attempt" > "$counter"\n'
+            "  printf 'ATTEMPT:%s:%s\\n' \"$1\" \"$attempt\"\n"
+            "  if (( attempt == 1 )); then\n"
+            "    printf 'PHASE:scan\\n' >&2\n"
+            "    printf 'Could not read the SSH host key.\\n' >&2\n"
+            "    return 1\n"
+            "  fi\n"
+            "  printf 'NODE-IDENTITY:%s\\t203.0.113.7\\t3002\\n' \"$1\" >&2\n"
+            "  return 0\n"
+            "}\n"
+        )
+        result, _survived = self.onboard(
+            {"worker-ok": False, "worker-bad": False}, callee=callee,
+            extra="_retry_diagnostics() { return 0; }\n",
+            stdin="1\ny\n1\ny\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Retry succeeded: worker-ok", result.stdout)
+        self.assertIn("Retry succeeded: worker-bad", result.stdout)
+        after = result.stdout.split("Retry succeeded: worker-bad", 1)[1]
+        self.assertIn("Registered and verified in the Panel: 2 of 2.", after)
+        self.assertIn("RC=0", result.stdout,
+                      "a repaired batch kept the code the first pass alone would have produced")
+        self.assertEqual(result.stdout.count("ATTEMPT:worker-ok:2"), 1,
+                         "the repaired node was not onboarded exactly twice")
+        self.assertEqual(result.stdout.count("ATTEMPT:worker-bad:2"), 1,
+                         "the repaired node was not onboarded exactly twice")
+        self.assertNotIn("ATTEMPT:worker-ok:3", result.stdout)
+        self.assertNotIn("ATTEMPT:worker-bad:3", result.stdout)
+
+    def test_a_declined_retry_keeps_the_partial_code(self):
+        # Declining is a decision, not a repair: nothing is onboarded again and
+        # the all-failed batch keeps the partial-success code.
+        result, _survived = self.onboard(
+            {"worker-ok": False, "worker-bad": False},
+            extra="_retry_diagnostics() { return 0; }\n",
+            stdin="1\nn\n3\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Retry declined, worker-ok was not touched.", result.stdout)
+        self.assertNotIn("Retrying worker-ok", result.stdout)
+        self.assertIn("RC=2", result.stdout)
+        self.assertEqual(result.stdout.count("worker-ok: failed (phase: scan"), 1,
+                         "a declined retry reprinted the screen as if the node had changed")
+
+    def test_a_registered_node_whose_cleanup_failed_is_not_registered_twice(self):
+        # `node add` runs before the cleanup stages, so a failure at `revoke`
+        # leaves a node the Panel already holds. The reason names that
+        # registration, the retry keeps it instead of asking for a second node
+        # by the same name, and the run stays nonzero because the cleanup is
+        # still unverified.
+        callee = (
+            "ssh_bootstrap_onboard_one() {\n"
+            "  printf 'ONBOARD:%s\\n' \"$1\"\n"
+            "  if [[ \"$1\" == worker-bad ]]; then\n"
+            "    printf 'NODE-IDENTITY:%s\\t203.0.113.7\\t3002\\n' \"$1\" >&2\n"
+            "    printf 'PHASE:revoke\\n' >&2\n"
+            "    printf 'The temporary key could not be revoked.\\n' >&2\n"
+            "    return 1\n"
+            "  fi\n"
+            "  printf 'NODE-IDENTITY:%s\\t203.0.113.7\\t3002\\n' \"$1\" >&2\n"
+            "  return 0\n"
+            "}\n"
+        )
+        extra = (
+            "_retry_diagnostics() { [[ \"$1\" == worker-bad ]]; }\n"
+            "wizard_panel_inventory_names() { "
+            "printf 'worker-bad\\t203.0.113.7\\t3002\\tuuid-worker-bad\\n'; }\n"
+        )
+        result, _survived = self.onboard(
+            {"worker-ok": True, "worker-bad": False}, callee=callee, extra=extra,
+            stdin="1\ny\n2\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "  worker-bad: failed (phase: revoke, reason: registered in the Panel as "
+            "uuid-worker-bad at 203.0.113.7:3002; The temporary key could not be revoked.)",
+            result.stdout,
+            "a registration left behind by a failed cleanup was not reported",
+        )
+        self.assertIn(
+            "Retry kept the registration the failed attempt made: the Panel holds "
+            "worker-bad at 203.0.113.7:3002 (uuid uuid-worker-bad), so the node was "
+            "not registered again.",
+            result.stdout,
+        )
+        self.assertEqual(result.stdout.count("ONBOARD:worker-bad"), 1,
+                         "the retry registered a node the Panel already held")
+        after = result.stdout.split("Retry kept the registration", 1)[1]
+        self.assertIn("worker-bad: failed (phase: revoke", after,
+                      "the retried row lost the stage that failed")
+        self.assertIn("Registered and verified in the Panel: 1 of 2.", after)
+        self.assertIn("RC=2", result.stdout,
+                      "a pending cleanup was reported as a completed run")
 
     def test_a_panel_that_does_not_list_the_node_fails_it_at_the_verify_step(self):
         # `node add` exited 0, but the Panel's own list is the authority: the
         # registration is reported against the stage that did not hold, not as
         # a success that only a process exit code supports.
         verifier = "wizard_verify_node_registration() { printf 'missing'; return 1; }\n"
-        result, _survived = self.onboard({"worker-ok": True, "worker-bad": True}, verifier=verifier)
+        result, _survived = self.onboard({"worker-ok": True, "worker-bad": True},
+                                         verifier=verifier, stdin="3\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("RC=1", result.stdout)
+        self.assertIn("RC=2", result.stdout)
         self.assertIn(
             "  worker-ok: failed (phase: verify, reason: the Panel's node list does not hold this node)",
             result.stdout,
@@ -1195,19 +1570,28 @@ class TestOnboardingOutcomes(unittest.TestCase):
             result.stdout,
         )
 
-    def test_an_unreadable_panel_is_reported_as_unconfirmed_not_as_a_failure(self):
-        # A remote Panel's token is not this host's to hold: nothing about the
-        # node was disproved, so the run keeps its clean exit code and says so.
+    def test_an_unreadable_panel_leaves_the_run_nonzero_but_not_failed(self):
+        # A remote Panel's token is not this host's to hold: nothing is
+        # disproved, so no node is reported as failed and no retry is offered.
+        # An unconfirmed registration is still not readiness, though, so the
+        # run exits with the partial code and says what would clear it.
         verifier = "wizard_verify_node_registration() { return 2; }\n"
         result, _survived = self.onboard({"worker-ok": True, "worker-bad": True}, verifier=verifier)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("RC=0", result.stdout)
+        self.assertIn("RC=2", result.stdout)
         self.assertIn(
             "  worker-ok: registered; a Panel on another host cannot confirm it from here",
             result.stdout,
         )
         self.assertIn("Registered and verified in the Panel: 0 of 2.", result.stdout)
+        self.assertIn(
+            "The Panel did not answer its own node list from this host, so these nodes are "
+            "registered but unconfirmed.",
+            result.stdout,
+            "an unconfirmed run did not name what would clear it",
+        )
         self.assertNotIn("Some nodes failed", result.stdout)
+        self.assertNotIn("failed (phase:", result.stdout)
 
     def test_the_scratch_directory_never_widens_to_its_parent(self):
         # The cleanup helper removes the directory it is handed. Handing it the
@@ -1242,6 +1626,1214 @@ class TestOnboardingOutcomes(unittest.TestCase):
                          f"the caller's scratch file was deleted: {result.stderr}")
         self.assertIn("phase: scan", result.stdout)
         self.assertIn("reason: Could not read the SSH host key.", result.stdout)
+
+
+# The stored draft as the fields the resume tests assert on. Each printer reads
+# the document back out of the store, so the answer comes from what a later
+# process would load, not from what this one holds in memory.
+DUMP_STORED_REVIEW = (
+    "draft_load | python3 -c 'import json, sys\n"
+    "document = json.load(sys.stdin)\n"
+    "print(\"reviewed=%s\" % (\"yes\" if document[\"reviewed_digest\"] else \"no\"))\n"
+    "print(\"operation=%s\" % document[\"operation_id\"])\n"
+    "print(\"panel=%s\" % document[\"answers\"].get(\"primary_domain\", \"\"))\n"
+    "'\n"
+)
+DUMP_STORED_CHECKPOINTS = (
+    "draft_load | python3 -c 'import json, sys\n"
+    "document = json.load(sys.stdin)\n"
+    "for identity in sorted(document[\"checkpoints\"]):\n"
+    "    print(\"checkpoint=%s:%s\" % (identity,"
+    " document[\"checkpoints\"][identity].get(\"state\", \"missing\")))\n"
+    "'\n"
+)
+
+
+def stored_values(stdout):
+    """The `key=value` lines a draft printer wrote, without the node rows."""
+    values = {}
+    for line in stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key not in {"node", "node_label"}:
+            values[key] = value
+    return values
+
+
+class TestDeploymentDraftPersistence(unittest.TestCase):
+    """The draft across processes: restored answers, review and abandonment.
+
+    A draft exists to outlive a process, so every case here reads in one shell
+    what another shell wrote. The second process is the evidence: it has never
+    seen the plan variables, and everything it prints comes from the store.
+    """
+
+    PLAN = (
+        "GOWAVE_PLAN_VARIANT=multi-node\n"
+        "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+        "GOWAVE_PLAN_CAMOUFLAGE_NAME=cdn.example.com\n"
+        "GOWAVE_PLAN_EMAIL=admin@example.com\n"
+        "GOWAVE_PLAN_LOCAL_LABEL=local-01\n"
+        "GOWAVE_PLAN_NODE_COUNT=2\n"
+        "GOWAVE_PLAN_NODE_NAMES=('worker-a.example.com' 'worker-b.example.com')\n"
+        "GOWAVE_PLAN_NODE_CAMOUFLAGE=('cam-a.example.com' 'cam-b.example.com')\n"
+        "GOWAVE_PLAN_NODE_VISION=('' 'vision-b.example.com')\n"
+        "GOWAVE_PLAN_NODE_LABELS=('ams-01' 'fra-01')\n"
+    )
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        # A directory the store creates itself, so the ownership and permission
+        # rules are exercised rather than bypassed by a mkdir in the test.
+        self.path = str(Path(self.directory) / "deployment" / "active.json")
+
+    def run_wizard(self, script, stdin=""):
+        return bash(
+            SOURCE_WIZARD + script,
+            stdin=stdin,
+            env={"GOWAVE_DRAFT_PATH": self.path, "GOWAVE_WIZARD_LANG": "en"},
+        )
+
+    def test_a_new_process_restores_the_answers_and_the_review(self):
+        saved = self.run_wizard(self.PLAN + "draft_save_plan --reviewed\n")
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+
+        restored = self.run_wizard(
+            "draft_restore_saved || { printf 'RESTORE_FAILED\\n'; exit 1; }\n"
+            "printf 'operation=%s\\n' \"$GOWAVE_DRAFT_OPERATION\"\n"
+            "printf 'reviewed=%s\\n' \"$GOWAVE_DRAFT_REVIEWED\"\n"
+            + DUMP_PLAN
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        values = stored_values(restored.stdout)
+        self.assertEqual(values["variant"], "multi-node")
+        self.assertEqual(values["panel"], "panel.example.com")
+        self.assertEqual(values["camouflage"], "cdn.example.com")
+        self.assertEqual(values["email"], "admin@example.com")
+        self.assertEqual(values["local_label"], "local-01")
+        self.assertEqual(values["node_count"], "2")
+        self.assertIn("worker-a.example.com|cam-a.example.com|", restored.stdout)
+        self.assertIn("worker-b.example.com|cam-b.example.com|vision-b.example.com", restored.stdout)
+        self.assertEqual(values["reviewed"], "yes",
+                         "a plan saved as authorized was restored without its review")
+        self.assertRegex(values["operation"], r"^[0-9a-f]{32}$")
+
+        stored = self.run_wizard(DUMP_STORED_REVIEW)
+        self.assertEqual(stored_values(stored.stdout)["reviewed"], "yes")
+
+    def test_an_edit_after_review_withdraws_only_the_authorization(self):
+        # The same draft keeps its operation id, so the edit is a correction of
+        # the plan the operator started, not a second deployment beside it. What
+        # it loses is the authorization: exactly these answers were approved,
+        # and these are no longer them.
+        first = self.run_wizard(
+            self.PLAN + "draft_save_plan --reviewed\n" + DUMP_STORED_REVIEW
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        approved = stored_values(first.stdout)
+        self.assertEqual(approved["reviewed"], "yes")
+
+        edited = self.run_wizard(
+            "draft_restore_saved || exit 1\n"
+            "GOWAVE_PLAN_EMAIL=other@example.com\n"
+            "draft_save_plan || exit 1\n"
+        )
+        self.assertEqual(edited.returncode, 0, edited.stderr)
+
+        after = self.run_wizard(DUMP_STORED_REVIEW)
+        values = stored_values(after.stdout)
+        self.assertEqual(values["operation"], approved["operation"],
+                         "an edit started a second deployment beside the saved plan")
+        self.assertEqual(values["reviewed"], "no",
+                         "an edited plan kept the authorization of the answers it replaced")
+
+    def test_abandoning_forgets_the_draft_and_keeps_working_without_one(self):
+        saved = self.run_wizard(self.PLAN + "draft_save_plan --reviewed\n")
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+
+        abandoned = self.run_wizard(
+            self.PLAN
+            + "draft_abandon\n"
+            "draft_abandon\n"  # idempotent: nothing to forget the second time
+            "if draft_load >/dev/null 2>&1; then printf 'LOADED\\n'; else printf 'ABSENT\\n'; fi\n"
+            "[[ -f \"$GOWAVE_DRAFT_PATH\" ]] && printf 'FILE=%s\\n' \"$GOWAVE_DRAFT_PATH\"\n"
+            "printf 'still_planned=%s\\n' \"$GOWAVE_PLAN_VARIANT\"\n"
+        )
+        self.assertEqual(abandoned.returncode, 0, abandoned.stderr)
+        self.assertIn("ABSENT", abandoned.stdout)
+        self.assertNotIn("FILE=", abandoned.stdout,
+                         "abandoning left the draft it was told to forget")
+        # Abandoning a plan is not a reset of the answers in hand and not an
+        # uninstall: nothing here removes anything but the draft.
+        self.assertIn("still_planned=multi-node", abandoned.stdout)
+
+    def test_a_draft_from_another_installer_revision_is_refused_rather_than_used(self):
+        # A resume after an upgrade that changed the plan vocabulary cannot mean
+        # what the saved answers meant. The store refuses to rewrite the draft,
+        # so the resume has to refuse to restore it: accepting answers it could
+        # never save would lose them silently at the end of the collection.
+        saved = self.run_wizard(
+            self.PLAN + "GOWAVE_INSTALLER_REVISION=rev-a draft_save_plan\n"
+        )
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+
+        moved = self.run_wizard(
+            "GOWAVE_INSTALLER_REVISION=rev-b\n"
+            + self.PLAN
+            + "if draft_save_plan >/dev/null 2>&1; then printf 'SAVED\\n'; else printf 'REFUSED\\n'; fi\n"
+            "rc=0\n"
+            "wizard_collect_plan >/dev/null || rc=$?\n"
+            "printf 'COLLECT_RC=%d\\n' \"$rc\"\n"
+        )
+        self.assertEqual(moved.returncode, 0, moved.stderr)
+        self.assertIn("REFUSED", moved.stdout)
+        self.assertIn("rev-a", moved.stderr)
+        self.assertIn("Use the original installer revision", moved.stderr)
+        self.assertIn("COLLECT_RC=1", moved.stdout)
+        self.assertNotIn("Select deployment scheme", moved.stderr)
+        self.assertNotIn("Saved plan restored", moved.stderr)
+        stored = self.run_wizard(DUMP_STORED_REVIEW)
+        self.assertEqual(stored_values(stored.stdout)["panel"], "panel.example.com",
+                         "a refused resume changed the plan the other revision saved")
+
+    def test_an_unsupported_draft_schema_is_preserved_and_stops_collection(self):
+        self.assertEqual(self.run_wizard(self.PLAN + "draft_save_plan\n").returncode, 0)
+        path = Path(self.path)
+        draft = path.read_text(encoding="utf-8")
+        self.assertIn('"schema_version": 1', draft)
+        unsupported = draft.replace('"schema_version": 1', '"schema_version": 99')
+        path.write_text(unsupported, encoding="utf-8")
+        result = self.run_wizard("wizard_collect_plan\n", stdin="2\n3\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("check its permissions and schema", result.stderr)
+        self.assertNotIn("Select deployment scheme", result.stderr)
+        self.assertEqual(path.read_text(encoding="utf-8"), unsupported)
+
+
+class TestResumedCollection(unittest.TestCase):
+    """wizard_collect_plan over a saved plan: only the unanswered questions.
+
+    The resumed run is driven with an answer list that omits everything the
+    draft already holds. If a question were asked again its answer would be the
+    next line, so the collected plan is what says which questions were asked —
+    and the prompts on stderr say it directly.
+    """
+
+    PANEL = (
+        "GOWAVE_PLAN_VARIANT=multi-node\n"
+        "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+        "GOWAVE_PLAN_CAMOUFLAGE_NAME=cdn.example.com\n"
+    )
+    RESTORED = "Saved plan restored. Only the questions it never answered are asked."
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.path = str(Path(self.directory) / "deployment" / "active.json")
+        self.resolver = write_resolver(self.directory)
+
+    def run_wizard(self, script, stdin=""):
+        return bash(
+            SOURCE_WIZARD + script,
+            stdin=stdin,
+            env={
+                "GOWAVE_DRAFT_PATH": self.path,
+                "GOWAVE_WIZARD_LANG": "en",
+                "GOWAVE_WIZARD_RESOLVER": self.resolver,
+            },
+        )
+
+    def seed(self, plan):
+        result = self.run_wizard(plan + "draft_save_plan\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def collect(self, answers):
+        # The collection's own stdout is kept apart: it carries the summary the
+        # operator reads, whose rows include `panel=…`, and the review menu. Only
+        # the plan dump below is parsed as data.
+        out = str(Path(self.directory) / "collect.out")
+        return self.run_wizard(
+            "rc=0\n"
+            f"wizard_collect_plan >{shlex.quote(out)} || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            f"if grep -q 'Saved plan restored' {shlex.quote(out)}; then"
+            " printf 'restored=yes\\n'; else printf 'restored=no\\n'; fi\n"
+            + DUMP_PLAN
+            + DUMP_STORED_REVIEW,
+            stdin=answers,
+        )
+
+    def test_a_resumed_run_asks_only_for_what_the_draft_never_answered(self):
+        self.seed(self.PANEL)
+        result = self.collect(
+            "1\n"                       # continue the saved plan
+            "local-01\n"                # the label the draft never reached
+            "admin@example.com\n"       # the contact the draft never reached
+            "1\n"                       # the node count the draft never reached
+            "worker-a.example.com\n"
+            "cam-a.example.com\n"
+            "n\n"                       # this node gets no Vision
+            "ams-01\n"
+            "n\n"                       # separate certificate names
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        self.assertEqual(values["variant"], "multi-node")
+        self.assertEqual(values["panel"], "panel.example.com",
+                         "the restored Panel answer was asked again and replaced")
+        self.assertEqual(values["camouflage"], "cdn.example.com")
+        self.assertEqual(values["email"], "admin@example.com")
+        self.assertEqual(values["local_label"], "local-01")
+        self.assertIn("worker-a.example.com|cam-a.example.com|", result.stdout)
+        self.assertEqual(values["restored"], "yes",
+                         "the operator was not told the saved plan was being continued")
+        self.assertNotIn("Panel domain (", result.stderr,
+                         "a resumed run asked a Panel question the draft answered")
+        self.assertNotIn("Select deployment scheme", result.stderr)
+        # The review the resumed run reached is recorded against these answers,
+        # so the install that follows is authorized work rather than a plan
+        # nobody approved after the interruption.
+        self.assertEqual(values["reviewed"], "yes")
+
+    def test_starting_over_asks_the_whole_card_and_stores_the_new_plan(self):
+        self.seed(self.PANEL + "GOWAVE_PLAN_EMAIL=saved@example.com\n")
+        result = self.collect(
+            "2\n"                       # start over
+            "3\n"                       # multi-node, asked because nothing is saved now
+            "new-panel.example.com\n"
+            "new-cdn.example.com\n"
+            "n\n"
+            "local-02\n"
+            "new@example.com\n"
+            "1\n"
+            "new-node.example.com\n"
+            "new-cam.example.com\n"
+            "n\n"
+            "new-01\n"
+            "n\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        self.assertEqual(values["panel"], "new-panel.example.com",
+                         "starting over kept an answer from the abandoned plan")
+        self.assertEqual(values["local_label"], "local-02")
+        self.assertIn("new-node.example.com|new-cam.example.com|", result.stdout)
+        self.assertIn("Select deployment scheme", result.stderr,
+                      "starting over did not ask from the beginning")
+        self.assertNotIn("saved@example.com", result.stdout)
+        # What the next process would load is the new plan, not a merge.
+        self.assertEqual(values["panel"], "new-panel.example.com")
+
+    def test_starting_over_forgets_the_saved_plan_before_answering_anything(self):
+        # The menu line says the saved plan is forgotten, so it has to be gone
+        # by the time the operator answers the next question. A run that stops at
+        # that question is what tells the two apart: if the draft only vanished
+        # when collection later saved, the old plan would still be on disk here
+        # and the next process would offer it again as if nothing was chosen.
+        self.seed(self.PANEL)
+        result = self.run_wizard(
+            "rc=0\n"
+            "wizard_collect_plan >/dev/null || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            "if draft_load >/dev/null 2>&1; then printf 'LOADED\\n'; else printf 'ABSENT\\n'; fi\n",
+            stdin="2\n",  # start over; the scheme question then hits EOF
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "1", "collection did not stop where the answers did")
+        self.assertIn("ABSENT", result.stdout,
+                      "the forgotten plan was still stored after starting over")
+
+    def test_leaving_the_menu_keeps_the_draft_and_asks_nothing(self):
+        self.seed(self.PANEL)
+        result = self.run_wizard(
+            "rc=0\n"
+            "wizard_collect_plan >/dev/null || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_REVIEW,
+            stdin="3\n",  # leave; nothing is collected
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "3",
+                         "leaving the resume menu was not distinguishable from collecting")
+        self.assertEqual(values["panel"], "panel.example.com",
+                         "leaving the menu discarded a draft the operator did not abandon")
+        self.assertNotIn("Panel domain (", result.stderr)
+
+
+class TestResumedOnboarding(unittest.TestCase):
+    """wizard_onboard_nodes on a resumed plan: verify what stands, build the rest.
+
+    The SSH hop and the Panel readback are the two boundaries this needs a
+    second host for, so both are stubbed; what the test reads is how often each
+    one was reached. A node the draft recorded as verified costs no SSH session,
+    including when the Panel contradicts the record. Only pending siblings
+    go through onboarding.
+    """
+
+    PLAN = (
+        "GOWAVE_PLAN_VARIANT=multi-node\n"
+        "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+        "GOWAVE_PLAN_NODE_NAMES=('ok.example.com' 'bad.example.com')\n"
+        "GOWAVE_PLAN_NODE_CAMOUFLAGE=('cam-ok.example.com' 'cam-bad.example.com')\n"
+        "GOWAVE_PLAN_NODE_VISION=('' '')\n"
+        "GOWAVE_PLAN_NODE_LABELS=('ok-01' 'bad-01')\n"
+    )
+    # The Panel issues canonical UUIDs and the draft schema stores nothing less,
+    # so the stubs answer with the shape a real registration produces.
+    OK_UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    BAD_UUID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    ONBOARD = (
+        "ssh_bootstrap_onboard_one() {\n"
+        "  printf 'ONBOARD:%s\\n' \"$1\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+        "  printf 'NODE-IDENTITY:%s\\t203.0.113.7\\t3002\\n' \"$4\" >&2\n"
+        "  return 0\n"
+        "}\n"
+    )
+    # The readback answers by name: the recheck asks with no address because the
+    # draft stores none, and the onboarding asks with the identity it just made.
+    VERIFIER = (
+        "wizard_verify_node_registration() {\n"
+        "  printf 'VERIFY:%s:%s:%s\\n' \"$1\" \"$2\" \"$3\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+        "  case \"$1\" in\n"
+        "    ok-01) printf '%s' \"$OK_UUID\" ;;\n"
+        "    *) printf '%s' \"$BAD_UUID\" ;;\n"
+        "  esac\n"
+        "  return 0\n"
+        "}\n"
+    )
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.path = str(Path(self.directory) / "deployment" / "active.json")
+        self.log = str(Path(self.directory) / "calls.log")
+        Path(self.log).write_text("", encoding="utf-8")
+
+    def run_wizard(self, script, stdin=""):
+        return bash(
+            "source " + shlex.quote(str(I18N_SH)) + "\n"
+            "source " + shlex.quote(str(REPO_ROOT / "modules" / "tempdir.sh")) + "\n"
+            + SOURCE_WIZARD + script,
+            stdin=stdin,
+            env={
+                "GOWAVE_DRAFT_PATH": self.path,
+                "GOWAVE_DRAFT_LOG": self.log,
+                "OK_UUID": self.OK_UUID,
+                "BAD_UUID": self.BAD_UUID,
+            },
+        )
+
+    def seed(self, checkpoints):
+        """Write the plan and the verdicts an interrupted run left behind."""
+        lines = [self.PLAN, "draft_save_plan\n"]
+        for identity, record in checkpoints.items():
+            arguments = " ".join(shlex.quote(field) for field in record.split())
+            lines.append(f"draft_checkpoint {identity} {arguments}\n")
+        result = self.run_wizard("".join(lines))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def batch(self, verifier):
+        return self.run_wizard(
+            "GOWAVE_STATE_DIR=$(mktemp -d)\n"
+            "track_temp_dir \"$GOWAVE_STATE_DIR\"\n"
+            + self.PLAN
+            + "GOWAVE_DRAFT_RESUMED=1\n"
+            + self.ONBOARD
+            + 'wizard_panel_inventory_names() { [[ $# == 4 ]]; }\n'
+            + 'verify_public_tls_sni() { return 0; }\n'
+            + 'verify_worker_security_readback() { return 0; }\n'
+            + verifier
+            + "set +e\n"
+            "wizard_onboard_nodes\n"
+            "rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_CHECKPOINTS,
+            stdin="3\n",
+        )
+
+    def calls(self):
+        return Path(self.log).read_text(encoding="utf-8").splitlines()
+
+    def test_a_recorded_node_is_rechecked_by_name_and_not_onboarded_again(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": "pending registration 0"})
+        result = self.batch(self.VERIFIER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        calls = self.calls()
+        self.assertNotIn("ONBOARD:ok.example.com", calls,
+                         "a node the Panel still held was onboarded a second time")
+        self.assertEqual(calls.count("ONBOARD:bad.example.com"), 1)
+        # The recheck compared the name the Panel registered. The draft stores
+        # no address, so the readback is asked by name rather than by a guess.
+        self.assertEqual(calls.count("VERIFY:ok-01::"), 1,
+                         f"the recheck invented an address to compare: {calls}")
+        self.assertIn(
+            f"ok.example.com: registered and verified in the Panel (uuid {self.OK_UUID})",
+            result.stdout,
+        )
+        self.assertIn("Registered and verified in the Panel: 2 of 2.", result.stdout)
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+
+    def test_a_missing_recorded_node_does_not_block_its_pending_sibling(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": "pending registration 0"})
+        result = self.batch(
+            "wizard_verify_node_registration() {\n"
+            "  printf 'VERIFY:%s:%s\\n' \"$1\" \"$2\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+            "  if [[ \"$1\" == ok-01 ]]; then return 1; fi\n"
+            "  printf '%s' \"$BAD_UUID\"\n"
+            "}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2")
+        self.assertEqual(self.calls(), ["VERIFY:ok-01:", "ONBOARD:bad.example.com",
+                                        "VERIFY:bad-01:203.0.113.7"])
+        self.assertIn("recorded identity could not be confirmed", result.stdout)
+        self.assertIn("checkpoint=node-1:indeterminate", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+
+    def test_an_unreadable_panel_keeps_the_record_and_opens_no_ssh(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": "pending registration 0"})
+        result = self.batch(
+            "wizard_verify_node_registration() {\n"
+            "  printf 'VERIFY:%s:%s\n' \"$1\" \"$2\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+            "  if [[ \"$1\" == ok-01 && -z \"$2\" ]]; then return 2; fi\n"
+            "  printf '%s' \"$BAD_UUID\"\n"
+            "  return 0\n"
+            "}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2",
+                         "an unconfirmed node was reported as a completed run")
+        calls = self.calls()
+        self.assertNotIn("ONBOARD:ok.example.com", calls,
+                         "a node was rebuilt because a remote Panel could not be read")
+        self.assertIn("checkpoint=node-1:indeterminate", result.stdout,
+                      "an unreadable Panel overwrote the record it could not check")
+        self.assertIn(
+            "ok.example.com: registered; a Panel on another host cannot confirm it from here",
+            result.stdout,
+        )
+
+    def test_resume_review_protects_recorded_identities_but_allows_pending_edits(self):
+        self.seed({"panel": "verified complete 1", "node-2": f"indeterminate verification 1 {self.BAD_UUID}"})
+        result = self.run_wizard(
+            self.PLAN
+            + 'GOWAVE_DRAFT_RESUMED=1\nGOWAVE_PLAN_NODE_COUNT=2\n'
+              'for edit in "panel_domain new.example.com" "node_label_1 new-label" "node_count 1"; do\n'
+              '    read -r field value <<< "$edit"\n'
+              '    if _wizard_review_apply "$field" "$value"; then exit 9; fi\n'
+              'done\n'
+              '_wizard_review_apply node_label_0 pending-label\n'
+              'printf "%s:%s:%s:%s\\n" "$GOWAVE_PLAN_PANEL_NAME" "${GOWAVE_PLAN_NODE_LABELS[@]}" "$GOWAVE_PLAN_NODE_COUNT"\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("panel.example.com:pending-label:bad-01:2", result.stdout)
+        self.assertEqual(result.stderr.count("already recorded by deployment"), 3)
+
+    def test_matching_uuid_does_not_hide_changed_host_associations(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": f"verified complete 1 {self.BAD_UUID}"})
+        result = self.batch(
+            self.VERIFIER
+            + 'wizard_panel_inventory_names() { [[ "$4" == "$BAD_UUID" ]]; }\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2")
+        self.assertEqual(self.calls(), ["VERIFY:ok-01::", "VERIFY:bad-01::"])
+        self.assertIn("checkpoint=node-1:indeterminate", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+
+    def test_failed_worker_tls_stops_only_that_worker(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": f"verified complete 1 {self.BAD_UUID}"})
+        result = self.batch(
+            self.VERIFIER
+            + 'verify_public_tls_sni() { printf "TLS:%s:%s:%s\\n" "$1" "$2" "$3" >> "$GOWAVE_DRAFT_LOG";'
+              ' [[ "$1" != cam-ok.example.com ]]; }\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2")
+        self.assertIn("did not pass TLS verification", result.stdout)
+        self.assertNotIn("The Panel did not answer its own node list", result.stdout)
+        self.assertIn("checkpoint=node-1:indeterminate", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+        self.assertEqual(self.calls(), [
+            "VERIFY:ok-01::", "TLS:ok.example.com:ok.example.com:443:1",
+            "TLS:cam-ok.example.com:ok.example.com:443:1", "VERIFY:bad-01::",
+            "TLS:bad.example.com:bad.example.com:443:1", "TLS:cam-bad.example.com:bad.example.com:443:1",
+        ])
+
+    def test_failed_security_readback_does_not_reinstall_completed_workers(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": f"verified complete 1 {self.BAD_UUID}"})
+        result = self.batch(
+            self.VERIFIER
+            + 'verify_worker_security_readback() { [[ "$1" == bad.example.com ]]; }\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2")
+        self.assertIn("could not confirm Worker security", result.stdout)
+        self.assertIn("checkpoint=node-1:indeterminate", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+        self.assertEqual(self.calls(), ["VERIFY:ok-01::", "VERIFY:bad-01::"])
+
+    def test_a_changed_uuid_is_not_adopted_on_this_or_the_next_resume(self):
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": f"verified complete 1 {self.BAD_UUID}"})
+        verifier = self.VERIFIER.replace('"$OK_UUID"', '"$BAD_UUID"')
+        for _ in range(2):
+            result = self.batch(verifier)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(stored_values(result.stdout)["RC"], "2")
+            self.assertIn("checkpoint=node-1:indeterminate", result.stdout)
+            self.assertIn("checkpoint=node-2:verified", result.stdout)
+        self.assertEqual(self.calls(), ["VERIFY:ok-01::", "VERIFY:bad-01::"] * 2)
+        persisted = self.run_wizard("draft_checkpoint_field node-1 node_uuid\n")
+        self.assertEqual(persisted.returncode, 0, persisted.stderr)
+        self.assertEqual(persisted.stdout, self.OK_UUID)
+
+    def test_the_recheck_is_not_attempted_for_a_plan_that_was_not_resumed(self):
+        # A fresh install has no reason to read a draft: the checkpoints of an
+        # abandoned plan must not decide anything about this run.
+        self.seed({"node-1": f"verified complete 1 {self.OK_UUID}",
+                   "node-2": "pending registration 0"})
+        result = self.run_wizard(
+            "GOWAVE_STATE_DIR=$(mktemp -d)\n"
+            "track_temp_dir \"$GOWAVE_STATE_DIR\"\n"
+            + self.PLAN
+            + self.ONBOARD
+            + self.VERIFIER
+            + "set +e\nwizard_onboard_nodes >/dev/null\nrc=$?\nprintf 'RC=%d\\n' \"$rc\"\n",
+            stdin="3\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RC=0", result.stdout)
+        calls = self.calls()
+        self.assertEqual(calls.count("ONBOARD:ok.example.com"), 1,
+                         "a fresh install read a stored checkpoint as progress")
+        self.assertEqual(calls.count("ONBOARD:bad.example.com"), 1)
+
+
+class TestResumePanelReuse(unittest.TestCase):
+    """The install's resumed Panel: read it back, or install it as pending work.
+
+    The entrypoint is sourced — it ends with a sourcing guard, so the CLI router
+    below it never runs — and each readback is replaced one at a time. What the
+    cases read is the install's own decision: which readbacks were reached, what
+    the checkpoint became, and which code the run leaves with.
+    """
+
+    READBACKS = (
+        "preflight_require_direct_dns() { printf 'dns\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+        "bootstrap_early_tools() { return 0; }\n"
+        "verify_panel_startup() { printf 'startup\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+        "verify_public_tls_sni() { printf 'sni\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+        "extract_secret_key() { printf 'secret'; return 0; }\n"
+        "verify_node_mtls_health() { printf 'mtls\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+        "wizard_panel_inventory_names() { if [[ $# == 2 ]]; then"
+        " printf 'local-node\\t127.0.0.1\\t3002\\taaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\\n'; fi; }\n"
+        "write_security_report() { printf 'report\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+    )
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.path = str(Path(self.directory) / "deployment" / "active.json")
+        self.log = str(Path(self.directory) / "calls.log")
+        Path(self.log).write_text("", encoding="utf-8")
+
+    def run_install(self, script):
+        return bash(
+            "source " + shlex.quote(str(GOWAVE_AUTO)) + "\n"
+            "trap - ERR\nset +e\n"
+            # The wizard has collected a plan by the time the install runs, and
+            # a checkpoint is written only for a plan: the variable is what
+            # makes the store a participant rather than a no-op.
+            "GOWAVE_PLAN_VARIANT=multi-node\n"
+            + script,
+            env={"GOWAVE_DRAFT_PATH": self.path, "GOWAVE_DRAFT_LOG": self.log,
+                 # A draft written by another revision is not resumed, so the
+                 # resume cases pin the revision both the draft and the live
+                 # answer report.
+                 "GOWAVE_INSTALLER_REVISION": "test-1"},
+        )
+
+    def seed_panel(self, record="verified complete 1"):
+        result = self.run_install(
+            "GOWAVE_PLAN_VARIANT=multi-node\n"
+            "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+            "draft_save_plan\n"
+            f"draft_checkpoint panel {record}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def calls(self):
+        return Path(self.log).read_text(encoding="utf-8").splitlines()
+
+    def verify_panel(self, extra="", mode="all-in-one"):
+        return self.run_install(
+            self.READBACKS
+            # The Panel's record is reconciled by its own cases; these drive the
+            # surrounding readbacks, so the classifier is stubbed here.
+            + "resume_reconcile_panel_identity() { printf 'reconcile\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            + extra
+            + "rc=0\n"
+            f"resume_verify_panel panel.example.com {shlex.quote(mode)} || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+
+    def test_every_readback_agreeing_records_the_panel_and_the_local_node(self):
+        self.seed_panel()
+        result = self.verify_panel()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "0")
+        self.assertIn(
+            "Resume: the Panel this host serves is the one the saved plan recorded.",
+            result.stdout,
+        )
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+        self.assertIn("checkpoint=local-node:verified", result.stdout,
+                      "a Panel that answered every readback left its local node unrecorded")
+        self.assertEqual(self.calls(), ["dns", "startup", "sni", "mtls", "report", "reconcile"],
+                         "the verification did not run the readbacks the checkpoint describes")
+
+    def test_a_panel_that_stopped_answering_fails_the_verification(self):
+        self.seed_panel()
+        result = self.verify_panel(
+            "verify_public_tls_sni() { printf 'sni\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 1; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertNotIn("checkpoint=local-node", result.stdout,
+                         "a Panel that did not serve its own SNI was recorded as verified")
+        self.assertEqual(self.calls(), ["dns", "startup", "sni"],
+                         "the verification went on after a readback disagreed")
+
+    def test_panel_only_accepts_an_authenticated_empty_inventory(self):
+        self.seed_panel()
+        result = self.verify_panel(
+            "wizard_panel_inventory_names() { return 0; }\n", mode="panel-only"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "0")
+        self.assertNotIn("checkpoint=local-node", result.stdout)
+        self.assertEqual(self.calls(), ["dns", "startup", "sni", "report", "reconcile"])
+
+    def test_an_all_in_one_panel_that_answers_with_no_nodes_is_not_verified(self):
+        # The node list is the readback that proves the credentials in this
+        # host's file still read the Panel. An empty answer is not agreement.
+        self.seed_panel()
+        result = self.verify_panel(
+            "wizard_panel_inventory_names() { return 0; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("the Panel answered its node list with no nodes", result.stderr)
+
+    def test_all_in_one_does_not_mistake_a_remote_node_for_the_local_identity(self):
+        self.seed_panel()
+        result = self.verify_panel(
+            "wizard_panel_inventory_names() { printf 'local-node\\t203.0.113.7\\t3002\\taaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\\n'; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("the planned local node has an unexpected address, port or UUID", result.stderr)
+        self.assertNotIn("checkpoint=local-node", result.stdout)
+        self.assertEqual(self.calls(), ["dns", "startup", "sni", "mtls"])
+
+    def test_a_fresh_run_takes_no_resume_decision(self):
+        # Nothing was interrupted, so a draft that some other run left behind
+        # decides nothing about this one.
+        self.seed_panel()
+        result = self.run_install(
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+            "printf 'finish=%s\\n' \"$finish\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INSTALL", result.stdout)
+        self.assertIn("finish=-1", result.stdout)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_recorded_panel_is_checked_and_the_run_ends_there(self):
+        self.seed_panel()
+        result = self.run_install(
+            "GOWAVE_DRAFT_RESUMED=1\n"
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+            "printf 'finish=%s\\n' \"$finish\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REUSED", result.stdout)
+        self.assertIn("finish=0", result.stdout)
+        self.assertEqual(self.calls(), ["verify", "finish"],
+                         "a verified Panel was checked without being finished, or finished unchecked")
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+
+    def test_a_failed_panel_readback_blocks_reinstall_and_preserves_the_checkpoint(self):
+        self.seed_panel()
+        result = self.run_install(
+            "GOWAVE_DRAFT_RESUMED=1\nGOWAVE_WIZARD_LANG=en\n"
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 1; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+            "printf 'finish=%s\\n' \"$finish\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("INSTALL", result.stdout)
+        self.assertIn("finish=1", result.stdout)
+        self.assertIn("Check Panel health, DNS, TLS and the security report", result.stderr)
+        self.assertEqual(self.calls(), ["verify"])
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+
+    def test_an_unreachable_panel_is_reported_once_and_leaves_the_checkpoint(self):
+        # The reconciliation already named the unread Panel; the resume must not
+        # repeat it as a generic readback failure, and must not downgrade the
+        # record a later retry compares against.
+        self.seed_panel()
+        result = self.run_install(
+            "GOWAVE_DRAFT_RESUMED=1\nGOWAVE_WIZARD_LANG=en\n"
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 3; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+            "printf 'finish=%s\\n' \"$finish\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("finish=1", result.stdout)
+        self.assertNotIn("Check Panel health, DNS, TLS and the security report", result.stderr,
+                         "the unreachable verdict was repeated as a generic readback failure")
+        self.assertEqual(self.calls(), ["verify"])
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+
+    def test_a_checkpoint_that_was_never_verified_is_not_even_checked(self):
+        self.seed_panel("pending preflight 0")
+        result = self.run_install(
+            "GOWAVE_DRAFT_RESUMED=1\n"
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("INSTALL", result.stdout)
+        self.assertEqual(self.calls(), [],
+                         "a Panel with no verified record was checked as if it had one")
+
+    def test_a_node_batch_still_pending_keeps_its_code(self):
+        # 2 is the Panel serving with a node that still has work. Returning it
+        # is the answer; treating it as "not resumed" would install the Panel a
+        # second time over the one that just proved it was serving.
+        self.seed_panel()
+        result = self.run_install(
+            "GOWAVE_DRAFT_RESUMED=1\n"
+            "resume_verify_panel() { printf 'verify\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "install_finish() { printf 'finish\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 2; }\n"
+            "finish=-1\n"
+            "if resume_recorded_panel finish panel.example.com all-in-one; then printf 'REUSED\\n';"
+            " else printf 'INSTALL\\n'; fi\n"
+            "printf 'finish=%s\\n' \"$finish\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REUSED", result.stdout)
+        self.assertIn("finish=2", result.stdout,
+                      "a pending node batch was not carried as the run's own exit code")
+
+    def test_the_install_returns_the_code_the_resume_helper_produced(self):
+        # The install's first step after the migration gate is the helper. Its
+        # answer has to be this run's exit code: falling through would install a
+        # Panel the helper had just verified, and swallowing a 2 would report a
+        # pending node batch as a clean install.
+        result = self.run_install(
+            "acquire_lock() { :; }\n"
+            "preflight_require_inputs() { return 0; }\n"
+            "migration_confirm_existing() { return 0; }\n"
+            "preflight_require_direct_dns() { printf 'install\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 1; }\n"
+            "resume_recorded_panel() { local -n out=\"$1\"; out=2;"
+            " printf 'resume\\n' >> \"$GOWAVE_DRAFT_LOG\"; return 0; }\n"
+            "rc=0\n"
+            "cmd_install panel.example.com cdn.example.com admin@example.com || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RC=2", result.stdout)
+        self.assertEqual(self.calls(), ["resume"],
+                         "the install went on to install a Panel the resume helper had settled")
+
+    def test_resume_checks_the_journal_before_inspecting_or_mutating_the_panel(self):
+        self.seed_panel()
+        path = Path(self.directory) / "journal.json"
+        original_draft = Path(self.path).read_bytes()
+        for state, expected in (("NODE_ADD_VERIFYING", "1"),
+                                ("NODE_ADD_COMMITTED", "2"),
+                                ("invalid-private-value", "1")):
+            with self.subTest(state=state):
+                journal = (
+                    '{"op":"node_add","timestamp":1,"state":"' + state + '"}'
+                )
+                path.write_text(journal, encoding="utf-8")
+                Path(self.log).write_text("", encoding="utf-8")
+                result = self.run_install(
+                    f"JOURNAL_FILE={shlex.quote(str(path))}\n"
+                    "GOWAVE_DRAFT_RESUMED=1\nGOWAVE_WIZARD_LANG=en\n"
+                    "acquire_lock() { printf 'lock\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+                    "preflight_require_inputs() { return 0; }\n"
+                    "migration_confirm_existing() { printf 'inspect\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+                    "resume_recorded_panel() { local -n out=\"$1\"; out=2;"
+                    " printf 'resume\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+                    "rc=0\n"
+                    "cmd_install panel.example.com cdn.example.com admin@example.com || rc=$?\n"
+                    "printf 'RC=%d\\n' \"$rc\"\n"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(stored_values(result.stdout)["RC"], expected)
+                self.assertEqual(path.read_text(encoding="utf-8"), journal)
+                self.assertEqual(Path(self.path).read_bytes(), original_draft)
+                self.assertNotIn("invalid-private-value", result.stderr)
+                if expected == "1":
+                    self.assertIn("finish recovery before resuming", result.stderr)
+                    self.assertEqual(self.calls(), ["lock"])
+                else:
+                    self.assertEqual(self.calls(), ["lock", "inspect", "resume"])
+
+    # -- Resume reconciliation ------------------------------------------------
+    #
+    # A checkpoint is a verdict about a moment, so a resume compares the record
+    # with the Panel before it continues. These cases drive the shipped
+    # reconciliation with a draft, a state file and a Panel answer: a stopped
+    # component must not take its completed sibling with it, an unread Panel
+    # must write nothing, and a drifted component must be re-applied through
+    # the UUID the Panel issued rather than registered a second time.
+
+    OK_UUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    BAD_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    OTHER_UUID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    OK_PROFILE = "profile-ok"
+    BAD_PROFILE = "profile-bad"
+    OK_INBOUND = "inbound-ok"
+    BAD_INBOUND = "inbound-bad"
+    OK_HOST = "host-ok"
+    BAD_HOST = "host-bad"
+    NODE_PLAN = (
+        "GOWAVE_PLAN_VARIANT=multi-node\n"
+        "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+        "GOWAVE_PLAN_NODE_NAMES=('ok.example.com' 'bad.example.com')\n"
+        "GOWAVE_PLAN_NODE_CAMOUFLAGE=('cam-ok.example.com' 'cam-bad.example.com')\n"
+        "GOWAVE_PLAN_NODE_VISION=('' '')\n"
+        "GOWAVE_PLAN_NODE_LABELS=('ok-01' 'bad-01')\n"
+    )
+
+    def write_json(self, name, document):
+        path = Path(self.directory) / name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def seed_resume_plan(self):
+        result = self.run_install(
+            self.NODE_PLAN
+            + "draft_save_plan\n"
+            + f"draft_checkpoint node-1 verified complete 1 {self.OK_UUID}\n"
+            + f"draft_checkpoint node-2 verified complete 1 {self.BAD_UUID}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def resume_state(self):
+        return {
+            "schemaVersion": 2,
+            "installationMode": "multi-node",
+            "panelDomain": "panel.example.com",
+            "realityDomain": "cdn.example.com",
+            "squadUuid": "squad-ink",
+            "nodes": [
+                {"name": "ok-01", "address": "203.0.113.7", "port": 3002,
+                 "workerDomain": "ok.example.com", "realityDomain": "cam-ok.example.com",
+                 "uuid": self.OK_UUID, "profileUuid": self.OK_PROFILE,
+                 "hostUuids": [self.OK_HOST]},
+                {"name": "bad-01", "address": "203.0.113.8", "port": 3002,
+                 "workerDomain": "bad.example.com", "realityDomain": "cam-bad.example.com",
+                 "uuid": self.BAD_UUID, "profileUuid": self.BAD_PROFILE,
+                 "hostUuids": [self.BAD_HOST]},
+            ],
+        }
+
+    def live_document(self, ok_profile=None, bad_held=False):
+        ok_profile = ok_profile or self.OK_PROFILE
+        nodes = [{
+            "uuid": self.OK_UUID, "name": "ok-01",
+            "configProfile": {
+                "activeConfigProfileUuid": ok_profile,
+                "activeInbounds": [{"uuid": self.OK_INBOUND}],
+            },
+        }]
+        hosts = [{
+            "uuid": self.OK_HOST, "address": "ok.example.com", "sni": "cam-ok.example.com",
+            "inbound": {"configProfileUuid": self.OK_PROFILE,
+                        "configProfileInboundUuid": self.OK_INBOUND},
+            "nodes": [{"uuid": self.OK_UUID}],
+        }]
+        profiles = [{"uuid": self.OK_PROFILE, "inbounds": [self.OK_INBOUND]}]
+        if ok_profile != self.OK_PROFILE:
+            profiles.append({"uuid": ok_profile, "inbounds": [self.OK_INBOUND]})
+        if bad_held:
+            nodes.append({
+                "uuid": self.OTHER_UUID, "name": "bad-01",
+                "configProfile": {
+                    "activeConfigProfileUuid": self.BAD_PROFILE,
+                    "activeInbounds": [{"uuid": self.BAD_INBOUND}],
+                },
+            })
+        else:
+            nodes.append({
+                "uuid": self.BAD_UUID, "name": "bad-01",
+                "configProfile": {
+                    "activeConfigProfileUuid": self.BAD_PROFILE,
+                    "activeInbounds": [{"uuid": self.BAD_INBOUND}],
+                },
+            })
+            hosts.append({
+                "uuid": self.BAD_HOST, "address": "bad.example.com",
+                "sni": "cam-bad.example.com",
+                "inbound": {"configProfileUuid": self.BAD_PROFILE,
+                            "configProfileInboundUuid": self.BAD_INBOUND},
+                "nodes": [{"uuid": self.BAD_UUID}],
+            })
+        profiles.append({"uuid": self.BAD_PROFILE, "inbounds": [self.BAD_INBOUND]})
+        return {
+            "reachable": True, "schema_version": 2, "installer_revision": "test-1",
+            "nodes": nodes, "hosts": hosts, "profiles": profiles,
+        }
+
+    def reconcile(self, extra):
+        return self.run_install(
+            self.NODE_PLAN
+            + extra
+            + 'rc=0\n'
+            + "recovery_reconcile_resume_nodes || rc=$?\n"
+            + "printf 'RC=%d\\n' \"$rc\"\n"
+            + 'printf "stopped=%s\\n" "${RESUME_STOPPED_NODES[*]:-}"\n'
+            + 'printf "reapplied=%s\\n" "${RESUME_REAPPLIED_NODES[*]:-}"\n'
+            + "recovery_exclude_stopped_nodes\n"
+            + 'printf "names=%s\\n" "${GOWAVE_PLAN_NODE_NAMES[*]:-}"\n'
+            + 'printf "labels=%s\\n" "${GOWAVE_PLAN_NODE_LABELS[*]:-}"\n'
+            + DUMP_STORED_CHECKPOINTS
+        )
+
+    def test_a_pending_node_is_left_to_the_batch(self):
+        # A checkpoint that never reached a verdict is not reconciled: there is
+        # no identity to compare, and rewriting it here would fight the batch
+        # that is about to register it.
+        result = self.run_install(
+            self.NODE_PLAN
+            + "draft_save_plan\n"
+            + f"draft_checkpoint node-1 verified complete 1 {self.OK_UUID}\n"
+            + "draft_checkpoint node-2 pending registration 0\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state_path = self.write_json("state.json", self.resume_state())
+        live_path = self.write_json("live.json", self.live_document(bad_held=True))
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+        self.assertIn("checkpoint=node-2:pending", result.stdout)
+        self.assertNotIn("node-2", stored_values(result.stdout)["stopped"])
+
+    def test_a_stopped_component_keeps_its_completed_sibling(self):
+        self.seed_resume_plan()
+        state_path = self.write_json("state.json", self.resume_state())
+        live_path = self.write_json("live.json", self.live_document(bad_held=True))
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        self.assertEqual(values["stopped"], "node-2")
+        self.assertIn("checkpoint=node-1:verified", result.stdout,
+                      "a stopped sibling took the completed node with it")
+        self.assertIn("checkpoint=node-2:indeterminate", result.stdout)
+        self.assertIn("node-2 stopped;", result.stderr)
+        self.assertIn("held by UUID", result.stderr)
+        self.assertNotIn("node-1 stopped", result.stderr)
+        # The batch receives the completed sibling and not the stopped node.
+        self.assertEqual(values["names"], "ok.example.com")
+        self.assertEqual(values["labels"], "ok-01")
+
+    def test_an_unreachable_panel_leaves_the_draft_resumable(self):
+        self.seed_resume_plan()
+        draft_before = Path(self.path).read_bytes()
+        state_path = self.write_json("state.json", self.resume_state())
+        live_path = self.write_json("live.json", {"reachable": False, "error": "connection refused"})
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+            + "recovery_reapply_node() { printf 'REAPPLY\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "3",
+                         "an unread Panel was reported as a classified run")
+        self.assertEqual(result.stderr.count("did not answer the reconciliation readback"), 1,
+                         "the operator was told more than once about one readback")
+        self.assertEqual(Path(self.path).read_bytes(), draft_before,
+                         "an unread Panel rewrote the draft it could not check")
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+        self.assertNotIn("REAPPLY", self.calls())
+
+    def test_a_drifted_node_is_reapplied_and_never_registered_again(self):
+        self.seed_resume_plan()
+        state_path = self.write_json("state.json", self.resume_state())
+        drift_path = self.write_json("drift.json", self.live_document(ok_profile="profile-other"))
+        match_path = self.write_json("match.json", self.live_document())
+        counter = Path(self.directory) / "live-calls"
+        result = self.reconcile(
+            'GOWAVE_DRAFT_RESUMED=1\n'
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"LIVE_DRIFT={shlex.quote(str(drift_path))}\n"
+            f"LIVE_MATCH={shlex.quote(str(match_path))}\n"
+            f"LIVE_COUNTER={shlex.quote(str(counter))}\n"
+            "recovery_panel_live_state() {\n"
+            "  local count=0\n"
+            "  [[ -f \"$LIVE_COUNTER\" ]] && count=$(cat \"$LIVE_COUNTER\")\n"
+            "  count=$((count + 1))\n"
+            "  printf '%s' \"$count\" > \"$LIVE_COUNTER\"\n"
+            "  if (( count == 1 )); then cat \"$LIVE_DRIFT\"; else cat \"$LIVE_MATCH\"; fi\n"
+            "}\n"
+            "recovery_reapply_node() {\n"
+            "  printf 'REAPPLY:%s:%s\\n' \"$1\" \"$2\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+            "  return 0\n"
+            "}\n"
+            "ssh_bootstrap_onboard_one() { printf 'ONBOARD\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = stored_values(result.stdout)
+        self.assertEqual(values["RC"], "0")
+        self.assertEqual(values["reapplied"], "node-1")
+        self.assertEqual(values["stopped"], "")
+        self.assertEqual(self.calls(), [f"REAPPLY:{self.OK_UUID}:{self.OK_PROFILE}"],
+                         "the drift was repaired by registering or onboarding instead of "
+                         "writing through the recorded UUID")
+        self.assertIn("checkpoint=node-1:verified", result.stdout)
+        self.assertIn("checkpoint=node-2:verified", result.stdout)
+
+    def test_install_finish_holds_a_stopped_node_out_of_the_batch(self):
+        result = self.run_install(
+            self.NODE_PLAN
+            + "GOWAVE_DRAFT_RESUMED=1\n"
+            + "RESUME_STOPPED_NODES=(node-2)\n"
+            + "recovery_reconcile_resume_nodes() { return 0; }\n"
+            + "wizard_panel_installed_notice() { :; }\n"
+            + "cmd_user_links() { :; }\n"
+            + "aggregate_worker_security_reports() { return 0; }\n"
+            + "wizard_onboard_nodes() {\n"
+            + "  printf 'ONBOARD:%s\\n' \"${GOWAVE_PLAN_NODE_NAMES[*]}\" >> \"$GOWAVE_DRAFT_LOG\"\n"
+            + "  return 0\n"
+            + "}\n"
+            + "rc=0\ninstall_finish panel.example.com admin || rc=$?\n"
+            + "printf 'RC=%d\\n' \"$rc\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "2",
+                         "a stopped node left the run reporting complete readiness")
+        self.assertEqual(self.calls(), ["ONBOARD:ok.example.com"])
+        self.assertIn("1 component(s) stopped and held out of this batch", result.stderr)
+
+    def test_a_security_report_from_another_machine_stops_the_panel(self):
+        self.seed_panel()
+        now = datetime.now(timezone.utc).isoformat()
+
+        def report(host_id):
+            return {
+                "schema_version": 1, "host_id": host_id, "role": "panel-only",
+                "installer_revision": "test-1", "observed_at": now,
+                "controls": {
+                    name: {"policy": "required", "status": "verified",
+                           "reason_code": "OK", "recovery": "not-needed",
+                           "evidence_codes": ["PROBE"]}
+                    for name in ("firewall", "ssh_protection", "security_updates", "dot")
+                },
+            }
+
+        report_path = Path(self.directory) / "security-report.json"
+        recorded = report("machine-a")
+        report_path.write_text(json.dumps(recorded), encoding="utf-8")
+        live_path = self.write_json("live-report.json", report("machine-b"))
+        result = self.run_install(
+            self.READBACKS
+            + f"GOWAVE_SECURITY_REPORT={shlex.quote(str(report_path))}\n"
+            + "recovery_panel_live_state() {\n"
+            + "  printf '{\"reachable\": true, \"schema_version\": 2,"
+              " \"installer_revision\": \"test-1\", \"nodes\": [], \"hosts\": [], \"profiles\": []}'\n"
+            + "}\n"
+            + "write_security_report() { cp "
+            + shlex.quote(str(live_path)) + ' "$GOWAVE_SECURITY_REPORT"; return 0; }\n'
+            + "rc=0\nresume_verify_panel panel.example.com panel-only || rc=$?\n"
+            + "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("panel stopped;", result.stderr)
+        self.assertIn("comes from host machine-b", result.stderr)
+        self.assertIn("checkpoint=panel:verified", result.stdout)
+        self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), recorded,
+                         "the refused host's report replaced the recorded identity")
+
+    def test_an_incompatible_panel_stops_itself_without_rewriting_the_checkpoint(self):
+        state_path = self.write_json("state.json", {"schemaVersion": 2})
+        live_path = self.write_json("live.json", {
+            "reachable": True, "schema_version": 3, "installer_revision": "test-1",
+            "nodes": [], "hosts": [], "profiles": [],
+        })
+        result = self.run_install(
+            "GOWAVE_PLAN_VARIANT=panel-only\n"
+            "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+            "draft_save_plan\n"
+            "draft_checkpoint panel verified complete 1\n"
+            "GOWAVE_DRAFT_RESUMED=1\n"
+            f"STATE_FILE={shlex.quote(str(state_path))}\n"
+            f"recovery_panel_live_state() {{ cat {shlex.quote(str(live_path))}; }}\n"
+            "recovery_reapply_node() { printf 'REAPPLY\\n' >> \"$GOWAVE_DRAFT_LOG\"; }\n"
+            "rc=0\nresume_reconcile_panel_identity panel-only || rc=$?\n"
+            "printf 'RC=%d\\n' \"$rc\"\n"
+            + DUMP_STORED_CHECKPOINTS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stored_values(result.stdout)["RC"], "1")
+        self.assertIn("panel stopped;", result.stderr)
+        self.assertIn("schema 3", result.stderr)
+        self.assertIn("recorded checkpoint is unchanged", result.stderr)
+        self.assertIn("checkpoint=panel:verified", result.stdout,
+                      "the stopped Panel lost the record the next run must compare")
+        self.assertNotIn("REAPPLY", self.calls())
 
 
 class TestNodeRegistrationReadback(unittest.TestCase):
@@ -1569,6 +3161,45 @@ class TestSelectiveRetry(unittest.TestCase):
 class TestWizardDocumentation(unittest.TestCase):
     """The three domain limits and the two SSH variables are policy, not prose."""
 
+    def test_resume_guide_distinguishes_actions_and_exit_codes_in_both_languages(self):
+        document = (REPO_ROOT / "docs/SETUP_WIZARD.md").read_text(encoding="utf-8")
+        for heading, actions, outcomes in (
+            ("The setup wizard saves accepted answers", (
+                "**Continue** restores the answers", "**Start over** discards the draft",
+                "**Leave without installing** keeps the draft",
+            ), (
+                "exit `0` means all requested components were confirmed",
+                "Exit `1` means the Panel could not be deployed or verified",
+                "Exit `2` means the Panel is ready but at least one requested Worker",
+            )),
+            ("Мастер сохраняет принятые ответы", (
+                "**Продолжить** — восстановить ответы", "**Начать заново** — удалить черновик",
+                "**Выйти без установки** — оставить черновик",
+            ), (
+                "код `0` означает, что все запрошенные компоненты подтверждены",
+                "Код `1` означает, что панель не удалось развернуть или подтвердить",
+                "Код `2` означает, что панель готова, но как минимум один запрошенный Worker",
+            )),
+        ):
+            with self.subTest(heading=heading):
+                section = document.split(heading, 1)[1].split("\n\n", 3)
+                self.assertEqual(len(section), 4)
+                for action in actions:
+                    self.assertIn(action, section[1])
+                for outcome in outcomes:
+                    self.assertIn(outcome, section[2])
+
+    def test_progress_guide_distinguishes_ssh_timeout_from_worker_rollback(self):
+        document = (REPO_ROOT / "docs/SETUP_WIZARD.md").read_text(encoding="utf-8")
+        text = " ".join(document.split())
+        for fragment in (
+            "SSH session has a 60-minute budget", "at most 59 times for that session",
+            "does not prove that the Worker stopped or rolled back",
+            "ограничен 60 минутами", "не более 59 таких сообщений за сеанс",
+            "Разрыв SSH не доказывает, что Worker остановился или откатился",
+        ):
+            self.assertIn(fragment, text)
+
     def test_the_operator_document_names_every_summary_state(self):
         # The result screen is a claim about the Panel, so the page that
         # describes it has to name the same sentences the screen prints. The
@@ -1612,6 +3243,24 @@ class TestWizardDocumentation(unittest.TestCase):
         page = " ".join(document.replace("`", "").split())
         for sentence in sentences:
             self.assertIn(sentence, page, f"the operator page does not name {sentence!r}")
+
+    def test_the_operator_document_names_the_kept_registration(self):
+        # A retry of a node that failed after registering keeps the Panel's row
+        # instead of asking for a second one; the page has to name that answer
+        # with the same values the screen fills, because it is the sentence an
+        # operator reads while deciding whether to register the node again.
+        document = (REPO_ROOT / "docs/SETUP_WIZARD.md").read_text(encoding="utf-8")
+        result = bash(
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            "GOWAVE_WIZARD_LANG=en\n"
+            "printf '%s\\n' \"$(tf wizard.retry.held fra-01 203.0.113.7 3002 "
+            "3d5c9a71-6f24-4b8e-9c07-2a1f5e8d4b63)\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sentence = " ".join(result.stdout.split())
+        self.assertIn("uuid 3d5c9a71-6f24-4b8e-9c07-2a1f5e8d4b63", sentence)
+        page = " ".join(document.replace("`", "").split())
+        self.assertIn(sentence, page, f"the operator page does not name {sentence!r}")
 
     def test_the_readme_names_the_three_limits_and_both_variables(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
@@ -1772,17 +3421,38 @@ class TestPlanReview(unittest.TestCase):
         self.assertNotIn("unbound variable", result.stderr)
         for label in (
             "Deployment scheme",
-            "Panel domain",
-            "Panel camouflage domain",
+            "Panel domain (browser address; API and subscriptions)",
+            "Panel camouflage domain (REALITY SNI)",
             "Panel Vision domain",
             "Local node name",
             "Let's Encrypt email",
             "Shared registered domain",
             "Number of remote nodes",
+            "Master static cover apex (empty — none)",
+            "Cover www alias",
         ):
             self.assertIn(f"{label} [", result.stdout)
         rows = [line for line in result.stdout.splitlines() if re.match(r"^\s+\d+\) .+ \[.*\]$", line)]
-        self.assertEqual(len(rows), 8, rows)
+        self.assertEqual(len(rows), 10, rows)
+
+    def test_the_node_group_names_the_transport_and_the_reality_sni(self):
+        """A Worker's rows say what each name serves, and never call it a Panel."""
+        with tempfile.TemporaryDirectory() as directory:
+            result = bash(
+                SOURCE_WIZARD
+                + "wizard_collect_plan >/dev/null\n"
+                + "review_rc=0\n"
+                + "wizard_review_plan || review_rc=$?\n"
+                + "printf 'review_rc=%s\\n' \"$review_rc\"\n",
+                # Open node 1's editor, go back, cancel.
+                stdin=self.ONE_NODE + "3\n0\n0\n",
+                env={"GOWAVE_WIZARD_RESOLVER": write_resolver(directory)},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Node 1 primary domain (XHTTP/WS/gRPC + static cover) [", result.stdout)
+        self.assertIn("Node 1 camouflage domain (REALITY SNI) [", result.stdout)
+        self.assertNotIn("Node 1 Panel", result.stdout)
+        self.assertNotIn("Node 1 is a Panel", result.stdout)
 
     def test_review_plan_can_rename_the_local_node_and_a_worker(self):
         """Both name rows are editable and the plan keeps what was accepted."""
@@ -1813,6 +3483,64 @@ class TestPlanReview(unittest.TestCase):
         values, _, stderr = self._review(self.ONE_NODE, "3\n4\n   \n4\nams-02\n0\n1\n")
         self.assertEqual(values["node_label"], "ams-02")
         self.assertIn("A node name is required.", stderr)
+
+    def test_review_plan_selects_a_cover_apex_and_its_alias(self):
+        """The cover apex is a plan field, not a value inferred from the Panel."""
+        values, _, _ = self._review(
+            self.ONE_NODE,
+            # Panel group, cover apex, then its www alias, back, start.
+            "2\n9\ncover.example.com\n10\ny\n0\n1\n",
+        )
+        self.assertEqual(values["cover"], "cover.example.com")
+        self.assertEqual(values["cover_www"], "yes")
+        self.assertEqual(values["panel"], "panel.example.com")
+
+    def test_a_new_plan_selects_no_cover_apex(self):
+        """Nothing is inferred: an untouched plan has no cover site at all."""
+        values, _, _ = self._review(self.ALL_IN_ONE, "1\n")
+        self.assertEqual(values["cover"], "")
+        self.assertEqual(values["cover_www"], "no")
+
+    def test_review_refuses_the_www_alias_without_an_apex(self):
+        values, _, stderr = self._review(self.ONE_NODE, "2\n10\ny\n0\n1\n")
+        self.assertEqual(values["cover_www"], "no")
+        self.assertIn("Select a cover apex", stderr)
+
+    def test_an_empty_answer_removes_a_selected_cover_apex(self):
+        values, _, _ = self._review(
+            self.ONE_NODE,
+            "2\n9\ncover.example.com\n10\ny\n0\n"
+            "2\n9\n\n0\n1\n",
+        )
+        self.assertEqual(values["cover"], "")
+        self.assertEqual(values["cover_www"], "no")
+
+    def test_review_refuses_a_cover_apex_another_host_already_owns(self):
+        values, _, stderr = self._review(self.ONE_NODE, "2\n9\nnode1.example.com\n0\n1\n")
+        self.assertEqual(values["cover"], "")
+        self.assertIn("already used by node 1", stderr)
+
+    def test_the_plan_hands_the_cover_to_the_install_as_documented_input(self):
+        """The positional contract keeps its names; the cover travels beside it."""
+        result = bash(
+            SOURCE_WIZARD
+            + "GOWAVE_PLAN_VARIANT=all-in-one\n"
+            + "GOWAVE_PLAN_PANEL_NAME=panel.example.com\n"
+            + "GOWAVE_PLAN_CAMOUFLAGE_NAME=cdn.example.com\n"
+            + "GOWAVE_PLAN_EMAIL=admin@example.com\n"
+            + "GOWAVE_PLAN_COVER_NAME=example.com\n"
+            + "GOWAVE_PLAN_COVER_WWW=yes\n"
+            + "wizard_apply_plan\n"
+            + "printf 'mode=%s\\n' \"$GOWAVE_INSTALL_MODE\"\n"
+            + "printf 'args=%s\\n' \"${#GOWAVE_INSTALL_POSITIONAL[@]}\"\n"
+            + "printf 'cover=%s\\n' \"$GOWAVE_COVER_DOMAIN\"\n"
+            + "printf 'www=%s\\n' \"$GOWAVE_COVER_WWW\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode=all-in-one", result.stdout)
+        self.assertIn("args=4", result.stdout)
+        self.assertIn("cover=example.com", result.stdout)
+        self.assertIn("www=yes", result.stdout)
 
     def test_editing_the_second_node_leaves_its_sibling_unchanged(self):
         """Node 2 is action 4, and its editor lists only that node's fields."""
@@ -1865,8 +3593,25 @@ class TestPlanReview(unittest.TestCase):
         self.assertNotIn("exceed the ceiling", stderr)
         self.assertEqual(stderr.count("budget is shared by the whole cluster"), 1)
 
+    def test_review_routes_an_unresolvable_name_to_its_field_and_keeps_the_plan(self):
+        """Start refuses a name it cannot resolve and re-reads only that field."""
+        values, nodes, stderr = self._review(
+            self.ALL_IN_ONE,
+            # Change the Panel domain to a name the resolver cannot answer, back
+            # to the menu, then start: the check routes to the Panel domain and
+            # the corrected answer lets the same start through.
+            "2\n2\nunresolved.example.com\n0\n1\npanel.example.com\n",
+            failing=("unresolved.example.com",),
+        )
+        self.assertEqual(values["panel"], "panel.example.com")
+        self.assertEqual(values["camouflage"], "cdn.example.com")
+        self.assertEqual(values["vision"], "vision.example.com")
+        self.assertEqual(values["email"], "admin@example.com")
+        self.assertIn("Back to Panel domain (browser address; API and subscriptions)",
+                      stderr)
+
     def test_review_plan_rejects_shared_domain_over_ceiling(self):
-        """A shared domain over the ceiling is refused, and start cannot bypass it."""
+        """An over-ceiling shared domain is refused, and start routes to the node count."""
         plan = (
             "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n25\n"
             + "\n".join(
@@ -1874,10 +3619,16 @@ class TestPlanReview(unittest.TestCase):
             )
             + "\nn\n"
         )
-        # Two refusals — one while editing, one at start — then the operator
-        # cancels, because no answer in the review makes 52 certificates fit.
-        values, nodes, stderr = self._review(plan, "2\n7\ny\n0\n1\n0\n")
+        # Two refusals — one while editing, one at start — and the start refusal
+        # names the node count rather than sending the operator back through the
+        # whole plan. Lowering it to the ceiling meets the budget, so the shared
+        # consent is asked; declining keeps the plan and returns to the menu.
+        values, nodes, stderr = self._review(plan, "2\n7\ny\n0\n1\n24\nn\n0\n")
         self.assertEqual(stderr.count("exceed the ceiling"), 2)
+        self.assertIn("Reduce the number of Workers to at most 24", stderr)
+        self.assertEqual(values["node_count"], "24")
+        self.assertEqual(len(nodes), 24)
+        self.assertEqual(stderr.count("budget is shared by the whole cluster"), 1)
 
     def test_cancelling_at_review_reports_the_code_and_changes_no_answer(self):
         with tempfile.TemporaryDirectory() as directory:

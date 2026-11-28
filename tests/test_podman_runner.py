@@ -479,6 +479,36 @@ class TestPodmanRunOwnership(unittest.TestCase):
             with self.assertRaises(ValueError):
                 context.write_secret("../escape", "value")
 
+    def test_a_kept_run_leaves_its_secret_directory_for_the_adopter(self):
+        # ``--keep`` promises a cell a later ``--reuse`` can attach to, and the
+        # containers mount this directory: removing it at exit would delete the
+        # payloads and the CA material the kept hosts are still reading.
+        with tempfile.TemporaryDirectory() as tmp:
+            context = RunContext(
+                "aio", Path(tmp), budget_seconds=60,
+                run_id="podman-aio-kept-abcd1234", keep=True,
+            )
+            secret = context.write_secret("admin-password", "SuperSecretPassword12345")
+            self.assertEqual(context.secret_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(context.run_cleanup(), [])
+            self.assertTrue(secret.exists(), "a kept run may not remove what it just promised")
+            self.assertTrue(context.keep_resources)
+
+    def test_an_adopted_run_never_removes_the_directory_it_borrowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "kept-secrets"
+            source.mkdir(mode=0o700)
+            context = RunContext(
+                "aio", Path(tmp) / "artifacts", budget_seconds=60,
+                run_id="podman-aio-adopted-abcd1234",
+                reused_from="podman-aio-kept-abcd1234",
+                keep=True, secret_dir=source,
+            )
+            self.assertEqual(context.secret_dir, source)
+            self.assertEqual(context.run_cleanup(), [])
+            self.assertTrue(source.is_dir(), "the directory belongs to the kept run")
+            self.assertTrue(context.keep_resources)
+
 
 class TestArtifactOwnership(unittest.TestCase):
     """A root run must leave artifacts the invoking operator can actually read."""
@@ -824,6 +854,41 @@ class TestPodmanContainerDiscovery(unittest.TestCase):
         ):
             with mock.patch.object(Podman, "_run", return_value=listed):
                 self.assertEqual(podman.run_containers(), [])
+
+    def test_an_adopted_run_discovers_the_kept_runs_containers_too(self):
+        # A failure in an adopted run has to describe the hosts it was measuring,
+        # and those carry the kept run's label rather than this one's.
+        from unittest import mock
+
+        from tools.podman_e2e.podman import Podman
+
+        podman = object.__new__(Podman)
+        podman.context = mock.Mock(
+            run_id="podman-aio-new-11112222", topology="aio",
+            reused_from="podman-aio-kept-abcdef12",
+        )
+        listings = {
+            "podman-aio-new-11112222": [{"Names": ["engines-11112222"], "State": "running"}],
+            "podman-aio-kept-abcdef12": [
+                {"Names": ["aio-abcdef12"], "State": "running"},
+                {"Names": ["engines-11112222"], "State": "running"},
+            ],
+        }
+        seen = []
+
+        def fake_run(args, **kwargs):
+            label = [item for item in args if item.startswith("label=")][0]
+            seen.append(label)
+            run_id = label[len("label=gowave.e2e.run="):]
+            return mock.Mock(returncode=0, stdout=json.dumps(listings.get(run_id, [])), stderr="")
+
+        with mock.patch.object(Podman, "_run", side_effect=fake_run):
+            containers = podman.run_containers()
+        self.assertEqual(
+            [entry["name"] for entry in containers], ["aio-abcdef12", "engines-11112222"],
+        )
+        self.assertIn("label=gowave.e2e.run=podman-aio-new-11112222", seen)
+        self.assertIn("label=gowave.e2e.run=podman-aio-kept-abcdef12", seen)
 
 
 if __name__ == "__main__":

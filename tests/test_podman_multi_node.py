@@ -11,15 +11,19 @@ defect into a harness failure — or worse, a wrong node into a passing case.
 import base64
 import contextlib
 import copy
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
 import os
+import re
+import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
+import types
 import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +34,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import acme_mode, aio, budget, gate_tiers, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, runstate_cases, tls_anchors, topology  # noqa: E402
+from tools.podman_e2e import acme_mode, aio, budget, gate_tiers, ingress, ingress_matrix, lock_cases, matrix, mtls, multi_node, panel_surface, runstate_cases, tls_anchors, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import (  # noqa: E402
     BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
@@ -134,6 +138,10 @@ class TestMultiNodeRoles(unittest.TestCase):
 
         self.podman = FakePodman()
         self.addCleanup(self.podman.context.run_cleanup)
+        lock = unittest.mock.patch.object(topology, "NETWORK_RESERVATION_LOCK",
+                                          self.podman.context.secret_dir / "networks.lock")
+        lock.start()
+        self.addCleanup(lock.stop)
         self.host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
 
     def _create(self):
@@ -580,7 +588,7 @@ active
 0      0      10.89.0.11:443      10.89.0.40:51000
 == firewall ==
 Status: active
-3002                       ALLOW       10.89.0.10             # GoWave Control Plane IPv4
+3002                       ALLOW       10.89.0.10             # GoWave Auto NGINX
 22/tcp                     ALLOW       Anywhere
 """
 
@@ -635,6 +643,70 @@ Status: active
         self.assertEqual(facts, {"node_service": "", "listeners": [], "peers": [], "firewall": []})
 
 
+class _ReadbackPodman:
+    def __init__(self, product):
+        self.product = product
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=60):
+        self.product.scripts.append((name, script))
+        return subprocess.CompletedProcess(
+            ["bash", "-lc", script], 0, json.dumps(self.product.document), "")
+
+
+class _ReadbackProduct:
+    """A Master whose only job is to carry the readback command and answer it."""
+
+    def __init__(self, master_ip):
+        self.scripts = []
+        self.document = {
+            "schema_version": 1,
+            "host_id": "worker.testbed.internal",
+            "role": "worker",
+            "installer_revision": "local",
+            "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "controls": {
+                name: {"policy": "required", "status": "verified", "reason_code": code,
+                       "recovery": "not-needed", "evidence_codes": [code]}
+                for name, code in (("firewall", "FW_APPLIED"),
+                                   ("ssh_protection", "JAIL_ACTIVE"),
+                                   ("security_updates", "APT_EFFECTIVE"))
+            } | {"dot": {"policy": "off", "status": "skipped", "reason_code": "DOT_DISABLED",
+                         "recovery": "not-needed", "evidence_codes": ["DOT_DISABLED"]}},
+        }
+        self.podman = _ReadbackPodman(self)
+        self.worker = types.SimpleNamespace(
+            plan=types.SimpleNamespace(worker_ip=master_ip[:-1] + "11", target_ip=master_ip))
+
+    def require_installed(self):
+        return types.SimpleNamespace(target_name="aio-test")
+
+
+class TestWorkerSecurityReadback(unittest.TestCase):
+    """The readback asks for the policy the install applied, not for a fixed pool.
+
+    The Worker's allow rule is derived from the Master's own control address, and
+    the subnet each cell draws is chosen per run. A literal address matched only
+    the cell that drew that pool: every other cell verified a policy its Worker
+    had never been given and reported a firewall it had actually configured as
+    `FW_NOT_EFFECTIVE`.
+    """
+
+    def test_the_readback_asks_for_the_runs_own_master_address(self):
+        for master_ip in ("10.90.0.10", "10.91.0.10", "10.89.0.10"):
+            with self.subTest(master_ip=master_ip):
+                product = _ReadbackProduct(master_ip)
+                facts = multi_node.verify_worker_security_readback_via_ssh(
+                    product, multi_node.WORKER_RESUME_CASE_ID, product.worker)
+                self.assertEqual(facts.get("ready"), "ready",
+                                 f"the readback could not read a ready report: {facts}")
+                script = product.scripts[-1][1]
+                self.assertIn(f"--worker-security-readback 3002 {master_ip} ", script)
+                for other in ("10.89.0.10", "10.90.0.10", "10.91.0.10"):
+                    if other != master_ip:
+                        self.assertNotIn(other, script,
+                                         "the readback still names an address the install never used")
+
+
 class _AddressProduct:
     """A product stub: it reports what the Worker said and what the plan expects."""
 
@@ -644,7 +716,7 @@ class _AddressProduct:
             "listeners": list(listeners),
             "peers": list(peers),
             "firewall": [
-                f"{multi_node.NODE_PORT}  ALLOW  {source}  # GoWave Control Plane IPv4"
+                f"{multi_node.NODE_PORT}  ALLOW  {source}  # GoWave Auto NGINX"
                 for source in sources
             ],
         }
@@ -672,7 +744,7 @@ class TestMasterAddressCase(unittest.TestCase):
         product = _AddressProduct([], [])
         product.reported["peers"] = [self._master(product)]
         product.reported["firewall"] = [
-            f"3002  ALLOW  {self._master(product)}  # GoWave Control Plane IPv4"
+            f"3002  ALLOW  {self._master(product)}  # GoWave Auto NGINX"
         ]
         facts = self._run(product)
         self.assertEqual(facts["master_address"], self._master(product))
@@ -688,7 +760,7 @@ class TestMasterAddressCase(unittest.TestCase):
     def test_no_live_connection_from_the_master_is_rejected(self):
         product = _AddressProduct(["10.89.0.99"], [])
         product.reported["firewall"] = [
-            f"3002  ALLOW  {self._master(product)}  # GoWave Control Plane IPv4"
+            f"3002  ALLOW  {self._master(product)}  # GoWave Auto NGINX"
         ]
         with self.assertRaises(AssertionError) as caught:
             self._run(product)
@@ -698,7 +770,7 @@ class TestMasterAddressCase(unittest.TestCase):
         product = _AddressProduct([], [])
         product.reported["peers"] = [self._master(product), "185.0.0.9"]
         product.reported["firewall"] = [
-            f"3002  ALLOW  {self._master(product)}  # GoWave Control Plane IPv4"
+            f"3002  ALLOW  {self._master(product)}  # GoWave Auto NGINX"
         ]
         with self.assertRaises(AssertionError) as caught:
             self._run(product)
@@ -880,7 +952,7 @@ class TestRunnerEntrypoint(unittest.TestCase):
             def execute(self):
                 return 0
 
-        def suite(podman, topology, distribution, vision=False, worker_vision=False):
+        def suite(podman, topology, distribution, vision=False, worker_vision=False, **kwargs):
             captured.update(
                 topology=topology, distribution=distribution,
                 vision=vision, worker_vision=worker_vision,
@@ -1878,8 +1950,11 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(suite[multi_node.IPV6_CASE_ID].topology, "multi-node")
 
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
+        # FW-04 re-reads the firewall decisions over IPv6 and FW-06 reads the
+        # Worker half of the same pair, so both run while the hosts are healthy
+        # and before the cases that only observe the Panel.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertSequence(ids, [multi_node.IPV6_CASE_ID,
+        self.assertSequence(ids, [multi_node.IPV6_CASE_ID, ingress_matrix.WORKER_CASE_ID,
                                   "CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
@@ -2263,8 +2338,7 @@ class _CoverPodman:
         self.decisions = decisions if decisions is not None else {
             "master": _cover_decision_output(
                 resolved=_COVER_MASTER_IP, own=(_COVER_MASTER_IP, "172.16.0.5")),
-            "worker": _cover_decision_output(
-                resolved=_COVER_MASTER_IP, own=(_COVER_WORKER_IP,)),
+            "worker": _cover_worker_output(),
         }
         self.decision_returncode = decision_returncode
         self.configs = configs if configs is not None else {
@@ -2298,6 +2372,8 @@ class _CoverProduct:
             "target_name": "aio-master",
             "worker_name": "worker-01",
             "worker_domain": topology.WORKER_DOMAIN,
+            "reality_domain": topology.REALITY_DOMAIN,
+            "worker_reality_domain": topology.WORKER_REALITY_DOMAIN,
         })()
 
 
@@ -2311,58 +2387,75 @@ def _cover_vhost(reality_domain, names="testbed.internal www.testbed.internal"):
     )
 
 
+_COVER_MASTER_REFUSALS = {
+    "": "",
+    topology.COVER_APEX: "",
+    topology.PANEL_DOMAIN:
+        "Error: the cover apex and the Panel domain are the same name; "
+        "the Panel keeps its own route.",
+    "not_a_name":
+        "Error: GOWAVE_COVER_DOMAIN 'not_a_name' is not a fully qualified domain name.",
+}
+
+
 def _cover_decision_output(resolved="10.89.0.10", own=("10.89.0.10",),
                            answers=None, refusals=None):
-    answers = multi_node.COVER_APEX_ANSWERS if answers is None else answers
-    if refusals is None:
-        refusals = {
-            domain: f"Camouflage apex disabled — {domain} has no subdomain, "
-                    "so no cover apex exists."
-            for domain in ("example.com", "localhost")
-        }
+    """The Master's table: every documented selection, and the apex it resolves to."""
+    answers = multi_node.MASTER_COVER_SELECTIONS if answers is None else answers
+    refusals = _COVER_MASTER_REFUSALS if refusals is None else refusals
     lines = [f"apex\t{resolved}"] + [f"self\t{address}" for address in own]
     lines += [f"derived\t{domain}\t{apex}" for domain, apex in answers.items()]
     lines += [f"refusals\t{domain}\t{message}" for domain, message in refusals.items()]
     return "\n".join(lines) + "\n"
 
 
+def _cover_worker_output(*defined):
+    """The Worker's answer: no apex, and any apex function its payload still defines."""
+    lines = [f"apexdef\t{name}" for name in defined]
+    lines.append("apex\t")
+    return "\n".join(lines) + "\n"
+
+
 class TestCoverDeriveCase(unittest.TestCase):
-    """NGX-COVER-DERIVE reads both roles, so neither copy can hide a wrong apex."""
+    """NGX-COVER-DERIVE: the Master carries the selected apex, the Worker none."""
 
     def _run(self, podman):
         return multi_node.case_cover_derive(_CoverProduct(podman))
 
-    def test_both_roles_report_the_derived_apex_and_their_binding(self):
+    def test_the_master_binds_the_selected_apex_and_the_worker_names_only_its_own(self):
         evidence = self._run(_CoverPodman())
-        self.assertEqual(evidence["master"]["derived"], multi_node.COVER_APEX_ANSWERS)
+        self.assertEqual(evidence["master"]["derived"],
+                         multi_node.MASTER_COVER_SELECTIONS)
         self.assertEqual(evidence["master"]["cover_domain"], "testbed.internal")
         self.assertTrue(evidence["master"]["cover_names_bound"])
         self.assertIn("www.testbed.internal", evidence["master"]["server_names"])
-        # The apex belongs to the Master here, so the Worker keeps a nameless
-        # decoy instead of a lineage its own port 80 could never validate.
-        self.assertEqual(evidence["worker"]["apex_resolved_to"], _COVER_MASTER_IP)
-        self.assertEqual(evidence["worker"]["own_addresses"], [_COVER_WORKER_IP])
-        self.assertFalse(evidence["worker"]["cover_names_bound"])
+        # The Worker owns no apex at all: its decoy carries only the camouflage
+        # name its site was rendered for, which is also its REALITY SNI.
+        self.assertEqual(evidence["worker"]["cover_name"], topology.WORKER_REALITY_DOMAIN)
+        self.assertEqual(evidence["worker"]["apex_defined"], [])
+        self.assertEqual(evidence["worker"]["apex_decided"], "")
         self.assertEqual(evidence["worker"]["server_names"],
-                         ["worker-reality.testbed.internal"])
+                         [topology.WORKER_REALITY_DOMAIN])
         self.assertEqual(evidence["master"]["vhost"],
                          "/etc/nginx/conf.d/gowave-decoy.conf")
         self.assertEqual(evidence["worker"]["vhost"],
                          "/etc/nginx/conf.d/gowave-worker-decoy.conf")
 
-    def test_each_role_runs_its_own_copy_of_the_decision(self):
+    def test_the_worker_asks_its_payload_whether_it_still_defines_an_apex(self):
         podman = _CoverPodman()
         self._run(podman)
         self.assertIn(f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh",
                       podman.scripts["master"])
-        self.assertIn("gowave-node-auto.sh", podman.scripts["worker"])
+        self.assertIn(multi_node.WORKER_PAYLOAD, podman.scripts["worker"])
         for function in multi_node.COVER_DECISION_FUNCTIONS:
             self.assertIn(function, podman.scripts["worker"])
         self.assertNotIn("modules/nginx.sh", podman.scripts["worker"])
 
     def test_the_generated_tables_run_the_shipped_decisions(self):
-        # The payload extraction is the fragile half of the Worker probe, so both
-        # roles' scripts are executed against the files this checkout ships.
+        # The payload read is the fragile half of the Worker probe, so both roles'
+        # scripts are executed against the files this checkout ships. The Master's
+        # selected apex does not resolve on a developer host, so its table is the
+        # refusal branch; the Worker's half is host-independent.
         for role in ("master", "worker"):
             with self.subTest(role=role):
                 script = multi_node.cover_decision_script(
@@ -2372,18 +2465,26 @@ class TestCoverDeriveCase(unittest.TestCase):
                                      capture_output=True, text=True)
                 self.assertEqual(res.returncode, 0, res.stderr)
                 facts = multi_node.parse_cover_decision(res.stdout)
-                self.assertEqual(facts["derived"], multi_node.COVER_APEX_ANSWERS)
-                for domain in ("example.com", "localhost"):
-                    self.assertIn("has no subdomain", facts["refusals"][domain])
+                multi_node.require_cover_decision(
+                    multi_node.COVER_DERIVE_CASE_ID, role, role, facts)
 
     def test_an_unknown_role_is_refused(self):
         with self.assertRaises(ValueError):
             multi_node.cover_decision_script("denial", topology.PANEL_DOMAIN)
 
+    def test_a_worker_that_still_defines_an_apex_is_rejected(self):
+        podman = _CoverPodman(decisions={
+            "master": _cover_decision_output(own=(_COVER_MASTER_IP,)),
+            "worker": _cover_worker_output("cover_domain_for"),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("still defines the cover-apex decision", str(caught.exception))
+
     def test_a_silent_refusal_is_rejected(self):
         podman = _CoverPodman(decisions={
             "master": _cover_decision_output(own=(_COVER_MASTER_IP,), refusals={}),
-            "worker": _cover_decision_output(own=(_COVER_WORKER_IP,)),
+            "worker": _cover_worker_output(),
         })
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
@@ -2408,7 +2509,7 @@ class TestCoverDeriveCase(unittest.TestCase):
             self._run(podman)
         self.assertIn("so its decoy has to carry", str(caught.exception))
 
-    def test_a_role_that_does_not_resolve_the_apex_must_not_name_it(self):
+    def test_a_worker_decoy_that_claims_the_master_apex_is_rejected(self):
         podman = _CoverPodman(configs={
             "master": _cover_vhost("reality.testbed.internal"),
             "worker": _cover_vhost("worker-reality.testbed.internal",
@@ -2416,7 +2517,7 @@ class TestCoverDeriveCase(unittest.TestCase):
         })
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
-        self.assertIn("must not name names it cannot validate", str(caught.exception))
+        self.assertIn("has to name only its own camouflage name", str(caught.exception))
 
     def test_a_decision_that_cannot_run_is_rejected(self):
         podman = _CoverPodman(decision_returncode=127)
@@ -2782,10 +2883,6 @@ _DECOY_ROUTE_WORKER_LINEAGES = {
         "worker.testbed.internal", "worker-reality.testbed.internal",
     ],
 }
-_DECOY_ROUTE_WORKER_REFUSAL = (
-    "Camouflage apex disabled — testbed.internal / www.testbed.internal do not resolve "
-    "to 10.89.0.11, so HTTP-01 would fail."
-)
 
 
 def _decoy_route_output(map_lines=None, listens=None, bound=None, lineages=None):
@@ -2832,8 +2929,8 @@ class _DecoyRoutePodman:
         }
         self.decisions = decisions if decisions is not None else {
             "master": _decoy_decision_output("panel.testbed.internal", "testbed.internal"),
-            "worker": _decoy_decision_output(
-                "worker.testbed.internal", "", _DECOY_ROUTE_WORKER_REFUSAL),
+            # The Worker owns no apex: its answer is an empty apex and no reason.
+            "worker": _decoy_decision_output("worker.testbed.internal", ""),
         }
         self.site_output = site_output if site_output is not None else (
             f"file\tindex.html\t{_DECOY_ROUTE_INDEX_SHA}\t{len(_DECOY_ROUTE_INDEX)}\n"
@@ -2850,7 +2947,7 @@ class _DecoyRoutePodman:
         if "ssl_preread" in script:
             self.scripts.setdefault(role, {})["route"] = script
             return subprocess.CompletedProcess(["bash", "-lc"], 0, self.routes[role], "")
-        if "cover_domain_for" in script:
+        if "cover_domain_for" in script or "apexdef" in script:
             self.scripts.setdefault(role, {})["decision"] = script
             return subprocess.CompletedProcess(["bash", "-lc"], 0, self.decisions[role], "")
         self.scripts.setdefault(role, {})["site"] = script
@@ -3006,16 +3103,16 @@ class TestDecoyRouteCase(unittest.TestCase):
                                                         lineages=_DECOY_ROUTE_WORKER_LINEAGES)}))
         self.assertIn("instead of the loopback decoy 127.0.0.1:9443", str(caught.exception))
 
-    def test_a_role_that_decides_no_apex_owes_no_cover_route(self):
+    def test_a_worker_that_decides_an_apex_owes_a_route_it_cannot_serve(self):
         decisions = {
             "master": _decoy_decision_output("panel.testbed.internal", "testbed.internal"),
             "worker": _decoy_decision_output("worker.testbed.internal",
-                                            "testbed.internal"),
+                                             "testbed.internal"),
         }
         podman = _DecoyRoutePodman(decisions=decisions)
         with self.assertRaises(AssertionError) as caught:
             self.run_case(podman)
-        self.assertIn("routes testbed.internal to None", str(caught.exception))
+        self.assertIn("decided a cover apex it does not own", str(caught.exception))
 
     def test_a_vpn_name_sent_to_the_decoy_is_rejected(self):
         routes = _decoy_route_output(tuple(
@@ -3302,16 +3399,34 @@ def _cover_probe_output(probe, answers=None, apex_rendered="", reason=None):
 _COVER_PROBE_IPS = {"master": _COVER_MASTER_IP, "worker": _COVER_WORKER_IP}
 
 
+def _cover_worker_probe_output(probe, answers=None):
+    """The Worker's probe answer: the steered pair, and no apex decision at all."""
+    answers = probe["answers"] if answers is None else answers
+    lines = [f"resolved\t{name}\t{value}" for name, value in answers.items()]
+    lines.append(f"decision\t{probe['domain']}\t\t")
+    return "\n".join(lines) + "\n"
+
+
 def _cover_probe_outputs(override=None):
-    """Every role's probe outputs, in the order the case runs them."""
+    """Every role's probe outputs, in the order the case runs them.
+
+    The overrides are the Master's, because a Worker has no decision to render or
+    to word: only a steered answer applies to its half.
+    """
     override = override or {}
-    return {
-        role: [
-            _cover_probe_output(probe, **override.get(probe["label"], {}))
-            for probe in multi_node.cover_probe_matrix(server_ip, _COVER_OTHER_IP)
-        ]
-        for role, server_ip in _COVER_PROBE_IPS.items()
-    }
+    outputs = {}
+    for role, server_ip in _COVER_PROBE_IPS.items():
+        entries = []
+        for probe in multi_node.cover_probe_matrix(server_ip, _COVER_OTHER_IP):
+            changed = override.get(probe["label"], {})
+            if role == "master":
+                entries.append(_cover_probe_output(probe, **changed))
+            else:
+                entries.append(_cover_worker_probe_output(
+                    probe, answers=changed.get("answers"),
+                ))
+        outputs[role] = entries
+    return outputs
 
 
 def _cover_state_output(domain, apex, answers, own, apex_rendered, reason,
@@ -3331,7 +3446,7 @@ def _cover_state_output(domain, apex, answers, own, apex_rendered, reason,
 
 
 def _cover_default_states():
-    """One rendered role and one refusing role, both as a healthy run leaves them."""
+    """One rendered Master and one Worker that owns no apex, as a healthy run leaves them."""
     apex = topology.COVER_APEX
     both = {apex: _COVER_MASTER_IP, f"www.{apex}": _COVER_MASTER_IP}
     master = _cover_state_output(
@@ -3342,10 +3457,9 @@ def _cover_default_states():
         lineages={_COVER_LINEAGE: "X509v3 Subject Alternative Name:   "
                                   f"DNS:reality.{apex}, DNS:{apex}, DNS:www.{apex}"},
     )
-    reason = multi_node.cover_refusal_message([apex, f"www.{apex}"], _COVER_WORKER_IP)
     worker = _cover_state_output(
         topology.WORKER_DOMAIN, apex, both,
-        (_COVER_WORKER_IP,), "", reason,
+        (_COVER_WORKER_IP,), "", "",
         claims=("/etc/nginx/conf.d/gowave-worker-decoy.conf:12:    server_name "
                 f"worker-reality.{apex};",),
         lineages={
@@ -3363,6 +3477,7 @@ class _CoverHost:
     target_name = "aio-master"
     worker_name = "worker-01"
     worker_domain = topology.WORKER_DOMAIN
+    worker_reality_domain = topology.WORKER_REALITY_DOMAIN
 
     class plan:
         target_ip = _COVER_MASTER_IP
@@ -3433,30 +3548,45 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         evidence, _ = self._run(_CoverUnresolvedPodman())
         apex = topology.COVER_APEX
         www = f"www.{apex}"
-        for role in ("master", "worker"):
-            with self.subTest(role=role):
-                probes = evidence["probes"][role]
-                self.assertEqual(sorted(probes),
-                                 ["apex_missing", "both_elsewhere", "www_missing"])
-                self.assertEqual([probe["apex_rendered"] for probe in probes.values()],
-                                 ["", "", ""])
-                self.assertEqual(probes["www_missing"]["steered"],
-                                 {apex: _COVER_PROBE_IPS[role], www: ""})
-                self.assertEqual(probes["apex_missing"]["steered"],
-                                 {apex: "", www: _COVER_PROBE_IPS[role]})
-                self.assertEqual(probes["both_elsewhere"]["steered"],
-                                 {apex: _COVER_OTHER_IP, www: _COVER_OTHER_IP})
-                self.assertIn(f"{www} does not resolve to {_COVER_PROBE_IPS[role]}",
-                              probes["www_missing"]["refusal"])
-                self.assertIn(f"— {apex} does not resolve",
-                              probes["apex_missing"]["refusal"])
-                self.assertNotIn(f"www.{apex}", probes["apex_missing"]["refusal"],
-                                 "the apex-only refusal named a record that did resolve")
-                self.assertIn(f"{apex} / {www} do not resolve to "
-                              f"{_COVER_PROBE_IPS[role]}",
-                              probes["both_elsewhere"]["refusal"])
+        probes = evidence["probes"]["master"]
+        self.assertEqual(sorted(probes),
+                         ["apex_missing", "both_elsewhere", "www_missing"])
+        self.assertEqual([probe["apex_rendered"] for probe in probes.values()],
+                         ["", "", ""])
+        self.assertEqual(probes["www_missing"]["steered"],
+                         {apex: _COVER_MASTER_IP, www: ""})
+        self.assertEqual(probes["apex_missing"]["steered"],
+                         {apex: "", www: _COVER_MASTER_IP})
+        self.assertEqual(probes["both_elsewhere"]["steered"],
+                         {apex: _COVER_OTHER_IP, www: _COVER_OTHER_IP})
+        self.assertIn(f"{www} does not resolve to {_COVER_MASTER_IP}",
+                      probes["www_missing"]["refusal"])
+        self.assertIn(f"— {apex} does not resolve",
+                      probes["apex_missing"]["refusal"])
+        self.assertNotIn(f"www.{apex}", probes["apex_missing"]["refusal"],
+                         "the apex-only refusal named a record that did resolve")
+        self.assertIn(f"{apex} {www} do not resolve to {_COVER_MASTER_IP}",
+                      probes["both_elsewhere"]["refusal"])
 
-    def test_the_role_that_holds_the_apex_shows_it_rendered(self):
+    def test_every_worker_probe_reports_no_apex_and_no_refusal(self):
+        evidence, _ = self._run(_CoverUnresolvedPodman())
+        apex = topology.COVER_APEX
+        www = f"www.{apex}"
+        probes = evidence["probes"]["worker"]
+        self.assertEqual(sorted(probes),
+                         ["apex_missing", "both_elsewhere", "www_missing"])
+        self.assertEqual([probe["apex_rendered"] for probe in probes.values()],
+                         ["", "", ""])
+        self.assertEqual([probe["refusal"] for probe in probes.values()],
+                         ["", "", ""])
+        self.assertEqual(probes["www_missing"]["steered"],
+                         {apex: _COVER_WORKER_IP, www: ""})
+        self.assertEqual(probes["apex_missing"]["steered"],
+                         {apex: "", www: _COVER_WORKER_IP})
+        self.assertEqual(probes["both_elsewhere"]["steered"],
+                         {apex: _COVER_OTHER_IP, www: _COVER_OTHER_IP})
+
+    def test_the_master_that_holds_the_apex_shows_it_rendered(self):
         evidence, _ = self._run(_CoverUnresolvedPodman())
         master = evidence["master"]
         self.assertEqual(master["server_ip"], _COVER_MASTER_IP)
@@ -3464,11 +3594,11 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         self.assertEqual(master["cover_page_bytes"], 4096)
         self.assertEqual(master["covered_by"], [_COVER_LINEAGE])
 
-    def test_the_role_that_does_not_hold_the_apex_shows_it_withheld(self):
+    def test_the_worker_claims_neither_half_of_the_master_apex(self):
         evidence, _ = self._run(_CoverUnresolvedPodman())
         worker = evidence["worker"]
         self.assertEqual(worker["apex_rendered"], "")
-        self.assertIn("Camouflage apex disabled", worker["refusal"])
+        self.assertEqual(worker["decoy_names"], [topology.WORKER_REALITY_DOMAIN])
         self.assertNotIn(topology.COVER_APEX, worker["claimed_names"])
         self.assertNotIn(f"www.{topology.COVER_APEX}", worker["claimed_names"])
 
@@ -3589,7 +3719,20 @@ class TestCoverUnresolvedCase(unittest.TestCase):
             self._run(podman)
         self.assertIn("left no rendered cover page", str(caught.exception))
 
-    def test_a_refusing_role_that_still_claims_the_apex_is_rejected(self):
+    def test_a_worker_probe_that_decides_an_apex_is_rejected(self):
+        apex = topology.COVER_APEX
+        outputs = _cover_probe_outputs()
+        probe = multi_node.cover_probe_matrix(_COVER_WORKER_IP, _COVER_OTHER_IP)[0]
+        outputs["worker"][0] = _cover_worker_probe_output(probe).replace(
+            f"decision\t{probe['domain']}\t\t",
+            f"decision\t{probe['domain']}\t{apex}\t",
+        )
+        podman = _CoverUnresolvedPodman(probe_outputs=outputs)
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("decided a cover apex it does not own", str(caught.exception))
+
+    def test_a_worker_decoy_that_names_the_master_apex_is_rejected(self):
         podman = _CoverUnresolvedPodman()
         apex = topology.COVER_APEX
         states = dict(podman.states)
@@ -3600,9 +3743,9 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         podman.states = states
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
-        self.assertIn("leaving a partial decoy", str(caught.exception))
+        self.assertIn("owns no apex but a vhost still claims", str(caught.exception))
 
-    def test_a_refusing_role_that_already_issued_the_lineage_is_rejected(self):
+    def test_a_worker_that_already_issued_the_lineage_is_rejected(self):
         podman = _CoverUnresolvedPodman()
         apex = topology.COVER_APEX
         states = dict(podman.states)
@@ -3611,7 +3754,20 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         podman.states = states
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
-        self.assertIn("the refusal came after issuance", str(caught.exception))
+        self.assertIn("owns no apex but holds a lineage naming it", str(caught.exception))
+
+    def test_a_worker_decoy_naming_anything_else_is_rejected(self):
+        podman = _CoverUnresolvedPodman()
+        apex = topology.COVER_APEX
+        states = dict(podman.states)
+        states["worker"] = states["worker"].replace(
+            f"server_name worker-reality.{apex};",
+            f"server_name worker-alias.{apex};",
+        )
+        podman.states = states
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("camouflage vhost has to name only", str(caught.exception))
 
     def test_a_state_that_cannot_be_read_is_rejected(self):
         podman = _CoverUnresolvedPodman(state_returncode=2)
@@ -3620,7 +3776,7 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         self.assertIn("could not report its cover state", str(caught.exception))
 
     def test_the_probe_scripts_run_the_shipped_decisions(self):
-        # The extracted payload is the fragile half, so both roles' scripts are
+        # The installed payload is the fragile half, so both roles' scripts are
         # executed against the files this checkout ships.
         apex = topology.COVER_APEX
         for role, server_ip in _COVER_PROBE_IPS.items():
@@ -3639,7 +3795,11 @@ class TestCoverUnresolvedCase(unittest.TestCase):
                     self.assertEqual(list(facts["decisions"]), [probe["domain"]])
                     decision = facts["decisions"][probe["domain"]]
                     self.assertEqual(decision["apex"], "")
-                    self.assertIn("Camouflage apex disabled", decision["reason"])
+                    self.assertEqual(facts["apexdef"], [])
+                    if role == "master":
+                        self.assertIn("Camouflage apex disabled", decision["reason"])
+                    else:
+                        self.assertEqual(decision["reason"], "")
 
     def test_the_probe_waits_for_the_steered_pair_and_flushes_before_reading(self):
         # The install already resolved these names through the same resolver, and
@@ -3675,6 +3835,16 @@ class TestCoverUnresolvedCase(unittest.TestCase):
                          "hostname -I", "getent ahostsv4"):
             self.assertIn(fragment, script)
         self.assertIn(f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh", script)
+
+    def test_the_worker_state_script_reads_the_payload_it_must_not_decide_from(self):
+        script = multi_node.cover_state_script(
+            "worker", topology.WORKER_DOMAIN, _COVER_WORKER_IP,
+            multi_node.cover_published_answers(_CoverHost().zone()))
+        self.assertIn(multi_node.WORKER_PAYLOAD, script)
+        self.assertNotIn("$(cover_domain_for", script)
+        self.assertNotIn("modules/nginx.sh", script)
+        for fragment in (multi_node.COVER_SITE_INDEX, "server_name", "subjectAltName"):
+            self.assertIn(fragment, script)
 
     def test_the_case_runs_beside_the_derivation_and_before_the_lifecycle_cases(self):
         tmp = tempfile.TemporaryDirectory()
@@ -4611,9 +4781,9 @@ class TestTlsSurfaceCase(unittest.TestCase):
         self.assertEqual([call["role"] for call in calls], ["the Master", "the Worker"])
         self.assertEqual([call["domain"] for call in calls],
                          [topology.PANEL_DOMAIN, topology.WORKER_DOMAIN])
-        # The Master serves the Panel page; the Worker's own vhost answers 404,
-        # which is what still proves which vhost terminated the connection.
-        self.assertEqual([call["status"] for call in calls], [200, 404])
+        # Both roles answer their own cover page on `/`; the certificate SAN pin
+        # is what still proves which role's vhost terminated the connection.
+        self.assertEqual([call["status"] for call in calls], [200, 200])
         self.assertEqual([call["container"] for call in calls], ["", "worker-test"])
         self.assertEqual(set(call["case_id"] for call in calls), {aio.TLS_CASE_ID})
         self.assertEqual(set(evidence), {"master", "worker"})
@@ -4691,7 +4861,8 @@ class TestMasterAccessCase(unittest.TestCase):
                 22: [], 80: [], 443: [],
                 3002: [{"target": "DROP", "source": "",
                         "line": "-A ufw-user-input -p tcp -m tcp --dport 3002 -j DROP"}],
-                7443: [],
+                7443: [{"target": "DROP", "source": "",
+                        "line": "-A ufw-user-input -p tcp -m tcp --dport 7443 -j DROP"}],
             },
             "counters": {
                 port: [{"packets": counts[port], "bytes": None,
@@ -4708,10 +4879,11 @@ class TestMasterAccessCase(unittest.TestCase):
         }
 
     def facts(self):
-        # The counters moved for every rule the case dialled, and the INPUT
-        # policy dropped the silent panel API probe.
+        # The counters moved for every rule the case dialled, including the
+        # panel API port now that the security contract gives it an explicit
+        # deny rule of its own.
         after_packets = {
-            port: count + 2 for port, count in self.PACKETS.items() if port != 7443
+            port: count + 2 for port, count in self.PACKETS.items()
         }
         return {
             "before": self.rule_set(),
@@ -4758,7 +4930,8 @@ class TestMasterAccessCase(unittest.TestCase):
         ]))
         self.assertEqual(evidence["input_policy"], "DROP")
         self.assertEqual(evidence["default_incoming"], "deny")
-        self.assertEqual(evidence["packets_moved"], {"22": 2, "80": 2, "443": 2, "3002": 2})
+        self.assertEqual(evidence["packets_moved"],
+                         {"22": 2, "80": 2, "443": 2, "3002": 2, "7443": 2})
         self.assertEqual(evidence["input_policy_packets_moved"], 2)
         self.assertEqual(evidence["https_tls_version"], "TLSv1.3")
         self.assertTrue(evidence["http_location"].startswith("https://"))
@@ -8064,16 +8237,16 @@ Select language / Выберите язык [en/ru]: Select deployment scheme (w
 1) Panel and one node on this server — for evaluation and personal use. Losing this server loses the Panel and its only node.
 2) Panel here, nodes on separate servers — recommended for failure isolation. This server manages the nodes and carries no client traffic.
 3) Panel and one node here, more nodes elsewhere — not recommended: losing this server takes out the Panel and one of the nodes.
-> Panel domain (the address you open in a browser): Camouflage domain (a different host that answers probes to the Panel domain): Enable Vision for panel.invalid? [y/N]: Local node name in the Panel and subscriptions (e.g. local-01): Email for Let's Encrypt notices (not the Panel login): How many remote nodes should be onboarded? Node 1 primary domain: Node 1 camouflage domain: Enable Vision for worker-1.invalid? [y/N]: Remote node 1 name in the Panel and subscriptions (e.g. ams-01): Node 2 primary domain: Node 2 camouflage domain: worker-2.invalid is already used by an answer you already gave in this card in this plan.
-Node 2 camouflage domain: cdn1.invalid is already used by node 1 camouflage domain in this plan.
-Node 2 camouflage domain: Enable Vision for worker-2.invalid? [y/N]: Remote node 2 name in the Panel and subscriptions (e.g. ams-01): Do all hosts share one registered domain? [y/N]: Choice: Retry onboarding for worker-2.invalid now? [y/N]: Choice: Select option [0-9]: """
+> Panel domain (the address you open in a browser): Camouflage domain (a different host that answers probes to the Panel domain): Enable Vision for panel.invalid? [y/N]: Local node name in the Panel and subscriptions (e.g. local-01): Email for Let's Encrypt notices (not the Panel login): How many remote nodes should be onboarded? Node 1 primary domain (XHTTP, WS and gRPC plus its static cover; no Panel runs here): Node 1 camouflage domain (the REALITY SNI): Enable Vision for worker-1.invalid? [y/N]: Remote node 1 name in the Panel and subscriptions (e.g. ams-01): Node 2 primary domain (XHTTP, WS and gRPC plus its static cover; no Panel runs here): Node 2 camouflage domain (the REALITY SNI): worker-2.invalid is already used by an answer you already gave in this card in this plan.
+Node 2 camouflage domain (the REALITY SNI): cdn1.invalid is already used by node 1 camouflage domain in this plan.
+Node 2 camouflage domain (the REALITY SNI): Enable Vision for worker-2.invalid? [y/N]: Remote node 2 name in the Panel and subscriptions (e.g. ams-01): Do all hosts share one registered domain? [y/N]: Choice: Retry onboarding for worker-2.invalid now? [y/N]: Choice: Select option [0-9]: """
 
 WIZARD_FLOW_OUTPUT = f"""\
 PLAN-BEGIN
 Installation plan:
   Panel (local-01): panel=panel.invalid camouflage=cdn.invalid vision=none
-  node 1 (worker-1): panel=worker-1.invalid camouflage=cdn1.invalid vision=none
-  node 2 (worker-2): panel=worker-2.invalid camouflage=cdn2.invalid vision=none
+  node 1 (worker-1): transport=worker-1.invalid camouflage=cdn1.invalid vision=none
+  node 2 (worker-2): transport=worker-2.invalid camouflage=cdn2.invalid vision=none
 Certificates this plan spends: 6
 Exit country: asked of each node after it serves, so nothing here contacts a country service
 Registered domain: one per host
@@ -8730,6 +8903,799 @@ class TestEnvContractCase(unittest.TestCase):
         # the journal; the case has to read that back rather than trust its undo.
         product, error = self.run_failing(restore=False)
         self.assertIn("is not the one this case started with", str(error))
+
+
+_WORKER_EDGE_DOMAIN = "worker.testbed.internal"
+_WORKER_EDGE_REALITY = "worker-reality.testbed.internal"
+_WORKER_EDGE_INDEX = (
+    b'<html><head><title>Worker camouflage | Testbed</title>'
+    b'<link rel="stylesheet" href="/static/css/site.css"></head>'
+    b'<body><img src="/static/svg/logo.svg"></body></html>'
+)
+_WORKER_EDGE_404 = b"<html><title>Not found | Testbed</title></html>"
+_WORKER_EDGE_INDEX_SHA = hashlib.sha256(_WORKER_EDGE_INDEX).hexdigest()
+_WORKER_EDGE_404_SHA = hashlib.sha256(_WORKER_EDGE_404).hexdigest()
+_WORKER_EDGE_ASSETS = {
+    "static/css/site.css": b"body{font-family:serif}",
+    "static/svg/logo.svg": b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+}
+_WORKER_EDGE_TYPES = {
+    "static/css/site.css": "text/css",
+    "static/svg/logo.svg": "image/svg+xml",
+}
+_WORKER_EDGE_HTTPS_VHOST = """# Managed by GoWave Auto NGINX: Worker Edge HTTPS
+server {
+    listen 127.0.0.1:7443 ssl proxy_protocol;
+    http2 on;
+    server_name worker.testbed.internal;
+    server_tokens off;
+
+    root /var/www/gowave-auto-nginx/cover-reality;
+    index index.html;
+    error_page 404 /404.html;
+
+    location ^~ /api/ {
+        return 444;
+    }
+
+    location ^~ /xhttp-down/ {
+        grpc_pass grpc://127.0.0.1:10001;
+    }
+
+    location = /ws {
+        proxy_pass http://127.0.0.1:10002;
+    }
+
+    location /trojan-grpc {
+        grpc_pass grpc://127.0.0.1:10003;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+"""
+_WORKER_EDGE_DECOY_VHOST = """# Managed by GoWave Auto NGINX: Worker Edge Decoy
+server {
+    listen 127.0.0.1:9443 ssl proxy_protocol;
+    server_name worker-reality.testbed.internal;
+    ssl_protocols TLSv1.3;
+    root /var/www/gowave-auto-nginx/cover-reality;
+    index index.html;
+    error_page 404 /404.html;
+}
+"""
+_WORKER_EDGE_VISION_VHOST = """# Managed by GoWave Auto NGINX: Worker Edge Vision Fallback Decoy
+server {
+    listen 127.0.0.1:9444 proxy_protocol;
+    server_name vision.testbed.internal;
+    root /var/www/gowave-auto-nginx/cover-reality;
+    index index.html;
+}
+"""
+_WORKER_EDGE_PREVIEW = (
+    "Edge migration preview for Worker worker-1:\n"
+    "  Primary name (XHTTP/WS/gRPC + static cover): worker.testbed.internal -> 127.0.0.1:7443\n"
+    "  Camouflage name (REALITY SNI):              "
+    "worker-reality.testbed.internal -> 127.0.0.1:8443\n"
+    "  Management and subscription paths are refused; Node API stays on 3002.\n"
+)
+_WORKER_EDGE_REFUSAL = (
+    "Error: re-applying a Worker rewrites its edge configuration, and there is no terminal "
+    "to confirm it on.\n"
+    "Rerun `gowave-auto.sh node reapply <name>` from a terminal, or pass "
+    "GOWAVE_MIGRATE_EXISTING=yes to confirm; either way the Worker is left unchanged until then.\n"
+)
+# The port 80 vhost a Worker carries, and the token its webroot answers with: the
+# renewal path is read through both, so a migration that takes it away is visible.
+_WORKER_EDGE_ACME_CHALLENGE_SHA = hashlib.sha256(
+    multi_node.ACME_CHALLENGE_TOKEN.encode("utf-8")).hexdigest()
+_WORKER_EDGE_ACME_VHOST = (
+    "present\t1\n"
+    "line\t1:    listen 80;\n"
+    f"line\t2:    server_name {_WORKER_EDGE_DOMAIN} {_WORKER_EDGE_REALITY};\n"
+    f"line\t3:    root {multi_node.ACME_WEBROOT};\n"
+    "webroot\t1\n"
+    "enabled\tgowave\n"
+)
+
+
+def _worker_edge_stream(routes=None):
+    """The stream map the payload renders, with the routes the caller asks for."""
+    routes = dict(routes or {
+        _WORKER_EDGE_DOMAIN: "127.0.0.1:7443",
+        _WORKER_EDGE_REALITY: "127.0.0.1:8443",
+        "default": "127.0.0.1:8443",
+    })
+    lines = ["# Managed by GoWave Auto NGINX: Worker Edge Stream",
+             "map $ssl_preread_server_name $worker_dest {"]
+    lines += [f"    {name} {backend};" for name, backend in routes.items()]
+    lines += [
+        "}", "", "server {", "    listen 443 so_keepalive=on;",
+        "    ssl_preread on;", "    proxy_protocol on;",
+        "    proxy_pass $worker_dest;", "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _worker_edge_routes_from_text(text):
+    """The map's entries, read the way the case's own parser reads them."""
+    return {
+        match.group(1): match.group(2)
+        for match in re.finditer(r"^\s*(\S+)\s+(127\.0\.0\.1:\d+);", text, re.MULTILINE)
+    }
+
+
+def _worker_edge_facts_output(https=None, decoy=None, vision=None, stream=None,
+                              routes=None, cover=None, bodies=None, assets=None):
+    """One Worker edge read, in the shape the facts script prints it."""
+    https = _WORKER_EDGE_HTTPS_VHOST if https is None else https
+    decoy = _WORKER_EDGE_DECOY_VHOST if decoy is None else decoy
+    stream = _worker_edge_stream(routes) if stream is None else stream
+    cover = cover if cover is not None else {
+        "index.html": hashlib.sha256(_WORKER_EDGE_INDEX).hexdigest(),
+        "404.html": hashlib.sha256(_WORKER_EDGE_404).hexdigest(),
+    }
+    bodies = bodies if bodies is not None else {
+        "index.html": _WORKER_EDGE_INDEX, "404.html": _WORKER_EDGE_404,
+    }
+    assets = assets if assets is not None else dict(_WORKER_EDGE_ASSETS)
+    lines = []
+    for key, text in (("https", https), ("decoy", decoy), ("vision", vision)):
+        if text is None:
+            lines.append(f"vhost\t{key}\t0")
+            continue
+        raw = text.encode("utf-8")
+        lines.append(f"vhost\t{key}\t1")
+        lines.append(f"sha\t{key}\t{hashlib.sha256(raw).hexdigest()}")
+        lines.append(f"text\t{key}\t{base64.b64encode(raw).decode('ascii')}")
+    raw = stream.encode("utf-8")
+    lines.append(
+        f"stream\tgowave-worker-stream.conf\t{base64.b64encode(raw).decode('ascii')}")
+    lines.append(f"sha\tstream\t{hashlib.sha256(raw).hexdigest()}")
+    for document, digest in cover.items():
+        lines.append(f"cover\t{document}\t{digest}")
+    for document, payload in bodies.items():
+        lines.append(f"body\t{document}\t{base64.b64encode(payload).decode('ascii')}")
+    for name, payload in sorted(assets.items()):
+        lines.append(f"asset\t{name}\t{hashlib.sha256(payload).hexdigest()}")
+    for name, backend in _worker_edge_routes_from_text(stream).items():
+        lines.append(f"sni\t{name}\t{backend}")
+    return "\n".join(lines) + "\n"
+
+
+class _WorkerEdgePodman:
+    """The Worker's own edge files, the client's sockets, and the operator's re-apply.
+
+    The map write is applied to the fake host's state instead of being echoed, so
+    the read that follows a write reports what was written: a case that never
+    installed the legacy identity would fail on its own next assertion rather
+    than passing on a fixture that answered for it.
+    """
+
+    ROLES = {"aio-master": "master", "worker-01": "worker"}
+
+    def __init__(self, facts=None, routes=None, refused_returncode=1, preview=None,
+                 refusal=None, extra_output="", confirmed_returncode=0,
+                 confirmed_stream=None, outcomes=None, replies=None, writes=None,
+                 acme_dropped=False):
+        self.stream_text = (_worker_edge_stream(routes) if routes is not None
+                            else _worker_edge_stream())
+        self.facts = facts
+        self.acme_dropped = acme_dropped
+        self.refused_returncode = refused_returncode
+        self.preview = _WORKER_EDGE_PREVIEW if preview is None else preview
+        self.refusal = _WORKER_EDGE_REFUSAL if refusal is None else refusal
+        self.extra_output = extra_output
+        self.confirmed_returncode = confirmed_returncode
+        self.confirmed_stream = confirmed_stream
+        self.outcomes = outcomes or {}
+        self.replies = replies or {}
+        self.writes = [] if writes is None else writes
+        self.refusals = []
+        self.confirmations = []
+
+    def primary_on_decoy(self):
+        routes = _worker_edge_routes_from_text(self.stream_text)
+        return routes.get(_WORKER_EDGE_DOMAIN) == f"127.0.0.1:{multi_node.DECOY_LISTENER_PORT}"
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        if multi_node.WORKER_EDGE_FACTS.strip() == script.strip():
+            if self.facts is not None:
+                return subprocess.CompletedProcess(["bash", "-lc"], 0, self.facts, "")
+            return subprocess.CompletedProcess(["bash", "-lc"], 0, _worker_edge_facts_output(
+                stream=self.stream_text,
+            ), "")
+        if "base64 -d >" in script:
+            payload = re.search(r"printf '%s' (\S+) \| base64 -d", script).group(1)
+            self.stream_text = base64.b64decode(payload).decode("utf-8")
+            self.writes.append(self.stream_text)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"written\t{hashlib.sha256(self.stream_text.encode()).hexdigest()}\n", "")
+        if "acme-challenge" in script and "sha256sum" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"challenge\t{multi_node.ACME_WEBROOT}\t{_WORKER_EDGE_ACME_CHALLENGE_SHA}\n", "")
+        if "sites-enabled" in script:
+            # A migration is allowed to rewrite the edge; taking the renewal
+            # vhost with it is a defect, so the fake can be told to lose it.
+            if self.acme_dropped and self.confirmations:
+                return subprocess.CompletedProcess(["bash", "-lc"], 0, "present\t0\n", "")
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0, _WORKER_EDGE_ACME_VHOST, "")
+        if "node reapply" in script:
+            if "GOWAVE_MIGRATE_EXISTING=yes" in script:
+                self.confirmations.append(script)
+                if self.confirmed_returncode:
+                    return subprocess.CompletedProcess(
+                        ["bash", "-lc"], self.confirmed_returncode, "", "re-apply failed\n")
+                self.stream_text = (
+                    _worker_edge_stream() if self.confirmed_stream is None
+                    else self.confirmed_stream)
+                return subprocess.CompletedProcess(
+                    ["bash", "-lc"], 0, "Worker 'worker-1' re-applied.\n", "")
+            self.refusals.append(script)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.refused_returncode,
+                self.preview + self.extra_output, self.refusal)
+        raise AssertionError(f"unexpected script on {container}: {script[:120]}")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        attempts = json.loads(argv[3])
+        entries = []
+        for attempt in attempts:
+            entry = {
+                "label": attempt["label"],
+                "address": attempt["address"],
+                "port": attempt["port"],
+                "outcome": self.outcomes.get(
+                    attempt["label"],
+                    "CONNECTED" if attempt["port"] == 443 else "REFUSED",
+                ),
+            }
+            if attempt.get("payload_b64"):
+                entry["sent_bytes"] = len(base64.b64decode(attempt["payload_b64"]))
+            if attempt.get("read_reply"):
+                reply, closed, timed_out = self.replies.get(attempt["label"], (b"", True, False))
+                entry["reply_bytes"] = len(reply)
+                entry["reply_preview"] = reply.decode("latin-1", "replace").strip()[:200]
+                entry["reply_closed"] = closed
+                entry["reply_timeout"] = timed_out
+            entries.append(entry)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(entries), "")
+
+
+class _WorkerEdgeHost:
+    """The client role, both addresses, and the fixture zone the case steers."""
+
+    target_name = "aio-master"
+    panel_domain = topology.PANEL_DOMAIN
+    reality_domain = topology.REALITY_DOMAIN
+    vision_domain = None
+    worker_name = "worker-01"
+    worker_domain = _WORKER_EDGE_DOMAIN
+    worker_reality_domain = _WORKER_EDGE_REALITY
+    worker_vision_domain = ""
+    worker_node_name = "worker-1"
+    client_name = "client-01"
+    untrusted_name = "untrusted-01"
+
+    def __init__(self, podman=None, management_open=False, absent_sni="served",
+                 unmapped_lineage=None, scanner_body=None, overrides=None):
+        self.podman = podman
+        self.management_open = management_open
+        self.absent_sni = absent_sni
+        self.unmapped_lineage = unmapped_lineage
+        self.scanner_body = scanner_body
+        self.overrides = overrides or {}
+        self.insecure = []
+        self.zone_writes = []
+        self._zone = {"records": {topology.PANEL_DOMAIN: {"A": ["10.89.0.10"]}}}
+        self.plan = type("Plan", (), {"target_ip": "10.89.0.10", "worker_ip": "10.89.0.11"})()
+
+    def zone(self):
+        return copy.deepcopy(self._zone)
+
+    def write_dns_zone(self, zone):
+        self._zone = copy.deepcopy(zone)
+        self.zone_writes.append(copy.deepcopy(zone))
+
+    def client_http(self, url, timeout=30, **kwargs):
+        if kwargs.get("insecure"):
+            self.insecure.append(url)
+        name, _, path = url.split("://", 1)[1].partition("/")
+        path = f"/{path}"
+        hosts = [str(header) for header in kwargs.get("headers") or ()]
+        if name == str(self.plan.worker_ip):
+            if self.absent_sni == "closed":
+                return self._closed(url, "ConnectionResetError: [Errno 104]")
+            return self._answer(url, 200, _WORKER_EDGE_INDEX, self._lineage(_WORKER_EDGE_REALITY))
+        if name.split(".")[0] == "probe-worker":
+            sans = self.unmapped_lineage or self._lineage(_WORKER_EDGE_REALITY)
+            return self._answer(url, 200, _WORKER_EDGE_INDEX, sans)
+        if path.startswith(multi_node.ACME_CHALLENGE_DIR + "/"):
+            token = path.rsplit("/", 1)[-1].encode("utf-8")
+            return self._answer(url, 200, token, self._lineage(_WORKER_EDGE_DOMAIN),
+                                content_type="text/plain")
+        legacy = self.podman is not None and self.podman.primary_on_decoy()
+        if path in self.overrides:
+            return self._answer(url, 200, self.overrides[path], self._lineage(
+                _WORKER_EDGE_DOMAIN))
+        if path.lstrip("/") in _WORKER_EDGE_ASSETS and path != "/":
+            asset = path.lstrip("/")
+            return self._answer(
+                url, 200, _WORKER_EDGE_ASSETS[asset], self._lineage(_WORKER_EDGE_DOMAIN),
+                content_type=_WORKER_EDGE_TYPES[asset],
+            )
+        if path == "/":
+            return self._answer(url, 200, _WORKER_EDGE_INDEX, self._lineage(_WORKER_EDGE_DOMAIN))
+        if path.startswith("/api/"):
+            if legacy or self.management_open:
+                return self._answer(
+                    url, 404, _WORKER_EDGE_404, self._lineage(_WORKER_EDGE_REALITY),
+                )
+            return self._closed(url, "ConnectionResetError: [Errno 104] Connection reset")
+        if path in multi_node.WORKER_EDGE_SCANNER_PATHS and self.scanner_body is not None:
+            return self._answer(
+                url, 404, self.scanner_body, self._lineage(_WORKER_EDGE_DOMAIN))
+        return self._answer(url, 404, _WORKER_EDGE_404, self._lineage(_WORKER_EDGE_DOMAIN))
+
+    @staticmethod
+    def _lineage(name):
+        # Both lineages of this fixture name the primary and camouflage names, so
+        # a SAN list alone cannot tell the two listeners apart; what separates
+        # them is where the request landed, which is what the body and the
+        # closure are read for.
+        return [_WORKER_EDGE_DOMAIN, _WORKER_EDGE_REALITY]
+
+    def _answer(self, url, status, payload, sans, content_type="text/html"):
+        probe = {
+            "url": url,
+            "method": "GET",
+            "status": status,
+            "headers": {"content-type": content_type},
+            "body_length": len(payload),
+            "body_sha256": hashlib.sha256(payload).hexdigest(),
+            "body_snippet": payload[:300].decode("utf-8", "replace"),
+            "peer": {"san": list(sans), "tls_version": "TLSv1.3"},
+        }
+        return {"url": url, "returncode": 0, "stdout": json.dumps(probe),
+                "stderr": "", "probe": probe}
+
+    def _closed(self, url, error):
+        probe = {"url": url, "tls_pins": {"min": "", "max": ""}, "error": error}
+        return {"url": url, "returncode": 1, "stdout": json.dumps(probe),
+                "stderr": "", "probe": probe}
+
+
+class _WorkerEdgeProduct:
+    """The Worker the case reads, its Panel inventory, and the connection it waits on."""
+
+    def __init__(self, podman, host, cluster=None, clusters=None, connected=True):
+        self.podman = podman
+        self.host = host
+        self.cluster = cluster if cluster is not None else _worker_edge_cluster()
+        self.clusters = list(clusters or [])
+        self.cluster_reads = 0
+        self.connected = connected
+        self.waits = []
+
+    def require_worker(self):
+        return self.host
+
+    def cluster_facts(self, case_id):
+        self.cluster_reads += 1
+        if self.clusters:
+            return self.clusters[min(self.cluster_reads - 1, len(self.clusters) - 1)]
+        return self.cluster
+
+    def wait_for_worker_connection(self, case_id, expected, timeout_seconds):
+        """The real poll refuses when the Panel still reports the other state."""
+        self.waits.append((case_id, expected, timeout_seconds))
+        if bool(self.connected) is not expected:
+            raise AssertionError(
+                f"{case_id}: the Panel still reports {topology.WORKER_NODE_NAME!r} as "
+                f"{self.connected!r} after {timeout_seconds}s, expected "
+                f"{'connected' if expected else 'offline'}"
+            )
+        return {"connected": bool(self.connected)}
+
+
+def _worker_edge_cluster(worker_uuid="d-node-worker", worker_profile="d-prof-worker"):
+    return {
+        "nodes": {"status": 200, "records": [
+            {"name": "local-node", "uuid": "d-node-local", "profile": "d-prof-local",
+             "inbounds": ["d-in-1"], "connected": True},
+            {"name": topology.WORKER_NODE_NAME, "uuid": worker_uuid,
+             "profile": worker_profile, "inbounds": ["d-in-2"], "connected": True},
+        ]},
+        "hosts": {"status": 200, "records": [
+            {"uuid": "d-host-1", "remark": "worker-reality", "sni": _WORKER_EDGE_REALITY,
+             "inbound": "d-in-2", "nodes": [worker_uuid]},
+            {"uuid": "d-host-0", "remark": "local", "sni": topology.REALITY_DOMAIN,
+             "inbound": "d-in-1", "nodes": ["d-node-local"]},
+        ]},
+    }
+
+
+class TestWorkerEdgeCase(unittest.TestCase):
+    """MN-WORKER-EDGE: the Worker's public 443 is what a scanning client meets."""
+
+    def run_case(self, podman=None, host=None):
+        podman = podman if podman is not None else _WorkerEdgePodman()
+        if host is None:
+            host = _WorkerEdgeHost(podman=podman)
+        return multi_node.case_worker_edge(_WorkerEdgeProduct(podman, host))
+
+    def test_the_client_meets_the_site_the_refusals_and_the_fallback(self):
+        evidence = self.run_case()
+        self.assertEqual(evidence["routes"][_WORKER_EDGE_DOMAIN], "127.0.0.1:7443")
+        self.assertEqual(evidence["routes"][_WORKER_EDGE_REALITY], "127.0.0.1:8443")
+        self.assertNotIn(f"127.0.0.1:{multi_node.DECOY_LISTENER_PORT}",
+                         evidence["routes"].values())
+        self.assertEqual(evidence["site"]["root"]["status"], 200)
+        self.assertEqual(evidence["site"]["root"]["body_sha256"], _WORKER_EDGE_INDEX_SHA)
+        self.assertIn(_WORKER_EDGE_DOMAIN, evidence["site"]["root"]["san"])
+        self.assertEqual(evidence["assets"]["/static/css/site.css"]["content_type"], "text/css")
+        self.assertEqual(evidence["assets"]["/static/svg/logo.svg"]["content_type"],
+                         "image/svg+xml")
+        self.assertEqual(evidence["unknown_path"]["body_sha256"], _WORKER_EDGE_404_SHA)
+        for path in multi_node.WORKER_EDGE_MANAGEMENT_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue(evidence["management"][path]["closed"])
+        for path in multi_node.WORKER_EDGE_SCANNER_PATHS:
+            with self.subTest(path=path):
+                self.assertEqual(evidence["scanners"][path]["status"], 404)
+                self.assertEqual(evidence["scanners"][path]["body_sha256"],
+                                 _WORKER_EDGE_404_SHA)
+        self.assertEqual(evidence["mismatch"]["host_header"], topology.PANEL_DOMAIN)
+        self.assertNotIn(topology.PANEL_DOMAIN, evidence["mismatch"]["site"]["san"])
+        self.assertTrue(evidence["mismatch"]["management"]["closed"])
+        self.assertEqual(evidence["absent_sni"]["status"], 200)
+        self.assertIn(_WORKER_EDGE_REALITY, evidence["absent_sni"]["san"])
+        self.assertEqual(evidence["unmapped_sni"]["name"],
+                         multi_node.WORKER_EDGE_UNMAPPED_SNI)
+        self.assertIn(_WORKER_EDGE_REALITY, evidence["unmapped_sni"]["san"])
+        self.assertTrue(evidence["paths"]["malformed"]["reply_closed"])
+        self.assertEqual(evidence["paths"][str(multi_node.DECOY_LISTENER_PORT)]["outcome"],
+                         "REFUSED")
+        self.assertEqual(evidence["still_serving"]["status"], 200)
+
+    def test_the_probe_name_is_written_into_the_zone_and_put_back(self):
+        podman = _WorkerEdgePodman()
+        host = _WorkerEdgeHost(podman=podman)
+        self.run_case(podman=podman, host=host)
+        self.assertIn(multi_node.WORKER_EDGE_UNMAPPED_SNI, host.zone_writes[0]["records"])
+        self.assertNotIn(multi_node.WORKER_EDGE_UNMAPPED_SNI, host.zone_writes[-1]["records"])
+        self.assertEqual(host.zone_writes[-1]["records"][topology.PANEL_DOMAIN],
+                         {"A": ["10.89.0.10"]})
+
+    def test_a_management_path_that_answers_instead_of_closing_is_rejected(self):
+        host = _WorkerEdgeHost(management_open=True)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("instead of closing the connection", str(caught.exception))
+        self.assertIn("/api/", str(caught.exception))
+
+    def test_a_scanner_path_answered_by_a_server_default_is_rejected(self):
+        host = _WorkerEdgeHost(scanner_body=b"<html>nginx</html>")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("instead of the cover site's own 404.html", str(caught.exception))
+        self.assertIn("/metrics", str(caught.exception))
+
+    def test_a_vhost_with_a_second_management_block_is_rejected(self):
+        https = _WORKER_EDGE_HTTPS_VHOST.replace(
+            "    location / {",
+            "    location ^~ /api/sub/ {\n        return 444;\n    }\n\n    location / {",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_WorkerEdgePodman(facts=_worker_edge_facts_output(https=https)))
+        self.assertIn("declares 2 `location ^~ /api/` block(s)", str(caught.exception))
+
+    def test_a_camouflage_vhost_with_a_location_is_rejected(self):
+        decoy = _WORKER_EDGE_DECOY_VHOST.replace(
+            "    error_page 404 /404.html;",
+            "    error_page 404 /404.html;\n    location = /healthz { return 200; }",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_WorkerEdgePodman(facts=_worker_edge_facts_output(decoy=decoy)))
+        self.assertIn("publishes routes it owes no handler for", str(caught.exception))
+
+    def test_a_name_routed_straight_to_the_camouflage_listener_is_rejected(self):
+        # A Worker owns no route to 9443: REALITY reaches that site on its own.
+        routes = {
+            _WORKER_EDGE_DOMAIN: "127.0.0.1:7443",
+            _WORKER_EDGE_REALITY: "127.0.0.1:8443",
+            "www.worker.testbed.internal": f"127.0.0.1:{multi_node.DECOY_LISTENER_PORT}",
+            "default": "127.0.0.1:8443",
+        }
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_WorkerEdgePodman(routes=routes))
+        self.assertIn("straight to the camouflage listener", str(caught.exception))
+
+    def test_a_vision_vhost_without_a_vision_name_is_rejected(self):
+        facts = _worker_edge_facts_output(vision=_WORKER_EDGE_VISION_VHOST)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_WorkerEdgePodman(facts=facts))
+        self.assertIn("although this deployment has no Vision name", str(caught.exception))
+
+    def test_a_vision_name_without_its_vhost_is_rejected(self):
+        host = _WorkerEdgeHost()
+        host.worker_vision_domain = "vision.testbed.internal"
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("has no /etc/nginx/conf.d/gowave-worker-vision-fallback.conf",
+                      str(caught.exception))
+
+    def test_a_malformed_handshake_answered_with_http_is_rejected(self):
+        podman = _WorkerEdgePodman(replies={
+            "worker-443-malformed": (b"HTTP/1.1 400 Bad Request\r\n", True, False),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("was answered with an HTTP response", str(caught.exception))
+
+    def test_an_unconfigured_name_served_by_another_lineage_is_rejected(self):
+        host = _WorkerEdgeHost(unmapped_lineage=["panel.testbed.internal"])
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("the fallback did not reach the decoy", str(caught.exception))
+
+
+class TestWorkerMigrationCase(unittest.TestCase):
+    """MN-MIGRATE: a legacy Worker edge is rewritten only on the operator's word."""
+
+    def run_case(self, podman=None, host=None, clusters=None, connected=True):
+        podman = podman if podman is not None else _WorkerEdgePodman()
+        if host is None:
+            host = _WorkerEdgeHost(podman=podman)
+        product = _WorkerEdgeProduct(
+            podman, host, clusters=clusters, connected=connected,
+        )
+        return multi_node.case_worker_migration(product), product
+
+    def test_the_legacy_edge_is_read_and_only_the_confirmed_run_adopts_it(self):
+        podman = _WorkerEdgePodman()
+        evidence, product = self.run_case(podman=podman)
+        self.assertEqual(
+            evidence["legacy"]["routes"][_WORKER_EDGE_DOMAIN],
+            f"127.0.0.1:{multi_node.DECOY_LISTENER_PORT}",
+        )
+        self.assertEqual(evidence["legacy"]["management_path"]["status"], 404)
+        self.assertEqual(evidence["legacy"]["management_path"]["body_sha256"],
+                         _WORKER_EDGE_404_SHA)
+        self.assertEqual(evidence["refused"]["returncode"], 1)
+        self.assertEqual(len(podman.refusals), 1)
+        self.assertNotIn("GOWAVE_MIGRATE_EXISTING=yes", podman.refusals[0])
+        self.assertEqual(len(podman.confirmations), 1)
+        self.assertIn("GOWAVE_MIGRATE_EXISTING=yes", podman.confirmations[0])
+        self.assertEqual(evidence["adopted"]["routes"][_WORKER_EDGE_DOMAIN], "127.0.0.1:7443")
+        self.assertTrue(evidence["adopted"]["management"]["closed"])
+        self.assertEqual(evidence["renewal"]["challenge"]["status"], 200)
+        self.assertEqual(evidence["renewal"]["challenge"]["body_sha256"],
+                         _WORKER_EDGE_ACME_CHALLENGE_SHA)
+        self.assertTrue(evidence["renewal_unchanged"])
+        self.assertTrue(evidence["identity_unchanged"])
+        self.assertTrue(evidence["connected"])
+        self.assertEqual(podman.writes, [
+            multi_node.legacy_map_text(
+                multi_node.WORKER_MIGRATION_CASE_ID, _worker_edge_stream(), _WORKER_EDGE_DOMAIN,
+            ),
+        ])
+        self.assertEqual(product.waits, [(multi_node.WORKER_MIGRATION_CASE_ID, True,
+                                          multi_node.RESTART_TIMEOUT_SECONDS)])
+
+    def test_a_refused_reapply_that_streams_the_payload_is_rejected(self):
+        podman = _WorkerEdgePodman(
+            extra_output="Re-applying the Worker payload to 'worker-1' (10.89.0.11:22)...\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("streamed the payload anyway", str(caught.exception))
+
+    def test_a_refusal_without_the_promised_route_is_rejected(self):
+        podman = _WorkerEdgePodman(preview=(
+            "Edge migration preview for Worker worker-1:\n"
+            "  Camouflage name (REALITY SNI): "
+            "worker-reality.testbed.internal -> 127.0.0.1:8443\n"
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("the identity this run would serve", str(caught.exception))
+
+    def test_a_confirmed_run_that_changes_the_registration_is_rejected(self):
+        clusters = [
+            _worker_edge_cluster(),
+            _worker_edge_cluster(worker_uuid="d-node-recreated"),
+        ]
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(clusters=clusters)
+        self.assertIn("changed what the Panel publishes about it", str(caught.exception))
+
+    def test_a_worker_that_does_not_reconnect_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(connected=False)
+        self.assertIn("still reports 'worker-1' as False", str(caught.exception))
+
+    def test_a_failed_confirmed_run_restores_the_map_it_replaced(self):
+        podman = _WorkerEdgePodman(confirmed_returncode=1)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("the confirmed `node reapply` exited 1", str(caught.exception))
+        self.assertEqual(podman.stream_text, _worker_edge_stream())
+        self.assertEqual(len(podman.writes), 2)
+        self.assertEqual(podman.writes[-1], _worker_edge_stream())
+
+    def test_a_map_without_the_primary_line_is_refused_before_it_is_rewritten(self):
+        routes = {
+            _WORKER_EDGE_REALITY: "127.0.0.1:8443",
+            "default": "127.0.0.1:8443",
+        }
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.legacy_map_text(
+                multi_node.WORKER_MIGRATION_CASE_ID, _worker_edge_stream(routes),
+                _WORKER_EDGE_DOMAIN,
+            )
+        self.assertIn("instead of exactly one", str(caught.exception))
+
+    def test_a_migration_that_drops_the_renewal_vhost_is_rejected(self):
+        podman = _WorkerEdgePodman(acme_dropped=True)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("no port 80 ACME vhost", str(caught.exception))
+
+    def test_both_new_cases_run_once_in_their_own_windows(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        suite = multi_node.cases(_StubPodman(Path(tmp.name)))
+        ids = [case.id for case in suite]
+        self.assertEqual(ids.count(multi_node.WORKER_EDGE_CASE_ID), 1)
+        self.assertEqual(ids.count(multi_node.WORKER_MIGRATION_CASE_ID), 1)
+        self.assertLess(ids.index(multi_node.DECOY_ROUTE_CASE_ID),
+                        ids.index(multi_node.WORKER_EDGE_CASE_ID))
+        self.assertLess(ids.index(multi_node.WORKER_EDGE_CASE_ID),
+                        ids.index(multi_node.WORKER_MIGRATION_CASE_ID))
+        self.assertLess(ids.index(multi_node.WORKER_MIGRATION_CASE_ID),
+                        ids.index(multi_node.ACME80_CASE_ID))
+        cases = {case.id: case for case in suite}
+        self.assertEqual(cases[multi_node.WORKER_EDGE_CASE_ID].timeout_seconds,
+                         multi_node.WORKER_EDGE_TIMEOUT_SECONDS)
+        self.assertEqual(cases[multi_node.WORKER_MIGRATION_CASE_ID].timeout_seconds,
+                         multi_node.WORKER_MIGRATION_TIMEOUT_SECONDS)
+        self.assertEqual(cases[multi_node.WORKER_EDGE_CASE_ID].topology, "multi-node")
+
+
+class TestInsecurePeerSan(unittest.TestCase):
+    """The independent probe reports SAN even when it does not verify the peer.
+
+    The no-SNI and unmapped-SNI reads run with verification off, and CPython's
+    `getpeercert()` returns an empty mapping under CERT_NONE. Reading that as "the
+    certificate names nothing" failed MN-WORKER-EDGE while the Worker served its
+    camouflage lineage: the names are on the wire in the DER, so the probe
+    decodes them instead.
+    """
+
+    def test_a_peer_certificate_is_decoded_when_verification_is_off(self):
+        from tools.podman_e2e import http_probe
+        with tempfile.TemporaryDirectory() as directory:
+            key = Path(directory) / "key.pem"
+            certificate = Path(directory) / "cert.pem"
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-keyout", str(key), "-out", str(certificate), "-days", "1",
+                 "-subj", "/CN=",
+                 "-addext", "subjectAltName=DNS:worker-reality.testbed.internal"],
+                check=True, capture_output=True,
+            )
+            der = ssl.PEM_cert_to_DER_cert(certificate.read_text(encoding="ascii"))
+
+        class UnverifiedPeer:
+            def getpeercert(self, binary_form=False):
+                return der if binary_form else {}
+
+            def version(self):
+                return "TLSv1.3"
+
+        report = http_probe.peer_report(UnverifiedPeer())
+        self.assertIn("worker-reality.testbed.internal", report.get("san") or [])
+
+
+class TestWorkerResumeAndComposedMixedCase(unittest.TestCase):
+    """MN-WORKER-RESUME and MN-COMPOSED-MIXED are declared once, in their windows.
+
+    Both observe a healthy cluster, so they must run after the edge is adopted
+    (migration) and before the lifecycle cases that revoke a client and fault the
+    Worker's own unit — no case observing a healthy cluster may run after those.
+    """
+
+    def _suite(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return multi_node.cases(_StubPodman(Path(tmp.name)))
+
+    def test_both_cases_run_once_in_their_own_windows(self):
+        suite = self._suite()
+        ids = [case.id for case in suite]
+        self.assertEqual(ids.count(multi_node.WORKER_RESUME_CASE_ID), 1)
+        self.assertEqual(ids.count(multi_node.COMPOSED_MIXED_CASE_ID), 1)
+        self.assertLess(ids.index(multi_node.WORKER_MIGRATION_CASE_ID),
+                        ids.index(multi_node.WORKER_RESUME_CASE_ID))
+        self.assertLess(ids.index(multi_node.WORKER_RESUME_CASE_ID),
+                        ids.index(multi_node.COMPOSED_MIXED_CASE_ID))
+        self.assertLess(ids.index(multi_node.COMPOSED_MIXED_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+
+    def test_each_case_keeps_its_topology_and_ceiling(self):
+        cases = {case.id: case for case in self._suite()}
+        resume = cases[multi_node.WORKER_RESUME_CASE_ID]
+        composed = cases[multi_node.COMPOSED_MIXED_CASE_ID]
+        self.assertEqual(resume.topology, "multi-node")
+        self.assertEqual(composed.topology, "multi-node")
+        self.assertEqual(resume.timeout_seconds,
+                         multi_node.WORKER_RESUME_TIMEOUT_SECONDS)
+        self.assertEqual(composed.timeout_seconds,
+                         multi_node.COMPOSED_MIXED_TIMEOUT_SECONDS)
+        self.assertGreater(resume.timeout_seconds, 0)
+        self.assertGreater(composed.timeout_seconds, 0)
+
+
+class TestNginxPinCase(unittest.TestCase):
+    """NGX-PIN reads the pin back from the hosts, not from the installer's word.
+
+    The unit suite already proves the selection logic against a stubbed
+    toolchain; this case is the one that proves an installed host carries the
+    approved revision, the Stream SNI build and the downloaded origin.
+    """
+
+    STREAM = "configure arguments: --with-stream --with-stream_ssl_preread_module\n"
+    HISTORY = "Commandline: apt-get install nginx_1.30.8-1~trixie_amd64.deb\n"
+
+    def facts(self, *, package="nginx\t1.30.8-1~trixie\n", built=STREAM, history=HISTORY):
+        answers = {
+            "dpkg-query -W nginx": package,
+            "nginx -V 2>&1": built,
+            "cat /var/log/apt/history.log 2>/dev/null": history,
+        }
+
+        class Product:
+            distribution = "debian-13"
+            podman = types.SimpleNamespace(
+                exec_bash=lambda container, command, **kwargs: subprocess.CompletedProcess(
+                    command, 0, answers[command], ""),
+            )
+
+        return multi_node.nginx_pin_facts(Product(), "NGX-PIN", "master", "aio-x", "trixie")
+
+    def test_the_pinned_revision_stream_build_and_origin_are_read_back(self):
+        self.assertEqual(self.facts(), {
+            "version": "1.30.8-1~trixie",
+            "stream": "static",
+            "origin": "approved download",
+        })
+
+    def test_a_distribution_revision_is_refused(self):
+        # `1.26.3-3+deb13u11` is what trixie's archive ships: a host left on it
+        # is outside the pin, and the case must say so instead of accepting a
+        # package that merely looks like nginx.
+        with self.assertRaisesRegex(Exception, "expected 'nginx 1.30.8-1~trixie'"):
+            self.facts(package="nginx\t1.26.3-3+deb13u11\n")
+
+    def test_a_build_without_stream_sni_is_refused(self):
+        with self.assertRaisesRegex(Exception, "does not report --with-stream_ssl_preread_module"):
+            self.facts(built="configure arguments: --with-stream\n")
+
+    def test_an_install_without_the_downloaded_package_is_refused(self):
+        with self.assertRaisesRegex(Exception, "did not come from the approved download"):
+            self.facts(history="Install: nginx:amd64 (1.30.8-1~trixie)\n")
+
+    def test_a_distribution_without_an_approved_suite_is_refused(self):
+        class Product:
+            distribution = "alpine-3.22"
+
+        with self.assertRaisesRegex(Exception, "has no approved NGINX suite"):
+            multi_node.case_nginx_pin(Product())
 
 
 if __name__ == "__main__":

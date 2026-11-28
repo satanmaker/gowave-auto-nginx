@@ -196,7 +196,9 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
             for candidate in topology.DATA_PREFIX_CANDIDATES
         )
         self.assertEqual(sorted(public_addresses(text)), expected)
-        self.assertEqual(len(expected), 3, "keep the exception to one small, auditable list")
+        self.assertEqual(len(expected), 4,
+                         "four concurrent distributions need four data blocks; keep the "
+                         "exception to one small, auditable list")
 
     def test_harness_never_reaches_a_remote_host_over_ssh(self):
         # The literal name of the SSH library is not what reaches a host: the

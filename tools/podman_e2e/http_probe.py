@@ -17,8 +17,10 @@ import argparse
 import hashlib
 import http.client
 import json
+import os
 import ssl
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlsplit
@@ -74,11 +76,45 @@ def _tls_version(name: str) -> "ssl.TLSVersion":
         ) from None
 
 
+def _decoded_peer_cert(sock: Any) -> Dict[str, Any]:
+    """The peer certificate as the ssl decoder sees it, verification or not.
+
+    ``getpeercert()`` returns an empty mapping when verification is off
+    (``CERT_NONE``), which is the mode a case uses to observe a rejection. The
+    names are still on the wire, so the DER form is decoded instead of trusting
+    the empty dict: a no-SNI handshake then reports the certificate's SAN
+    instead of an empty list that reads as "the certificate names nothing".
+    """
+    cert = sock.getpeercert()
+    if cert:
+        return cert
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        return {}
+    decoder = getattr(ssl, "_test_decode_cert", None) or getattr(
+        getattr(ssl, "_ssl", None), "_test_decode_cert", None
+    )
+    if decoder is None:
+        return {}
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".pem", delete=False, encoding="ascii"
+    ) as handle:
+        handle.write(ssl.DER_cert_to_PEM_cert(der))
+        path = handle.name
+    try:
+        return decoder(path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def peer_report(sock: Any) -> Dict[str, Any]:
     if sock is None:
         return {}
     try:
-        cert = sock.getpeercert()
+        cert = _decoded_peer_cert(sock)
     except (ValueError, OSError):
         return {}
     if not cert:

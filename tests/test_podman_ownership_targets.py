@@ -247,11 +247,13 @@ class TestOwnershipTargetsCase(unittest.TestCase):
 
     def test_the_guard_runs_before_the_first_managed_path(self):
         body = ownership_targets.WORKER_INSTALLER.read_text(encoding="utf-8")
-        guard = body.index("    verify_worker_mutation_targets_preflight || return 1\n")
+        # The confirmed-migration branch calls the guard with the adopt override;
+        # both the override call and the plain call sit before any mutation.
+        guard = body.index("verify_worker_mutation_targets_preflight || return 1")
         record = body.index("    record_worker_mutation_targets\n")
         for later in ("setup_system_prereqs </dev/null", "configure_host_security </dev/null",
                       "configure_firewall </dev/null", "unpack_cover_reality </dev/null",
-                      "configure_edge_nginx </dev/null",
+                      "configure_edge_nginx \"$_WORKER_LIVE_DIR\" \"$_REALITY_LIVE_DIR\" \"${_VISION_LIVE_DIR:-}\" </dev/null",
                       "run_upstream_node_installer </dev/null"):
             with self.subTest(mutation=later):
                 self.assertLess(guard, body.index(later))
@@ -260,6 +262,29 @@ class TestOwnershipTargetsCase(unittest.TestCase):
         # the file happens to hold first: the signal block disarms its own.
         self.assertLess(record, body.index(
             "    # Disable ERR compensation trap on verified success\n"))
+
+    def test_a_confirmed_migration_adopts_an_unowned_regular_file(self):
+        # `node reapply` with GOWAVE_MIGRATE_EXISTING=yes forwards the adopt
+        # flag: a regular file this install did not record (the legacy stream
+        # map) is rewritten on the operator's word, while an unconfirmed run
+        # still refuses it. Symlinks and directories stay refused either way.
+        script = (
+            "set -u\n"
+            "work=$(mktemp -d)\n"
+            "trap 'rm -rf \"$work\"' EXIT\n\n"
+            + ownership_targets.guard_functions()
+            + "\n"
+            "root=\"$work/legacy\"\n"
+            "mkdir -p \"$root/etc/nginx/stream-enabled\" \"$root/var/lib\"\n"
+            "printf 'legacy map\\n' > \"$root/etc/nginx/stream-enabled/gowave-worker-stream.conf\"\n"
+            "printf '%s\\n' '{\"created_by_tx\": true, \"targets\": {}}' > \"$root/var/lib/ownership.json\"\n"
+            "verify_worker_mutation_targets_preflight \"$root\" \"$root/var/lib/ownership.json\" >/dev/null 2>&1; printf 'plain=%s\\n' \"$?\"\n"
+            "GOWAVE_ADOPT_UNOWNED=1 verify_worker_mutation_targets_preflight \"$root\" \"$root/var/lib/ownership.json\" >/dev/null 2>&1; printf 'adopt=%s\\n' \"$?\"\n"
+        )
+        finished = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertIn("plain=1", finished.stdout)
+        self.assertIn("adopt=0", finished.stdout)
 
     def test_a_contour_without_a_worker_is_blocked_not_passed(self):
         product = _LocalProduct(worker=False)

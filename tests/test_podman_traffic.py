@@ -2007,7 +2007,8 @@ class TestTrafficTopology(unittest.TestCase):
             patcher = mock.patch.object(target, value, return_value=self._stub_value(value))
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.instance.create()
+        with mock.patch.object(topology, "NETWORK_RESERVATION_LOCK", self.leaf_dir / "networks.lock"):
+            self.instance.create()
 
     def _stub_value(self, name):
         if name == "issued_root":

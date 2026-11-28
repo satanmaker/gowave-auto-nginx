@@ -314,11 +314,12 @@ class TestPanelOnlySuite(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(self.context.run_cleanup)
 
-    def test_the_suite_declares_the_six_cases_in_run_order(self):
+    def test_the_suite_declares_the_cases_in_run_order(self):
         suite = panel_only.cases(FakePodman(self.context))
         self.assertEqual(
             [case.id for case in suite],
-            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
+            ["PO-INSTALL", "PO-HOST", "PO-FIREWALL", "PO-API", "PO-SQUAD",
+             "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
         )
         self.assertEqual({case.topology for case in suite}, {"panel-only"})
         self.assertEqual(

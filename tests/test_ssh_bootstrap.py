@@ -530,6 +530,7 @@ class TestOnboardingLifecycle(unittest.TestCase):
         self.assertIn("REVOKE", log)
         self.assertIn("AGENT_STOP", log)
         self.assertIn("registration failed", result.stderr)
+        self.assertIn("FAILED-PHASE:add_node", result.stderr)
 
     def test_without_vision_the_node_add_carries_no_vision_flag(self):
         result, log = self._onboard(0, vision="")
@@ -656,6 +657,117 @@ class TestStageNotices(unittest.TestCase):
         self.assertEqual(process.returncode, 0, seen)
         self.assertNotIn(b"wizard.phase", seen)
         self.assertNotIn(b"not_a_stage", seen)
+
+    def test_worker_progress_renders_only_known_stages_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capture"
+            seen, process = _run_on_pty(
+                SOURCE
+                + "_ssh_bootstrap_bind_terminal\n"
+                  "printf '%s\\n' 'GOWAVE-WORKER-STAGE:hardening' 'GOWAVE-WORKER-STAGE:hardening'"
+                  " 'GOWAVE-WORKER-STAGE:secret=value' 'captured log' 'GOWAVE-WORKER-STAGE:verification'"
+                  " | ssh_bootstrap_worker_progress worker.example.com > \"$CAPTURE\"\n"
+                  "echo RC=0\n",
+                [], self._stderr_sink(), env=self._env(CAPTURE=output),
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            self.assertEqual(seen.count(b"configuring security on worker.example.com"), 1)
+            self.assertIn(b"Checking services and effective security on worker.example.com", seen)
+            self.assertNotIn(b"secret=value", seen)
+            self.assertNotIn(b"captured log", seen)
+            self.assertEqual(output.read_text(encoding="utf-8"), "captured log\n")
+
+    def test_a_silent_worker_reports_the_last_known_stage_without_partial_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            notices = Path(directory) / "notices"
+            result = bash(
+                SOURCE + '''GOWAVE_SSH_NOTICE_OUT="$NOTICES"
+read() {
+    local -n value="${@: -1}"
+    case "$counter" in
+        0) value=GOWAVE-WORKER-STAGE:acme; counter=1; return 0 ;;
+        1) value=private; counter=2; return 142 ;;
+        2) value=' diagnostic'; counter=3; return 0 ;;
+        *) value=''; return 1 ;;
+    esac
+}
+counter=0
+ssh_bootstrap_worker_progress worker.example.com
+''',
+                env={"NOTICES": str(notices), "GOWAVE_WIZARD_LANG": "en"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(notices.read_text(), "Still waiting for worker.example.com (stage: acme).\n")
+            self.assertEqual(result.stdout, "private diagnostic\n")
+            self.assertEqual(result.stderr, "")
+
+    def test_worker_progress_without_a_terminal_exposes_only_allowlisted_events(self):
+        result = bash(
+            SOURCE + '_ssh_bootstrap_bind_terminal\n'
+            'ssh_bootstrap_worker_progress worker.example.com\n',
+            stdin=('GOWAVE-WORKER-STAGE:acme\nGOWAVE-WORKER-STAGE:arbitrary=private\n'
+                   'GOWAVE-WORKER-STAGE:acme\nretained output\n'),
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, 'GOWAVE-WORKER-STAGE:acme\n')
+        self.assertEqual(result.stdout, 'retained output\n')
+
+    def test_stage_timeout_attribution_on_ssh_session_end(self):
+        """Verify that stage timeouts are attributed when the SSH session ends."""
+        with tempfile.TemporaryDirectory() as directory:
+            # Capture terminal output (where notices go when bound to a terminal)
+            seen, process = _run_on_pty(
+                SOURCE
+                + "_ssh_bootstrap_bind_terminal\n"
+                + '''read() {
+    local -n value="${@: -1}"
+    case "$counter" in
+        0) value=GOWAVE-WORKER-STAGE:hardening; counter=1; return 0 ;;
+        1) value=GOWAVE-WORKER-STAGE:acme; counter=2; return 0 ;;
+        2) value=""; return 1 ;;
+    esac
+}
+counter=0
+ssh_bootstrap_worker_progress worker.example.com
+echo RC=0
+''',
+                [],
+                self._stderr_sink(),
+                env=self._env(GOWAVE_WIZARD_LANG="en"),
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            # Both hardening and acme should have been noticed on the terminal
+            self.assertIn(b"Installing prerequisites and configuring security on worker.example.com", seen)
+            self.assertIn(b"Obtaining certificates and configuring NGINX on worker.example.com", seen)
+            # Timeout check runs on session end - hardening budget is 10 min, acme is 15 min.
+            # Since this is a fast test, no timeout should be reported.
+
+    def test_stage_timeout_reported_when_budget_exceeded(self):
+        """Verify timeout notice is emitted when a stage exceeds its budget."""
+        with tempfile.TemporaryDirectory() as directory:
+            # Capture terminal output
+            seen, process = _run_on_pty(
+                SOURCE
+                + "_ssh_bootstrap_bind_terminal\n"
+                + f'''GOWAVE_SSH_STAGE_TIME_FILE="{directory}/stage-time"
+''' + "cat > \"$GOWAVE_SSH_STAGE_TIME_FILE\" <<'EOF'\n" +
+                f"hardening\t{int(time.time()) - 7200}\n" + "EOF\n" +
+                '''_ssh_bootstrap_check_stage_timeouts worker.example.com
+echo RC=0
+''',
+                [],
+                self._stderr_sink(),
+                env=self._env(GOWAVE_WIZARD_LANG="en"),
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            # Format: "Stage <node> on <stage> exceeded its budget: <elapsed> seconds elapsed (budget: <budget> minutes)."
+            self.assertIn(b"Stage worker.example.com on hardening exceeded its budget", seen)
+            # Accept 7200 or 7201 due to 1-second timing variance between writing the file and reading it
+            self.assertTrue(
+                b"7200" in seen or b"7201" in seen,
+                f"expected 7200 or 7201 in output, got: {seen!r}"
+            )  # elapsed seconds
+            self.assertIn(b"10", seen)  # budget minutes
 
     def test_the_typed_password_is_not_echoed_and_lands_in_a_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
