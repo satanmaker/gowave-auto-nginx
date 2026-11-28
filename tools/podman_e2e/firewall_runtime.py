@@ -34,10 +34,12 @@ def _snapshot(product: Any, container: str, case_id: str, stage: str) -> Dict[st
         require(case_id,
                 result.returncode == 0 and result.stdout.strip(),
                 f"{stage}: {tool} answered nothing on {container}, so a reload cannot be compared")
-        # Packet and byte counters move on their own; the rules themselves are
-        # what a reload must preserve.
+        # Packet and byte counters move on their own, and `iptables-save` stamps
+        # every dump with the second it ran (`# Completed on …`); the rules
+        # themselves are what a reload must preserve.
         facts[tool] = "\n".join(
-            line for line in result.stdout.splitlines() if not line.startswith("[")
+            line for line in result.stdout.splitlines()
+            if not line.startswith("[") and not line.startswith("#")
         ).replace("[0:0]", "")
     listeners = product.podman.exec_bash(container, _LISTENERS, check=False, timeout=60)
     require(case_id, listeners.returncode == 0,

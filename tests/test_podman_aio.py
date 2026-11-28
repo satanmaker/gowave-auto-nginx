@@ -417,6 +417,11 @@ class ScriptedPodman:
             return subprocess.CompletedProcess(
                 ["bash", "-lc", script], 0, self.panel_cluster, "",
             )
+        # The fallback-state housekeeping of AIO-PKT-02 is not a measurement: the
+        # stub answers the case's own file moves instead of consuming an answer
+        # scripted for a probe.
+        if "pkt-02" in script:
+            return subprocess.CompletedProcess(["bash", "-lc", script], 0, "", "")
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
 
@@ -441,6 +446,10 @@ class StubHost:
         #: Every zone a case steered, in order, so a test can read what was
         #: published for an attempt and that the fixture's own zone came back.
         self.zones = []
+
+    def ingress_hosts(self):
+        """The one host a client's names resolve to, as the ingress bracket asks."""
+        return [ingress.Host(role="local", container=self.target_name, name=self.panel_domain)]
 
     def zone(self):
         return topology.zone(self.plan)
@@ -6293,6 +6302,20 @@ class TestPacketEvidenceCase(unittest.TestCase):
         for key in ("no_capture_tool_reason", "no_identity_reason",
                     "window_expired_reason", "foreign_source_reason"):
             self.assertTrue(evidence[key], f"{key} names nothing that was missing")
+
+    def test_the_fallback_is_measured_on_a_host_without_the_edge_log(self):
+        """The capture is the fallback witness, so the log cannot answer for it.
+
+        Since the stream router writes its own access log, a host that logs every
+        connection answers PASS for a capture that saw nothing — the four
+        degradations would stop being cases. The case sets the state the fallback
+        exists for and puts the file back afterwards, whatever the request did.
+        """
+        product = self._product()
+        aio.case_packet_evidence_incomplete(product)
+        scripts = "\n".join(product.host.podman.scripts)
+        self.assertIn("gowave-edge-access.log.pkt-02", scripts)
+        self.assertEqual(scripts.count("mv"), 2, "the log was not moved aside and put back")
 
     def test_a_missing_tool_is_incomplete_with_no_count_to_fall_back_on(self):
         evidence = aio.case_packet_evidence_incomplete(self._product())

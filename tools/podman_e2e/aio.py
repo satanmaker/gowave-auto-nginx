@@ -7357,6 +7357,42 @@ def wait_past_capture_window(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _hide_edge_log(host: Any) -> List[Any]:
+    """Move the stream router's access log aside on every ingress host.
+
+    The capture is the fallback witness, so a case about a capture that cannot
+    account for a request has to measure a host that keeps no edge log. The file
+    is renamed rather than truncated: NGINX keeps writing to the descriptor it
+    already holds, and the restore returns the same lines under the same name.
+    """
+    moved = []
+    for entry in host.ingress_hosts():
+        hidden = f"{ingress.EDGE_LOG}.pkt-02"
+        result = host.podman.exec_bash(
+            entry.container,
+            f"if [ -f {ingress.EDGE_LOG} ]; then mv {ingress.EDGE_LOG} {hidden}; fi",
+            check=False, timeout=60,
+        )
+        if result.returncode != 0:
+            _restore_edge_log(host, moved)
+            raise AssertionError(
+                f"{PKT_INCOMPLETE_CASE_ID}: could not set the fallback state on "
+                f"{entry.container}: {(result.stderr or result.stdout or '')[-300:]}"
+            )
+        moved.append((entry.container, hidden))
+    return moved
+
+
+def _restore_edge_log(host: Any, moved: Any) -> None:
+    """Put every renamed log back, whatever happened to the request."""
+    for container, hidden in moved or []:
+        host.podman.exec_bash(
+            container,
+            f"if [ -f {hidden} ]; then mv {hidden} {ingress.EDGE_LOG}; fi",
+            check=False, timeout=60,
+        )
+
+
 def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
     """PKT-02: evidence that is unavailable makes the case INCOMPLETE, not a pass.
 
@@ -7388,20 +7424,30 @@ def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
         wait_past_capture_window(PKT_SLOW_REQUEST_SECONDS)
         return request()
 
-    degradations = {
-        "no_capture_tool": product.bracket_request(
-            request, inbound, probe_script=PKT_MISSING_PROBE,
-        ),
-        "no_identity": product.bracket_request(
-            request, inbound, identity_port=PKT_SILENT_PORT,
-        ),
-        "window_expired": product.bracket_request(
-            slow_request, inbound, window=PKT_SHORT_WINDOW_SECONDS,
-        ),
-        "foreign_source_only": product.bracket_request(
-            request, inbound, identity_engine=host.client_name,
-        ),
-    }
+    # The four degradations are about the packet capture, which is the fallback
+    # witness: since the stream router writes its own access log, a host that
+    # logs every connection would answer PASS for a capture that saw nothing.
+    # The case therefore measures the state the fallback exists for — a host
+    # that predates the log — by moving the file aside for the duration and
+    # putting it back in the same order NGINX had it.
+    hidden = _hide_edge_log(host)
+    try:
+        degradations = {
+            "no_capture_tool": product.bracket_request(
+                request, inbound, probe_script=PKT_MISSING_PROBE,
+            ),
+            "no_identity": product.bracket_request(
+                request, inbound, identity_port=PKT_SILENT_PORT,
+            ),
+            "window_expired": product.bracket_request(
+                slow_request, inbound, window=PKT_SHORT_WINDOW_SECONDS,
+            ),
+            "foreign_source_only": product.bracket_request(
+                request, inbound, identity_engine=host.client_name,
+            ),
+        }
+    finally:
+        _restore_edge_log(host, hidden)
 
     verdicts = {}
     reasons = {}
