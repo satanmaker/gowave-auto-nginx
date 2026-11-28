@@ -29,7 +29,14 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nginx libnginx-mod-stream sqlite3 openssl curl ufw fail2ban certbot tar gzip
+          sudo apt-get install -y --no-install-recommends nginx libnginx-mod-stream sqlite3 openssl curl ufw fail2ban certbot tar gzip openssh-server
+          # The jail cases read a real daemon: they configure Fail2ban over the
+          # host's own sshd, and `sshd -t` refuses to run on a host that has no
+          # host keys. The runner image ships openssh-server without them, so the
+          # precondition the suite documents is established here rather than
+          # assumed.
+          sudo ssh-keygen -A
+          sudo systemctl enable --now fail2ban
 
       # The suite imports every test module before it runs, and the protocol
       # matrix and the served-payload probes parse YAML, so the interpreter that
