@@ -541,6 +541,55 @@ requirements:
 # scenario for the behavior the case proves. Each entry names the requirement and
 # why no scenario fits; `trace.py` still refuses an id no suite declares, and an
 # id that is also mapped to a scenario above.
+  - requirement: Parallel distribution acceptance with isolated evidence
+    scenarios:
+      - scenario: GitHub Actions runs the distribution matrix
+        topologies: [aio, multi-node, panel-only]
+        tests:
+          - tests.test_podman_gate.TestPodmanGateContract
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance, Panel-only Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance, Multi-Node Lifecycle and Recovery Acceptance]
+      - scenario: Four local runs start together
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_lock_cases.TestPairLockOverLocalHolders
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: NGINX package policy is verified
+        cases: [NGX-PIN]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestNginxPinCase
+          - tests.test_os_detection.TestOSDetection
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Data-plane evidence is read from the edge's own log
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_ingress.TestEdgeLogWitness
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Operable harness evidence and selected runs
+    scenarios:
+      - scenario: A finished run leaves a compact summary
+        topologies: [aio]
+        tests:
+          - tests.test_podman_run_options.TestSummaryArtifact
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: The phase of a running cell is one command away
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_live_status.TestLiveStatus
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Selected cases run without reinstalling the cell
+        topologies: [aio]
+        tests:
+          - tests.test_podman_run_options.TestOnlyFromTheCommandLine
+          - tests.test_podman_run_options.TestReuseFromTheCommandLine
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: A re-provisioning step cannot run on the default timeout
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_harness_timeouts.TestHarnessTimeouts
+        jobs: [Multi-Node Podman Acceptance]
+
 cases_by_requirement:
   - requirement: Real Panel subscription lifecycle
     cases: [AIO-AUTH]

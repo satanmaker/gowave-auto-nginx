@@ -71,6 +71,14 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Trustworthy result and diagnostics | Unexpected skip | — | `GATE-STATUS` | `test_podman_runner.TestResultSemantics`, `test_podman_status.TestStatusCase` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
 | Trustworthy result and diagnostics | Install-dependent case without a successful installation | — | — | `test_podman_aio.TestDiagnosticArtifactsCase` | All-in-One Podman Acceptance, Lint, Completeness, and Suite Nonroot | — |
 | Safe isolation and cleanup | Cleanup after failure | — | — | `test_podman_cleanup.TestPodmanStaleRunRecovery`, `test_podman_cleanup.TestEntrypointReclaimsStaleRuns`, `test_podman_fixture_isolation.TestPodmanFixtureIsolation` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
+| Parallel distribution acceptance with isolated evidence | GitHub Actions runs the distribution matrix | — | — | `test_podman_gate.TestPodmanGateContract` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance, Panel-only Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance, Multi-Node Lifecycle and Recovery Acceptance | — |
+| Parallel distribution acceptance with isolated evidence | Four local runs start together | — | — | `test_podman_lock_cases.TestPairLockOverLocalHolders` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
+| Parallel distribution acceptance with isolated evidence | NGINX package policy is verified | — | `NGX-PIN` | `test_podman_multi_node.TestNginxPinCase`, `test_os_detection.TestOSDetection` | Multi-Node Podman Acceptance | — |
+| Parallel distribution acceptance with isolated evidence | Data-plane evidence is read from the edge's own log | — | — | `test_podman_ingress.TestEdgeLogWitness` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
+| Operable harness evidence and selected runs | A finished run leaves a compact summary | — | — | `test_podman_run_options.TestSummaryArtifact` | All-in-One Podman Acceptance | — |
+| Operable harness evidence and selected runs | The phase of a running cell is one command away | — | — | `test_podman_live_status.TestLiveStatus` | Multi-Node Podman Acceptance | — |
+| Operable harness evidence and selected runs | Selected cases run without reinstalling the cell | — | — | `test_podman_run_options.TestOnlyFromTheCommandLine`, `test_podman_run_options.TestReuseFromTheCommandLine` | All-in-One Podman Acceptance | — |
+| Operable harness evidence and selected runs | A re-provisioning step cannot run on the default timeout | — | — | `test_podman_harness_timeouts.TestHarnessTimeouts` | Multi-Node Podman Acceptance | — |
 
 ## Cases serving a requirement that states no scenario
 

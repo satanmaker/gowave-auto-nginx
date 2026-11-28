@@ -47,29 +47,33 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 
 #### Scenario: External inaccessibility verification of local node port
 - **GIVEN** a running All-in-One installation where `gowave-node` listens on wildcard `:3002`
-- **WHEN** external probes attempt to connect to `<public-ipv4>:3002` or `[<public-ipv6>]:3002`
-- **THEN** connections are dropped or refused by UFW firewall rules across both IPv4 and IPv6, while local connections from `127.0.0.1:3002` and `[::1]:3002` succeed.
+- **WHEN** external probes attempt to connect to public IPv4 or IPv6 port 3002
+- **THEN** connections are dropped or refused by UFW across both enabled families while local loopback connections succeed.
 
 #### Scenario: Worker node complete edge traffic plane deployment
 - **GIVEN** a remote worker server running `gowave-node-auto.sh`
 - **WHEN** edge traffic plane configuration is applied
-- **THEN** NGINX Stream on port 443 routes camouflage SNI to local Xray REALITY (`127.0.0.1:8443`), worker domain SNI to local NGINX HTTPS (`127.0.0.1:7443`) terminating Let's Encrypt TLS, proxying XHTTP, WebSocket, and Trojan gRPC to local Xray loopback inbounds, and routes the Worker's camouflage apex and `www.<apex>` directly to the local decoy listener (`127.0.0.1:9443`) so the bare domain serves the rendered static site, while the port 80 ACME vhost keeps those names in `server_name` (challenge served in place, `301` for other paths, `444` for unmanaged hosts), enabling direct client VPN connections without traversing the Central Panel.
+- **THEN** NGINX Stream routes REALITY SNI to local 8443, primary Worker SNI to local HTTPS 7443 for XHTTP/WS/gRPC and generated static cover, and enabled Vision to local 8444 with cover-only fallback; management/subscription paths are denied, all fallback listeners are loopback-only, and Worker does not adopt Master apex/www routes or SANs. Port 80 serves owned HTTP-01 challenges, redirects other owned requests to HTTPS and refuses unmanaged hosts, enabling direct VPN traffic without traversing Panel.
 
 #### Scenario: Remote worker orchestration via SSH stdin streaming
-- **GIVEN** an operator running `gowave-node-auto.sh` targeting a remote edge server over SSH
-- **WHEN** the deployment begins
-- **THEN** environment variables, functions, and base64-encoded `cover-reality` payload are streamed over SSH stdin directly to `bash -s` without temporary files or `scp`, unpacking `cover-reality` with SHA256 verification, and scoping `SECRET_KEY` strictly to upstream installer execution.
+- **GIVEN** an operator targeting a remote edge server over SSH
+- **WHEN** deployment begins
+- **THEN** variables, functions and the checksummed base64 cover payload are streamed over SSH stdin to `bash -s` without scp or unmanaged remote staging files, and SECRET_KEY is scoped to upstream installer execution.
 
 #### Scenario: Automated worker registration via CLI node add command
-- **GIVEN** an active GoWave Panel and an accessible remote worker host
-- **WHEN** `gowave-auto.sh node add <name> <ip> <worker-domain> <reality-domain> [user] [port]` is executed
-- **THEN** it validates that if worker IP matches PANEL_IP or 127.0.0.1, NODE_PORT=3002 is enforced, creates a dedicated worker profile with unique tags (`*-<name>`), registers the node via `POST /api/nodes`, links inbounds to squad, provisions worker Host records, streams payload via `remote_payload` over SSH stdin, and persists worker state in `state.json` schemaVersion 2.
+- **GIVEN** an active Panel and accessible remote worker
+- **WHEN** `gowave-auto.sh node add <name> <ip> <worker-domain> <reality-domain> [user] [port]` runs
+- **THEN** same-host nodes enforce port 3002, a dedicated profile and unique tags are associated with the node and squad, Worker Host records are provisioned, payload is streamed over SSH stdin and versioned state preserves UUID and edge-identity associations.
 
 #### Scenario: Remote worker deployment failure compensating rollback
-- **GIVEN** a remote worker deployment initiated via `gowave-node-auto.sh remote_payload`
-- **WHEN** any stage of remote configuration fails (firewall, NGINX, ACME, upstream installer, or mTLS health check)
-- **THEN** the remote orchestrator executes automated compensating rollback (`compensate_remote_worker`), stopping and removing systemd services and drop-ins, removing worker NGINX virtual hosts and stream blocks, deleting issued ACME certificates, restoring pre-install UFW rules, deactivating and deleting swap, removing sysctl tuning, unsetting secrets, and the Central Panel initiates compensating entity rollback.
+- **GIVEN** a remote worker deployment transaction
+- **WHEN** firewall, NGINX, ACME, upstream installation or mTLS verification fails
+- **THEN** remote and Panel compensation restore the pre-install baseline for owned changes, remove only newly created owned services/configuration/certificates and entities, restore firewall state and managed swap/sysctl changes, unset secrets and verify recovery; adopted or unrelated resources and completed sibling nodes remain untouched.
 
+#### Scenario: Failed re-apply leaves a serving Worker serving
+- **GIVEN** a Worker that is already installed and serving, whose Panel registration this run does not change
+- **WHEN** the re-apply fails after it stopped the managed service
+- **THEN** compensation restores the run's before-image and starts that service again with its enablement intact, so the host is not left registered and silent; only a run that found the service inactive disables it, and a restoration that could not put every owned path back reports the recovery as failed instead of starting a half-restored host.
 ### Requirement: Mutual TLS 1.3 Control Plane Protocol with Strict SNI Verification
 All panel-to-node management communication SHALL use TLS 1.3 with mutual certificate verification, derived HKDF SNI (`rw-v1`), RS256 JWT bearer token authentication, and strict SNI enforcement.
 
@@ -144,3 +148,25 @@ The verification harness SHALL provide an automated dual-container Podman testbe
 - **GIVEN** a panel managing `local-node` on address `127.0.0.1`
 - **WHEN** an operator provisions an additional worker node
 - **THEN** GoWave enforces address uniqueness (`UNIQUE(address)`), requiring distinct network addressing for the worker, and subsequent queries to `GET /api/nodes` return both `local-node` and the worker node with their respective profiles and inbounds.
+
+### Requirement: Persisted node edge identity
+The deployment state SHALL record each host's role, node identity, explicit domain roles, certificate SAN ownership and selected lineage paths with a schema version. State SHALL remain secret-free for draft and report use, preserve existing UUID associations and be reconciled with Panel and host readback before adoption or resume.
+
+#### Scenario: Resume does not duplicate resources
+- **WHEN** a resumed deployment finds the expected node, profile and host records already registered
+- **THEN** it verifies their identity and readiness, retains their UUIDs and runs only confirmed incomplete work rather than creating replacements.
+
+#### Scenario: Legacy identity needs confirmation
+- **WHEN** legacy state lacks explicit cover ownership or certificate paths
+- **THEN** the installer derives a read-only candidate from actual configuration, shows ambiguities and waits for migration confirmation rather than inferring a new apex from the transport name.
+
+### Requirement: Explicit Worker edge migration
+Existing Worker routes and certificate ownership SHALL change only after an explicit migration preview and confirmation. Migration SHALL preserve Node supervision, profile associations, valid transport sessions' configuration and immutable upstream interfaces. Failure SHALL restore prior owned configuration with verified recovery and report unresolved state without claiming readiness.
+
+#### Scenario: Existing Worker adopts static primary cover
+- **WHEN** the operator confirms migration from generic primary-host refusal to static cover
+- **THEN** primary root and assets serve the generated site, management paths remain denied, XHTTP/WS/gRPC and optional Vision keep their selected identities and no Panel is installed on Worker.
+
+#### Scenario: Shared-zone migration fails
+- **WHEN** a Worker migration fails after changing owned NGINX or certificate references
+- **THEN** previous owned routes and references are restored and verified, Master apex and certificates remain unchanged, and the report distinguishes deployment failure from recovery failure.
