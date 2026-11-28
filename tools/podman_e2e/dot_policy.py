@@ -20,6 +20,7 @@ import json
 from typing import Any, Dict
 
 from tools.podman_e2e import topology
+from tools.podman_e2e.firewall_runtime import normalise_dump
 from tools.podman_e2e.runner import require
 
 DOT_BLOCKED_CASE_ID = "DOT-853"
@@ -50,8 +51,7 @@ def _normalised_rules(product: Any, container: str, case_id: str, stage: str) ->
                 result.returncode == 0 and result.stdout.strip(),
                 f"{stage}: {tool} answered nothing on {container}, so the case cannot prove "
                 f"the rule set it started with came back")
-        kept = [line for line in result.stdout.splitlines() if not line.startswith("#")]
-        facts[tool] = "\n".join(line.replace("[0:0]", "") for line in kept)
+        facts[tool] = normalise_dump(result.stdout)
     return facts
 
 

@@ -11,6 +11,7 @@ has proven the least interesting moment.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict
 
 from tools.podman_e2e.runner import require
@@ -25,6 +26,21 @@ RELOAD_TIMEOUT_SECONDS = 420
 # one without any command failing.
 _RULES = ("iptables-save", "ip6tables-save")
 _LISTENERS = "ss -ltn"
+_COUNTERS = re.compile(r"\[\d+:\d+\]")
+
+
+def normalise_dump(text: str) -> str:
+    """A rule dump with the two things that move on their own removed.
+
+    `iptables-save` stamps every dump with the second it ran and prefixes each
+    rule and chain with a `[packets:bytes]` counter. A reload resets the
+    counters and an idle period advances them, so a comparison that kept either
+    would report a change nobody made — the first live run of the reload case
+    failed on the timestamp alone, and the DoT cases then failed on counters the
+    case's own queries had moved.
+    """
+    kept = [line for line in text.splitlines() if not line.startswith("#")]
+    return "\n".join(_COUNTERS.sub("", line).strip() for line in kept).strip()
 
 
 def _snapshot(product: Any, container: str, case_id: str, stage: str) -> Dict[str, str]:
@@ -34,13 +50,7 @@ def _snapshot(product: Any, container: str, case_id: str, stage: str) -> Dict[st
         require(case_id,
                 result.returncode == 0 and result.stdout.strip(),
                 f"{stage}: {tool} answered nothing on {container}, so a reload cannot be compared")
-        # Packet and byte counters move on their own, and `iptables-save` stamps
-        # every dump with the second it ran (`# Completed on …`); the rules
-        # themselves are what a reload must preserve.
-        facts[tool] = "\n".join(
-            line for line in result.stdout.splitlines()
-            if not line.startswith("[") and not line.startswith("#")
-        ).replace("[0:0]", "")
+        facts[tool] = normalise_dump(result.stdout)
     listeners = product.podman.exec_bash(container, _LISTENERS, check=False, timeout=60)
     require(case_id, listeners.returncode == 0,
             f"{stage}: could not read the listening sockets on {container}")
