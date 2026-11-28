@@ -302,7 +302,14 @@ class TestFail2banJailOnAHost(unittest.TestCase):
         self.assertEqual(dump.returncode, 0, dump.stderr)
         for port in payload["ports"]:
             self.assertIn(str(port), dump.stdout)
-        self.assertIn("backend = systemd", dump.stdout)
+        # fail2ban renders the same fact two ways: `-d` prints the jail's
+        # configuration as text on one release and as `['add', 'sshd',
+        # 'systemd']` on another (1.0.2 on a bare runner). The case is about the
+        # backend the jail runs with, not about which rendering answered.
+        self.assertTrue(
+            "backend = systemd" in dump.stdout or "'sshd', 'systemd'" in dump.stdout,
+            "the sshd jail is not systemd-backed:\n" + dump.stdout[-400:],
+        )
         self.assertIn("_COMM=sshd-session", dump.stdout)
         for key, value in (("maxretry", "5"), ("findtime", "1800"), ("bantime", "3600")):
             got = subprocess.run(["fail2ban-client", "get", "sshd", key],
