@@ -590,6 +590,24 @@ requirements:
           - tests.test_podman_harness_timeouts.TestHarnessTimeouts
         jobs: [Multi-Node Podman Acceptance]
 
+  - requirement: Node installation is proven without the GitHub API
+    scenarios:
+      - scenario: A blocked API contour still installs the node
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAioSuite
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: The opt-out control fails on the same contour
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAioSuite
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: Evidence is read from the installed side
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAioSuite
+        jobs: [All-in-One Podman Acceptance]
+
 cases_by_requirement:
   - requirement: Real Panel subscription lifecycle
     cases: [AIO-AUTH]

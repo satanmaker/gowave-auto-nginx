@@ -62,9 +62,9 @@ class TestTraceabilityRules(unittest.TestCase):
         # one `clarify-deployment-wizard` adds under *Independent Multi-Node
         # acceptance topology*: the composed wizard correcting a duplicate cover
         # domain and retrying one failed Worker.
-        self.assertEqual(len(self.spec), 64, "the spec states 64 scenarios")
-        self.assertEqual(len(trace.rows(self.table)), 64)
-        self.assertEqual(len({tuple(row) for row in self.spec}), 64)
+        self.assertEqual(len(self.spec), 67, "the spec states 67 scenarios")
+        self.assertEqual(len(trace.rows(self.table)), 67)
+        self.assertEqual(len({tuple(row) for row in self.spec}), 67)
 
     def test_every_declared_case_is_mapped_or_serves_a_requirement(self):
         mapped = {
@@ -466,10 +466,10 @@ class TestTraceabilityRules(unittest.TestCase):
     def test_the_audit_entrypoint_reads_the_checked_in_table(self):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--check"]), 0)
-        self.assertIn("64 scenarios, 64 rows", printed.getvalue())
+        self.assertIn("67 scenarios, 67 rows", printed.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--strict"]), 0)
-        self.assertIn("64 scenarios, 64 rows, 0 gaps", printed.getvalue())
+        self.assertIn("67 scenarios, 67 rows, 0 gaps", printed.getvalue())
 
     def test_the_audit_entrypoint_refuses_a_drifted_report(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -79,6 +79,9 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Operable harness evidence and selected runs | The phase of a running cell is one command away | — | — | `test_podman_live_status.TestLiveStatus` | Multi-Node Podman Acceptance | — |
 | Operable harness evidence and selected runs | Selected cases run without reinstalling the cell | — | — | `test_podman_run_options.TestOnlyFromTheCommandLine`, `test_podman_run_options.TestReuseFromTheCommandLine` | All-in-One Podman Acceptance | — |
 | Operable harness evidence and selected runs | A re-provisioning step cannot run on the default timeout | — | — | `test_podman_harness_timeouts.TestHarnessTimeouts` | Multi-Node Podman Acceptance | — |
+| Node installation is proven without the GitHub API | A blocked API contour still installs the node | — | — | `test_podman_aio.TestAioSuite` | All-in-One Podman Acceptance | — |
+| Node installation is proven without the GitHub API | The opt-out control fails on the same contour | — | — | `test_podman_aio.TestAioSuite` | All-in-One Podman Acceptance | — |
+| Node installation is proven without the GitHub API | Evidence is read from the installed side | — | — | `test_podman_aio.TestAioSuite` | All-in-One Podman Acceptance | — |
 
 ## Cases serving a requirement that states no scenario
 
