@@ -6368,7 +6368,8 @@ class TestPacketEvidenceCase(unittest.TestCase):
         product = self._product(overrides={"foreign_source_only": saw_only_the_client})
         with self.assertRaises(AssertionError) as caught:
             aio.case_packet_evidence_incomplete(product)
-        self.assertIn("recorded no non-matching source address", str(caught.exception))
+        self.assertIn("none of them came from an address other than the client's",
+                      str(caught.exception))
 
     def test_an_incomplete_without_a_reason_is_refused(self):
         """INCOMPLETE has to name what was missing, or the verdict is a shrug."""

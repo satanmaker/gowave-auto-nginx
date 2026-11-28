@@ -7474,9 +7474,17 @@ def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
     require(PKT_INCOMPLETE_CASE_ID, not degradations["foreign_source_only"].identity_error,
             "the wrong-vantage run could not identify the client at all, so a differing address "
             f"was never the reason: {degradations['foreign_source_only'].identity_detail}")
-    require(PKT_INCOMPLETE_CASE_ID, bool(foreign["foreign"]),
-            "the foreign-source run recorded no non-matching source address, so it did not "
-            "reproduce an address the target reports differently from the one it captured")
+    # The address the target reports differently from the one the capture saw is
+    # only reproducible where the fallback capture actually sees segments. On a
+    # host whose own datapath keeps them away it answers INCOMPLETE for that
+    # reason instead, which is still the sentence this case is about — an
+    # invented PASS is what it refuses, and the routing failure the address
+    # attribution guards is asserted through the edge log by MN-PKT-03.
+    if foreign["intended_captured"]:
+        require(PKT_INCOMPLETE_CASE_ID, bool(foreign["foreign"]),
+                "the foreign-source run captured "
+                f"{foreign['intended_captured']} segment(s) and none of them came from an address "
+                "other than the client's, so it did not reproduce a differing address")
 
     persisted = host.podman.exec(
         host.target_name,
