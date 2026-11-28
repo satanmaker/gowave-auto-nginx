@@ -323,9 +323,28 @@ class Podman:
         # up by this tag, and removing it at exit would leave a cell that looks
         # alive and cannot be extended.
         if not getattr(self.context, "keep_resources", False):
-            self.context.add_cleanup(lambda: self._run(["rmi", "-f", tag], check=False))
+            self.context.add_cleanup(lambda: self._drop_built_image(tag))
         self._built_images.add(tag)
         return tag
+
+    def _drop_built_image(self, tag: str) -> None:
+        """Remove a built tag unless a container of any run still runs it.
+
+        The tags are shared by every cell of a matrix: `gowave-e2e-client` carries
+        the pinned engines for all four, and `gowave-e2e-target:<distribution>` is
+        shared by two cells of the same distribution. `rmi -f` deletes the
+        containers that use the image, so a cell that finished first took a
+        sibling cell's still-serving engine client with it and every later case in
+        that cell answered `no container with name or ID engines-… found`.
+        """
+        in_use = self._run(
+            ["ps", "-a", "--filter", f"ancestor={tag}", "--format", "{{.ID}}"], check=False)
+        if in_use.returncode != 0 or in_use.stdout.strip():
+            # Either a container still runs the image or the question could not be
+            # answered; in both cases a tag left behind is cheaper than a
+            # container removed from under a running cell.
+            return
+        self._run(["rmi", "-f", tag], check=False)
 
     def run(
         self,

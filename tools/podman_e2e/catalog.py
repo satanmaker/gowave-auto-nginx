@@ -985,6 +985,20 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Security and network isolation verification",
     },
     {
+        "id": "DOT-853",
+        "requirement": "Security and network isolation verification",
+        "assertion": "Closing the encrypted resolver port on an installed host degrades the optional DNS-over-TLS control without ever calling it delivered: the product's own DoT step fails at its verification stage, proves the previous resolver works again, and the host's own report calls the control failed with a verified recovery and a `ready-with-warnings` readiness; the same closed path under the required policy reports the same rollback but a `failed` readiness, so an optional degradation and a refused requirement are not the same outcome. The case removes its firewall chain again, re-establishes the installed policy, re-reads the report as `ready`, and compares the host's IPv4 and IPv6 rule sets with the snapshot it took before the first rule — a product that called DoT delivered, a report that conflated the control with its recovery, or a rule left on the host fails the case.",
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
+        "id": "DOT-RESTORE",
+        "requirement": "Security and network isolation verification",
+        "assertion": "A DNS-over-TLS rollback that cannot be proven working stops every policy: with the encrypted path closed and the step's own post-rollback resolution probe refused, both the best-effort and the required run report an unverified restoration, the host's report calls the DoT control failed with a failed recovery, and readiness is `failed` for both — an unproven rollback is never rounded into a warning. The case then removes its firewall chain and its probe, puts the installed policy back, reads the report as `ready` again and compares the rule sets with its own before-snapshot, so the host is left exactly as the install had it.",
+        "topology": ["aio"],
+        "promotion_target": "Security and network isolation verification",
+    },
+    {
         "id": "NGX-PIN",
         "requirement": "Independent Multi-Node acceptance topology",
         "assertion": "Both roles carry the approved NGINX installation and not the distribution build: `dpkg-query -W nginx` on the Master and on the Worker reports exactly the suite-suffixed revision `1.30.8-1~<bookworm|trixie|noble|resolute>`, `nginx -V` shows both a static `--with-stream` and `--with-stream_ssl_preread_module` so the Stream SNI plane is really built in, and the host's APT history holds the download of `nginx_1.30.8-1~<suite>_<arch>.deb`, which the distribution archive cannot produce at that revision. A host left on its archive version, a build without the Stream SNI module, or an install with no record of the approved package fails the case instead of passing as configured.",

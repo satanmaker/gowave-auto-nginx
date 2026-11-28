@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 137
-  total: 262
+  podman_first: 139
+  total: 264
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -9557,6 +9557,64 @@ cases:
       evidence:
       - mutation
       - session
+  promotion_target: Security and network isolation verification
+- id: DOT-853
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: 'Closing the encrypted resolver port on an installed host degrades the optional DNS-over-TLS
+    control without ever calling it delivered: the product''s own DoT step fails at its verification stage,
+    proves the previous resolver works again, and the host''s own report calls the control failed with
+    a verified recovery and a `ready-with-warnings` readiness; the same closed path under the required
+    policy reports the same rollback but a `failed` readiness, so an optional degradation and a refused
+    requirement are not the same outcome. The case removes its firewall chain again, re-establishes the
+    installed policy, re-reads the report as `ready`, and compares the host''s IPv4 and IPv6 rule sets
+    with the snapshot it took before the first rule — a product that called DoT delivered, a report that
+    conflated the control with its recovery, or a rule left on the host fails the case.'
+  assertion_sha256: 8f051d515cf922d328ffa5ed4df13d8f525494779756084b29bf38247407b6e7
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: dot_policy:case_blocked_encrypted_path
+      evidence:
+      - optional
+      - readiness
+      - required
+      - rules
+  promotion_target: Security and network isolation verification
+- id: DOT-RESTORE
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: 'A DNS-over-TLS rollback that cannot be proven working stops every policy: with the encrypted
+    path closed and the step''s own post-rollback resolution probe refused, both the best-effort and the
+    required run report an unverified restoration, the host''s report calls the DoT control failed with
+    a failed recovery, and readiness is `failed` for both — an unproven rollback is never rounded into
+    a warning. The case then removes its firewall chain and its probe, puts the installed policy back,
+    reads the report as `ready` again and compares the rule sets with its own before-snapshot, so the
+    host is left exactly as the install had it.'
+  assertion_sha256: 9ccfc09aee72ddf68ab8288a63fcabbafba688de7915345d3171dd1515ecc576
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: dot_policy:case_unverifiable_restoration
+      evidence:
+      - best-effort
+      - readiness
+      - required
+      - rules
   promotion_target: Security and network isolation verification
 - id: NGX-PIN
   requirement: Independent Multi-Node acceptance topology

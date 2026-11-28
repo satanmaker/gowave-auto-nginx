@@ -13,7 +13,7 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 44 across 9 areas, naming 262 of 262 catalog cases.
+Behaviours: 45 across 9 areas, naming 264 of 264 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
@@ -22,7 +22,7 @@ Behaviours: 44 across 9 areas, naming 262 of 262 catalog cases.
 | subscription-representations | 2 | 7 | 4 |
 | data-plane | 5 | 45 | 11 |
 | decoy | 2 | 8 | 2 |
-| tls-dns-acme | 5 | 7 | 9 |
+| tls-dns-acme | 6 | 8 | 10 |
 | network-policy | 2 | 10 | 6 |
 | lifecycle | 7 | 23 | 20 |
 | failure-injection | 2 | 14 | 7 |
@@ -84,6 +84,7 @@ Behaviours: 44 across 9 areas, naming 262 of 262 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
+| A blocked encrypted resolver degrades visibly and an unproven rollback blocks | aio | pre-push | `DOT-853` | `DOT-RESTORE` |
 | Names resolve to the declared address from both vantages or are refused | aio, multi-node | pre-push | `DNS-01`, `PRE-05` | `PRE-02`, `PRE-03`, `PRE-04`, `PRE-06` |
 | Every HTTPS role serves its own certificate and only when it validates | aio, multi-node | pre-push | `TLS-01` | `NGX-05` |
 | Real issuance and renewal run through the pinned directory | aio | pre-push | `ACME-01` | `ACME-02`, `AIO-NEG-ACME` |

@@ -616,6 +616,21 @@ cases_by_requirement:
     reason: >-
       the public surface fails while the Panel's loopback API keeps answering,
       which is the isolation the requirement names, stated by no scenario
+  - requirement: Security and network isolation verification
+    cases: [DOT-853, DOT-RESTORE]
+    reason: >-
+      the requirement names the isolation a host must hold, and its scenarios
+      state the management plane that must refuse an untrusted origin; the
+      optional DNS-over-TLS control is a different isolation question the matrix
+      can break on a live host, and no scenario states what a closed encrypted
+      resolver does to each policy. DOT-853 closes port 853 on the host's own
+      outbound chain and reads the product's own report, so the optional
+      control's warning and the required control's refusal are proven on a host
+      rather than in a stub, and DOT-RESTORE withholds the rollback's own
+      resolution proof so an unverifiable restoration has to stop both policies
+      instead of being rounded into a warning. Both re-read the report as `ready`
+      and compare the rule sets with their own before-snapshot, which is how the
+      host is shown to be left as it was found
   - requirement: Failure injection and recovery
     cases: [AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY]
     reason: >-

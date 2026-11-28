@@ -35,6 +35,11 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 - **WHEN** firewall, NGINX, ACME, upstream installation or mTLS verification fails
 - **THEN** remote and Panel compensation restore the pre-install baseline for owned changes, remove only newly created owned services/configuration/certificates and entities, restore firewall state and managed swap/sysctl changes, unset secrets and verify recovery; adopted or unrelated resources and completed sibling nodes remain untouched.
 
+#### Scenario: Failed re-apply leaves a serving Worker serving
+- **GIVEN** a Worker that is already installed and serving, whose Panel registration this run does not change
+- **WHEN** the re-apply fails after it stopped the managed service
+- **THEN** compensation restores the run's before-image and starts that service again with its enablement intact, so the host is not left registered and silent; only a run that found the service inactive disables it, and a restoration that could not put every owned path back reports the recovery as failed instead of starting a half-restored host.
+
 ## ADDED Requirements
 
 ### Requirement: Persisted node edge identity

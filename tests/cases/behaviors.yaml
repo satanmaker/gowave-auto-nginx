@@ -438,6 +438,23 @@ behaviors:
     error_paths: [NGX-02]
 
   # --------------------------------------------------------------- tls-dns-acme
+  - name: A blocked encrypted resolver degrades visibly and an unproven rollback blocks
+    area: tls-dns-acme
+    description: >-
+      The optional DNS-over-TLS control is the one the matrix can break on a live
+      host. Closing the encrypted resolver port makes the product's own DoT step
+      fail at its verification stage, prove the previous resolver works again and
+      leave a report that calls the control failed with a verified recovery — a
+      warning, not a pass. The same closed path under the required policy blocks
+      readiness, and a rollback whose own resolution probe is refused blocks
+      every policy instead of being rounded into a warning. Both readings come
+      from the host's own security report, and the cases leave the rule sets and
+      the installed policy as they found them.
+    topology: [aio]
+    gate: pre-push
+    cases: [DOT-853]
+    error_paths: [DOT-RESTORE]
+
   - name: Names resolve to the declared address from both vantages or are refused
     area: tls-dns-acme
     description: >-

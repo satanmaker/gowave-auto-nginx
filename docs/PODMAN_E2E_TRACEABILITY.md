@@ -85,6 +85,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Explicit ACME Endpoint Selection and Certificate Lineage Isolation | `TLS-LINEAGE` |
 | Explicit ACME Endpoint Selection and Certificate Lineage Isolation | `TLS-LINEAGE-BAD` |
 | Security and network isolation verification | `AIO-NEG-DEP` |
+| Security and network isolation verification | `DOT-853`, `DOT-RESTORE` |
 | Failure injection and recovery | `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY` |
 | Live scenario parity | `AIO-PKT-02`, `MN-PKT-03`, `AIO-NEG-PIN`, `GATE-TEARDOWN` |
 | Live scenario parity | `VIS-CONFIG`, `VIS-GATE`, `VIS-05`, `VIS-06` |

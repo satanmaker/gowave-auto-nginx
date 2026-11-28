@@ -224,6 +224,47 @@ install_pinned_nginx debian trixie
                     self.assertIn("Dir::Etc::sourceparts=-", calls[0])
                 self.assertEqual(list(Path(directory).iterdir()), [log] if log.exists() else [])
 
+    def test_the_vendor_fetch_carries_a_retry_budget(self):
+        """One dropped connection to the vendor must not abort a re-apply.
+
+        The signed vendor repository is the only source the pin accepts, so a
+        single failed connection used to fail the whole Worker run and roll a
+        serving host back. The budget is asserted on the commands the module
+        actually runs: the refresh, the download and the install share one
+        options array, so the retry reaches all three.
+        """
+        script = r'''
+source "$1/tempdir.sh"
+source "$1/nginx_package.sh"
+export TMPDIR="$2"
+dpkg() { printf 'amd64\n'; }
+dpkg-query() { return 1; }
+curl() {
+    printf '%s\n' "$*" >> "$TMPDIR/curl.log"
+    local out='' prev=''
+    for arg in "$@"; do
+        [[ "$prev" == -o ]] && out="$arg"
+        prev="$arg"
+    done
+    [[ -n "$out" ]] && printf 'KEY\n' > "$out"
+    return 0
+}
+gpg() { if [[ "$*" == *--export* ]]; then printf 'key\n'; fi; }
+apt-cache() { return 1; }
+apt-get() { printf '%s\n' "$*" >> "$TMPDIR/apt.log"; return 1; }
+install_pinned_nginx debian trixie
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(["bash", "-c", script, "test", str(MODULE_PATH.parent), directory],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0, "an unreachable vendor was reported as installed")
+            self.assertIn("Could not authenticate", result.stderr)
+            curl_call = (Path(directory) / "curl.log").read_text()
+            self.assertIn("--retry 3", curl_call)
+            self.assertIn("--retry-connrefused", curl_call)
+            apt_call = (Path(directory) / "apt.log").read_text()
+            self.assertIn("Acquire::Retries=5", apt_call)
+
     def test_nginx_pin_checks_package_identity_before_install_and_stream_afterwards(self):
         script = r'''
 source "$1/tempdir.sh"

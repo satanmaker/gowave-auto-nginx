@@ -36,6 +36,7 @@ install_pinned_nginx() (
     mkdir -m 0700 "$scratch/gnupg" || return 1
     mkdir -m 0755 "$scratch/lists" || return 1
     curl --proto '=https' --fail --silent --show-error --location --max-time 60 \
+        --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 15 \
         https://nginx.org/keys/nginx_signing.key -o "$scratch/vendor.asc" || return 1
     gpg --batch --homedir "$scratch/gnupg" --import "$scratch/vendor.asc" || return 1
     gpg --batch --homedir "$scratch/gnupg" --export "$fingerprint" > "$scratch/vendor.gpg" || return 1
@@ -45,9 +46,14 @@ install_pinned_nginx() (
     apt_uri="https://nginx.org/packages/${distro}/"
     printf 'deb [arch=%s signed-by=%s] %s %s nginx\n' \
         "$arch" "$scratch/vendor.gpg" "$apt_uri" "$codename" > "$scratch/vendor.list" || return 1
+    # A re-apply over a serving Worker must not fail on one dropped connection to
+    # the vendor: the refresh, the download and the install are the same
+    # authenticated fetch, so the retry budget belongs to all of them. Exhausting
+    # it is still a refusal, and still no distribution fallback.
     apt_options=(-o "Dir::Etc::sourcelist=$scratch/vendor.list" -o Dir::Etc::sourceparts=-
                  -o "Dir::State::lists=$scratch/lists" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=
-                 -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false)
+                 -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false
+                 -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
     apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -qq </dev/null || {
         echo "Error: Could not authenticate or refresh the official NGINX repository for $codename." >&2
         return 1

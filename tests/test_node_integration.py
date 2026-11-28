@@ -971,6 +971,36 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotIn("certbot delete", acme_cleanup)
         self.assertIn("rollback_failed=1", acme_cleanup)
 
+    def test_worker_compensation_restarts_a_service_it_found_serving(self):
+        """A failed re-apply must leave the Worker serving, not silent.
+
+        The compensation is written for a first install: it stops and disables
+        the unit whose paths it is about to remove. A re-apply over a Worker the
+        Panel still lists is not that — if the run dies after the stop, the
+        cluster keeps a registered member that answers nothing, which is exactly
+        what an unreachable vendor repository produced. The unit is therefore
+        disabled only when it was not serving before the run, and the restored
+        unit is started again after the before-image is put back.
+        """
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        start = worker_script.index("compensate_remote_worker() {")
+        block = worker_script[start:worker_script.index('compensate_remote_worker "$exit_code"', start)]
+        self.assertIsNotNone(
+            re.search(r'if \[\[ "\$\{_NODE_SERVICE_WAS_ACTIVE:-0\}" -ne 1 \]\]; then\s*\n\s*'
+                      r'systemctl disable "\$unit"', block),
+            "the compensation disables the node unit unconditionally, so a failed re-apply "
+            "takes a serving Worker offline")
+        restart = re.search(r'if \[\[ "\$\{_NODE_SERVICE_WAS_ACTIVE:-0\}" -eq 1 \]\] && '
+                            r'\[\[ "\$rollback_failed" -eq 0 \]\]; then', block)
+        self.assertIsNotNone(restart, "nothing puts back the service the run found active")
+        after_restart = block[restart.end():]
+        self.assertIn('systemctl start gowave-node.service', after_restart)
+        self.assertIn('systemctl is-active --quiet gowave-node.service', after_restart)
+        # The answer is read before the first mutation, or it would describe the
+        # host this run already changed.
+        self.assertLess(worker_script.index("_NODE_SERVICE_WAS_ACTIVE=1"),
+                        worker_script.index('record_worker_transaction_journal "$_ACME_TX_ID" || return 1'))
+
     def test_node_add_commit_record_failure_compensates_both_sides(self):
         """A failed durable commit after remote success must roll back Worker and Panel API state."""
         worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()

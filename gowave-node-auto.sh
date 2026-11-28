@@ -5708,7 +5708,7 @@ compensate_remote_worker() {
 
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
-        echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
+        echo "[ROLLBACK] Stopping gowave-node.service before its paths are restored..." >&2
         # Xray is supervised by gowave-node in this product and the upstream
         # installer may leave no unit of its own, so an absent unit is a clean
         # host rather than a failed cleanup: only a unit that exists is stopped.
@@ -5716,7 +5716,13 @@ compensate_remote_worker() {
             if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" ||
                 systemctl is-active --quiet "$unit" 2>/dev/null; then
                 systemctl stop "$unit" 2>/dev/null || rollback_failed=1
-                systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+                # A Worker that was already serving is not being uninstalled:
+                # this run was a re-apply whose Panel registration is unchanged,
+                # and the unit the before-image is about to put back is started
+                # again for it rather than left disabled.
+                if [[ "${_NODE_SERVICE_WAS_ACTIVE:-0}" -ne 1 ]]; then
+                    systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+                fi
             fi
         done
         systemctl daemon-reload 2>/dev/null || rollback_failed=1
@@ -5732,6 +5738,18 @@ compensate_remote_worker() {
     restore_worker_targets_before_image \
         "$host_root" "$(worker_targets_before_image "$state_root" "$_ACME_TX_ID")" ||
         rollback_failed=1
+
+    # 1b. Put the service back the way this run found it. A failed re-apply of a
+    # serving Worker that leaves the host silent is a worse outcome than the
+    # refusal: the Panel still lists the node, so the operator sees a cluster
+    # with a dead member and no message. Only a rollback that restored every
+    # path starts it — a half-restored binary is not started to prove more.
+    if [[ "${_NODE_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]] && [[ "$rollback_failed" -eq 0 ]]; then
+        echo "[ROLLBACK] Restarting the Worker service this run found active..." >&2
+        systemctl enable gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl start gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl is-active --quiet gowave-node.service || rollback_failed=1
+    fi
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
@@ -5875,6 +5893,7 @@ main() {
     _NGINX_CONFIGS_CREATED=0
     _STREAM_INCLUDE_ADDED=0
     _NODE_SERVICE_CONFIGURED=0
+    _NODE_SERVICE_WAS_ACTIVE=0
 
     _COMPENSATED=0
     cleanup_temp_and_secrets() {
@@ -6008,6 +6027,14 @@ main() {
     # anything it cannot prove.
     record_worker_targets_before_image \
         "/" "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" || return 1
+
+    # Whether this run found the node already serving, which is what tells a
+    # re-apply from a first install when the compensation decides whether the
+    # unit it stopped is disabled or started again. Read before the first
+    # mutation, so nothing this run does can be mistaken for the answer.
+    if systemctl is-active --quiet gowave-node.service 2>/dev/null; then
+        _NODE_SERVICE_WAS_ACTIVE=1
+    fi
 
     # Recorded after the before-image and before the first mutation: a
     # run that dies from here on leaves a journal a later entrypoint can

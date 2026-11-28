@@ -8753,12 +8753,18 @@ def verify_worker_security_readback_via_ssh(
     node by and the harness pinned the host key under: the containers' resolver
     is the fixture DNS, not podman's, so a container name does not resolve from
     the Master and `ssh root@worker-<id>` fails with `Could not resolve hostname`.
+
+    The Master source is the run's own control address, not a fixed one: the
+    install derived the Worker's allow rule from ``plan.target_ip``, and the
+    subnet each cell draws is picked per run. A hard-coded address matched only
+    the cell that drew that pool and made every other cell read a policy it had
+    never been given.
     """
     cmd = (
         f"timeout 45 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes "
         f"-o ConnectTimeout=5 -o ClearAllForwardings=yes -o ForwardAgent=no "
         f"-o UpdateHostKeys=no -p 22 root@{worker.plan.worker_ip} "
-        f"'python3 - --worker-security-readback 3002 10.89.0.10 \"\" best-effort' "
+        f"'python3 - --worker-security-readback 3002 {worker.plan.target_ip} \"\" best-effort' "
         f"< {topology.REPO_IN_CONTAINER}/assets/security/managed.py"
     )
     # A re-apply next door rewrites the Worker's report, so the readback can

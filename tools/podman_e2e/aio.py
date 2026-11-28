@@ -30,6 +30,7 @@ from . import (
     client_image,
     client_trust,
     diagnostics,
+    dot_policy,
     environment_gate,
     firewall_runtime,
     hook_ownership,
@@ -10265,6 +10266,15 @@ def cases(
         Case(firewall_runtime.RULES_SURVIVE_RELOAD_CASE_ID, "aio",
              lambda context: firewall_runtime.case_rules_survive_reload(product),
              timeout_seconds=firewall_runtime.RELOAD_TIMEOUT_SECONDS),
+        # The one optional control the matrix can break on a live host: an
+        # unreachable encrypted resolver has to degrade visibly, and a rollback
+        # nobody can prove has to stop the host rather than warn about it.
+        Case(dot_policy.DOT_BLOCKED_CASE_ID, "aio",
+             lambda context: dot_policy.case_blocked_encrypted_path(product),
+             timeout_seconds=dot_policy.DOT_CASE_TIMEOUT_SECONDS),
+        Case(dot_policy.DOT_RESTORE_CASE_ID, "aio",
+             lambda context: dot_policy.case_unverifiable_restoration(product),
+             timeout_seconds=dot_policy.DOT_CASE_TIMEOUT_SECONDS),
         Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),

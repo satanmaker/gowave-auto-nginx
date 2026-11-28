@@ -295,6 +295,8 @@ be published.
 - **MN-MIGRATE** — promotion target: Distributed Worker VPS Deployment Verification
 - **FW-08** — promotion target: Security and network isolation verification
 - **FW-07** — promotion target: Security and network isolation verification
+- **DOT-853** — promotion target: Security and network isolation verification
+- **DOT-RESTORE** — promotion target: Security and network isolation verification
 - **NGX-PIN** — promotion target: Independent Multi-Node acceptance topology
 - **MN-WORKER-RESUME** — promotion target: Distributed Worker VPS Deployment Verification
 - **MN-COMPOSED-MIXED** — promotion target: Distributed Worker VPS Deployment Verification

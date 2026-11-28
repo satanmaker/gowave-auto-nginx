@@ -119,6 +119,53 @@ class TestPodmanStaleRunRecovery(unittest.TestCase):
         self.assertEqual(podman.remove_stale_runs(now=now), [])
 
 
+class _ImageCleanupStub(Podman):
+    """Answers the "who runs this tag" question and records the removal it allows."""
+
+    def __init__(self, answer, returncode=0):
+        self.answer = answer
+        self.returncode = returncode
+        self.commands = []
+
+    def _run(self, args, check=True, input_text=None):
+        self.commands.append(list(args))
+        if args[:2] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(args, self.returncode, self.answer, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def removals(self):
+        return [command for command in self.commands if command[0] == "rmi"]
+
+
+class TestBuiltImageCleanup(unittest.TestCase):
+    """A finishing cell must not force-remove an image a sibling cell still runs.
+
+    Every cell of a matrix builds the same client tag and the same
+    per-distribution target tag. `rmi -f` deletes the containers that use the
+    image, so the first cell to exit removed the engine client of a cell that was
+    still running its cases.
+    """
+
+    TAG = "localhost/gowave-e2e-client:1.19.34-26.11.9"
+
+    def test_a_tag_a_container_still_runs_is_left_alone(self):
+        stub = _ImageCleanupStub("f5ea1dc7c658\n")
+        stub._drop_built_image(self.TAG)
+        self.assertEqual(stub.removals(), [],
+                         "an image a running container uses was force-removed")
+
+    def test_an_unused_tag_is_removed(self):
+        stub = _ImageCleanupStub("")
+        stub._drop_built_image("localhost/gowave-e2e-target:debian-13")
+        self.assertEqual(stub.removals(), [["rmi", "-f", "localhost/gowave-e2e-target:debian-13"]])
+
+    def test_a_question_that_cannot_be_answered_keeps_the_tag(self):
+        stub = _ImageCleanupStub("", returncode=125)
+        stub._drop_built_image(self.TAG)
+        self.assertEqual(stub.removals(), [],
+                         "an unreadable answer was read as 'nothing uses it'")
+
+
 class TestEntrypointReclaimsStaleRuns(unittest.TestCase):
     """A killed run cannot clean up, so the next invocation must, and say so."""
 

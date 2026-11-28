@@ -122,6 +122,11 @@ The installer SHALL enforce one NGINX package policy for Panel-only, All-in-One 
 - **WHEN** the required official revision is unavailable without a repository authentication error
 - **THEN** provisioning may use a package from the signed distribution archive only if an explicitly approved revision covers all required applicable fixes, including CVE-2026-132779 where affected, and its installed revision and Stream capability are verified.
 
+#### Scenario: The vendor repository is briefly unreachable
+- **GIVEN** a Worker that is already serving and is being re-applied
+- **WHEN** a connection to the signed official repository drops during the index refresh, the package download or the install
+- **THEN** that authenticated fetch is retried within a bounded budget before the repository is called unavailable, and exhausting the budget is still a refusal with the same diagnostic and no distribution fallback.
+
 #### Scenario: Neither source can establish a verified install
 - **WHEN** neither source qualifies, a repository authentication check fails, a downgrade would be required, or the installed package cannot be verified
 - **THEN** provisioning fails with a safe diagnostic identifying the source and version check, does not activate the managed NGINX configuration, and does not stop or replace a pre-existing service merely to work around the refusal.

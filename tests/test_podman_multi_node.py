@@ -11,6 +11,7 @@ defect into a harness failure — or worse, a wrong node into a passing case.
 import base64
 import contextlib
 import copy
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -640,6 +641,70 @@ Status: active
     def test_an_empty_report_is_an_empty_report(self):
         facts = multi_node.parse_worker_control("")
         self.assertEqual(facts, {"node_service": "", "listeners": [], "peers": [], "firewall": []})
+
+
+class _ReadbackPodman:
+    def __init__(self, product):
+        self.product = product
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=60):
+        self.product.scripts.append((name, script))
+        return subprocess.CompletedProcess(
+            ["bash", "-lc", script], 0, json.dumps(self.product.document), "")
+
+
+class _ReadbackProduct:
+    """A Master whose only job is to carry the readback command and answer it."""
+
+    def __init__(self, master_ip):
+        self.scripts = []
+        self.document = {
+            "schema_version": 1,
+            "host_id": "worker.testbed.internal",
+            "role": "worker",
+            "installer_revision": "local",
+            "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "controls": {
+                name: {"policy": "required", "status": "verified", "reason_code": code,
+                       "recovery": "not-needed", "evidence_codes": [code]}
+                for name, code in (("firewall", "FW_APPLIED"),
+                                   ("ssh_protection", "JAIL_ACTIVE"),
+                                   ("security_updates", "APT_EFFECTIVE"))
+            } | {"dot": {"policy": "off", "status": "skipped", "reason_code": "DOT_DISABLED",
+                         "recovery": "not-needed", "evidence_codes": ["DOT_DISABLED"]}},
+        }
+        self.podman = _ReadbackPodman(self)
+        self.worker = types.SimpleNamespace(
+            plan=types.SimpleNamespace(worker_ip=master_ip[:-1] + "11", target_ip=master_ip))
+
+    def require_installed(self):
+        return types.SimpleNamespace(target_name="aio-test")
+
+
+class TestWorkerSecurityReadback(unittest.TestCase):
+    """The readback asks for the policy the install applied, not for a fixed pool.
+
+    The Worker's allow rule is derived from the Master's own control address, and
+    the subnet each cell draws is chosen per run. A literal address matched only
+    the cell that drew that pool: every other cell verified a policy its Worker
+    had never been given and reported a firewall it had actually configured as
+    `FW_NOT_EFFECTIVE`.
+    """
+
+    def test_the_readback_asks_for_the_runs_own_master_address(self):
+        for master_ip in ("10.90.0.10", "10.91.0.10", "10.89.0.10"):
+            with self.subTest(master_ip=master_ip):
+                product = _ReadbackProduct(master_ip)
+                facts = multi_node.verify_worker_security_readback_via_ssh(
+                    product, multi_node.WORKER_RESUME_CASE_ID, product.worker)
+                self.assertEqual(facts.get("ready"), "ready",
+                                 f"the readback could not read a ready report: {facts}")
+                script = product.scripts[-1][1]
+                self.assertIn(f"--worker-security-readback 3002 {master_ip} ", script)
+                for other in ("10.89.0.10", "10.90.0.10", "10.91.0.10"):
+                    if other != master_ip:
+                        self.assertNotIn(other, script,
+                                         "the readback still names an address the install never used")
 
 
 class _AddressProduct:

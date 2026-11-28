@@ -78,3 +78,27 @@ security identity first.
 **Done when** a Worker whose recorded security report belongs to another machine is
 classified and stopped before the batch reads it as evidence, and the case that
 covers a resumed Worker still passes.
+
+---
+
+## 5. Serve the pinned NGINX repository from the test bed
+
+**Measured on 2026-11-28.** The four-cell multi-node matrix fetches
+`https://nginx.org/packages/…` from the runner's own network on every install and
+every re-apply. In `matrix-09d56bf449ed4f67ac998142bcb6b17c` one cell lost that
+connection during the retry inside `MN-COMPOSED-MIXED`
+(`E: Failed to fetch …/dists/trixie/InRelease  Unable to connect to nginx.org:https`)
+and the case failed for the runner's network, not for the product. The bounded apt
+retry added in the same change absorbs a single drop; it cannot absorb a real
+outage, and the suite then reports a product failure it did not observe.
+
+**Done when** the acceptance bed answers for `nginx.org` itself — a fixture that
+serves the pinned `.deb` and its signed `InRelease` over the pinned fingerprint, the
+way the ACME and DNS fixtures already answer for their services — and the matrix
+passes with the runner's outbound access to the vendor blocked. The product keeps
+verifying the vendor signature; only the transport the suite depends on changes.
+
+**Why it is deferred.** It is test-bed infrastructure, not product behaviour, and it
+needs its own change: a fixture container, a certificate the `signed-by` fingerprint
+accepts, and a case proving the fixture is what the install actually read.
+

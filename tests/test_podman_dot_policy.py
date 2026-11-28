@@ -1,0 +1,207 @@
+"""The two DNS-over-TLS failure cases, driven through a stand-in product.
+
+`DOT-853` and `DOT-RESTORE` read a real installed host: one closes the encrypted
+resolver port with a firewall rule, the other withholds the rollback's own
+proof as well. What a stub can prove is that the assertions are the strict ones
+— a product that calls a blocked DoT path delivered, that rounds an unverified
+rollback into a warning, or that leaves a rule behind must fail the case rather
+than pass it.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import unittest
+from typing import Any, Dict, List, Optional
+
+from tools.podman_e2e import dot_policy
+
+RULES = "*filter\n:INPUT DROP [0:0]\n-A OUTPUT -j ufw-before-output\nCOMMIT\n"
+RULES_CHANGED = "*filter\n:INPUT ACCEPT [0:0]\n-A OUTPUT -j ufw-before-output\nCOMMIT\n"
+SNAPSHOT = "iptables-save 2>/dev/null"
+
+
+def verdict(status: str, recovery: str, policy: str = "best-effort") -> str:
+    return json.dumps({"status": status, "dot": policy, "policy": policy,
+                       "recovery": recovery, "warnings": [
+                           "DNS preparation failed during DNS-over-TLS verification: "
+                           "Command failed (exit 1): resolvectl query --cache=no debian.org",
+                           "rollback=" + status]})
+
+
+def report(readiness: str, dot_status: str, dot_recovery: str,
+           policy: str = "best-effort") -> str:
+    document = {
+        "schema_version": 1,
+        "host_id": "aio-cell",
+        "role": "aio",
+        "installer_revision": "local",
+        "observed_at": "2026-11-28T00:00:00+00:00",
+        "controls": {
+            "firewall": {"policy": "required", "status": "verified", "reason_code": "FW_APPLIED",
+                         "recovery": "not-needed", "evidence_codes": ["FW_APPLIED"]},
+            "ssh_protection": {"policy": "required", "status": "verified",
+                               "reason_code": "JAIL_ACTIVE", "recovery": "not-needed",
+                               "evidence_codes": ["JAIL_ACTIVE"]},
+            "security_updates": {"policy": "required", "status": "verified",
+                                 "reason_code": "APT_EFFECTIVE", "recovery": "not-needed",
+                                 "evidence_codes": ["APT_EFFECTIVE"]},
+            "dot": {"policy": policy, "status": dot_status, "reason_code": "DOT_NOT_EFFECTIVE",
+                    "recovery": dot_recovery, "evidence_codes": ["DOT_NOT_EFFECTIVE"]},
+        },
+    }
+    head = json.dumps({"status": readiness, "readiness": readiness,
+                       "report": "/var/lib/gowave-auto-nginx/security-report.json",
+                       "controls": {name: control["status"]
+                                    for name, control in document["controls"].items()},
+                       "warnings": []})
+    return head + "\n--- report ---\n" + json.dumps(document) + "\n"
+
+
+class FakePodman:
+    """Answers `exec_bash` from a scripted map, consuming one answer per call."""
+
+    def __init__(self, answers: Dict[str, Any]):
+        self.answers = {needle: (list(value) if isinstance(value, list) else [value])
+                        for needle, value in answers.items()}
+        self.calls: List[str] = []
+
+    def exec_bash(self, name: str, script: str, check: bool = True,
+                  input_text: Optional[str] = None, timeout: int = 60) -> Any:
+        self.calls.append(script)
+        for needle, answers in self.answers.items():
+            if needle in script:
+                answer = answers.pop(0) if len(answers) > 1 else answers[0]
+                if isinstance(answer, Exception):
+                    raise answer
+                return subprocess.CompletedProcess(["bash", "-lc", script], 0, answer, "")
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, "", "")
+
+
+class FakeProduct:
+    """One installed All-in-One host whose only moving part is the answer map."""
+
+    def __init__(self, podman: FakePodman):
+        self.podman = podman
+
+    def require_installed(self) -> Any:
+        return type("Host", (), {"target_name": "aio-cell"})()
+
+
+def host_answers(*, best: List[str], required: List[str],
+                 rules: Any = RULES) -> Dict[str, Any]:
+    """The four commands the case runs, per policy, in the order it runs them."""
+    return {
+        # `ip6tables-save` first: its name contains `iptables-save`.
+        "ip6tables-save 2>/dev/null": RULES,
+        SNAPSHOT: rules if isinstance(rules, list) else [rules] * 8,
+        "if [ -s /proc/net/if_inet6 ]": "true\n",
+        "GOWAVE_DOT_POLICY=best-effort python3": best,
+        "GOWAVE_DOT_POLICY=required python3": required,
+    }
+
+
+BEST_FAILED = verdict("failed_rolled_back", "verified")
+BEST_WARNING = report("ready-with-warnings", "failed", "verified")
+BEST_RESTORED = verdict("configured", "not-needed")
+BEST_READY = report("ready", "verified", "not-needed")
+REQUIRED_FAILED = verdict("failed_rolled_back", "verified", "required")
+REQUIRED_BLOCKED = report("failed", "failed", "verified", "required")
+
+
+class TestBlockedEncryptedPath(unittest.TestCase):
+    def test_a_blocked_path_degrades_the_optional_policy_without_claiming_it(self):
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_FAILED, BEST_WARNING, BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_FAILED, REQUIRED_BLOCKED],
+        )))
+        facts = dot_policy.case_blocked_encrypted_path(product)
+        self.assertEqual(facts["readiness"], ["ready-with-warnings", "failed"])
+        self.assertEqual(facts["rules"], "unchanged")
+        # The encrypted port was closed with the case's own chain and the case
+        # removed that chain again; a case that never blocked the path proved
+        # nothing about it.
+        self.assertTrue(any(f"iptables -N {dot_policy._CHAIN}" in call
+                            for call in product.podman.calls))
+        self.assertTrue(any(f"iptables -X {dot_policy._CHAIN}" in call
+                            for call in product.podman.calls))
+
+    def test_a_silent_degradation_is_refused(self):
+        # The host keeps the opportunistic mode, the plaintext fallback answers,
+        # and the product would report the control delivered. A suite that only
+        # checked the report's wording would call this a pass.
+        product = FakeProduct(FakePodman(host_answers(
+            best=[verdict("configured", "not-needed")] * 4,
+            required=[REQUIRED_FAILED, REQUIRED_BLOCKED],
+        )))
+        with self.assertRaisesRegex(AssertionError, "called delivered while it could not be"):
+            dot_policy.case_blocked_encrypted_path(product)
+
+    def test_required_that_does_not_block_readiness_is_refused(self):
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_FAILED, BEST_WARNING, BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_FAILED,
+                      report("ready-with-warnings", "failed", "verified", "required")],
+        )))
+        with self.assertRaisesRegex(AssertionError, "must block readiness"):
+            dot_policy.case_blocked_encrypted_path(product)
+
+    def test_a_report_that_conflates_the_control_with_its_recovery_is_refused(self):
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_FAILED, report("ready-with-warnings", "failed", "not-needed"),
+                  BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_FAILED, REQUIRED_BLOCKED],
+        )))
+        with self.assertRaisesRegex(AssertionError, "conflates the optional control"):
+            dot_policy.case_blocked_encrypted_path(product)
+
+    def test_a_rule_left_behind_is_refused(self):
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_FAILED, BEST_WARNING, BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_FAILED, REQUIRED_BLOCKED],
+            rules=[RULES, RULES_CHANGED],
+        )))
+        with self.assertRaisesRegex(AssertionError, "changed across the case"):
+            dot_policy.case_blocked_encrypted_path(product)
+
+
+BEST_UNVERIFIED = verdict("failed_unverified", "failed")
+BEST_UNPROVEN = report("failed", "failed", "failed")
+REQUIRED_UNVERIFIED = verdict("failed_unverified", "failed", "required")
+REQUIRED_UNPROVEN = report("failed", "failed", "failed", "required")
+
+
+class TestUnverifiableRestoration(unittest.TestCase):
+    def test_an_unproven_restoration_blocks_every_policy(self):
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_UNVERIFIED, BEST_UNPROVEN, BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_UNVERIFIED, REQUIRED_UNPROVEN],
+        )))
+        facts = dot_policy.case_unverifiable_restoration(product)
+        self.assertEqual(facts["readiness"], "failed")
+        self.assertTrue(any("gowave-dot-case/bin" in call for call in product.podman.calls),
+                        "the case never installed the probe whose answer it withholds")
+
+    def test_a_rounded_rollback_is_refused(self):
+        # The step says the rollback was verified, which is the one outcome this
+        # case exists to refuse: its subject is that the proof was absent.
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_FAILED, BEST_UNPROVEN, BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_FAILED, REQUIRED_UNPROVEN],
+        )))
+        with self.assertRaisesRegex(AssertionError, "rounded into a pass"):
+            dot_policy.case_unverifiable_restoration(product)
+
+    def test_a_report_that_stays_ready_is_refused(self):
+        product = FakeProduct(FakePodman(host_answers(
+            best=[BEST_UNVERIFIED, report("ready-with-warnings", "failed", "failed"),
+                  BEST_RESTORED, BEST_READY],
+            required=[REQUIRED_UNVERIFIED, REQUIRED_UNPROVEN],
+        )))
+        with self.assertRaisesRegex(AssertionError, "although the restoration is unproven"):
+            dot_policy.case_unverifiable_restoration(product)
+
+
+if __name__ == "__main__":
+    unittest.main()
