@@ -102,3 +102,20 @@ verifying the vendor signature; only the transport the suite depends on changes.
 needs its own change: a fixture container, a certificate the `signed-by` fingerprint
 accepts, and a case proving the fixture is what the install actually read.
 
+
+---
+
+## 6. Measure the endpoint-propagation window `AIO-IDEMPOTENT` probes through
+
+**Measured on 2026-11-28.** In GitHub Actions run `46114497205` the All-in-One
+cell on debian-13 failed `AIO-IDEMPOTENT` with `the xray transfer through tcp
+returned HTTP 503 without an endpoint report` — the Panel answering before the
+reinstalled node had registered an endpoint. The same case passed on the same
+distribution twice the same day (local `podman-aio-20261128T054644-8c6d8beb`
+and GitHub run `46111515705`), so the failure is a window, not a configuration.
+
+**Done when** the case waits for the endpoint the way every other data-plane case
+already does (`wait_tunnel_ready`), and a run that hits the window reports the
+wait it performed instead of reading a 503 as a product verdict — or the case
+proves that the Panel publishes the endpoint before the install returns, and the
+window is closed in the product instead.
