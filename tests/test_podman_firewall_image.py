@@ -250,16 +250,25 @@ class TestFirewallImageCase(unittest.TestCase):
         self.assertEqual(body.count(reference), 3)
 
     def test_the_image_is_taken_before_the_first_rule_changes(self):
-        body = firewall_image.WORKER_INSTALLER.read_text(encoding="utf-8")
-        capture = body.index("    record_firewall_before_image || return 1\n")
-        for later in ('    ufw default deny incoming\n',
-                      '    ufw default allow outgoing\n',
-                      '    ufw allow "$ssh_port/tcp" comment "SSH administration"\n',
-                      '    ufw allow 80/tcp comment "HTTP ACME challenge"\n',
-                      '    ufw --force enable\n'):
-            with self.subTest(mutation=later):
-                self.assertLess(capture, body.index(later))
-        self.assertLess(capture, body.index("    _UFW_RULES_CONFIGURED=1\n"))
+        """The baseline precedes the only place a rule is written.
+
+        The Worker payload no longer calls `ufw` itself: it streams
+        `modules/security.sh` and the policy is applied there. The order that
+        matters is therefore the module's — the transaction (and with it the
+        before-image) is opened before `firewall_apply_policy`, and the
+        application is verified after it.
+        """
+        module = (REPO_ROOT / "modules" / "security.sh").read_text(encoding="utf-8")
+        capture = module.index('    firewall_begin_transaction "$root" || return 1\n')
+        applied = module.index("    firewall_apply_policy || return 1\n")
+        verified = module.index('    firewall_verify "$root" || {\n')
+        self.assertLess(capture, applied,
+                        "the baseline is captured before the policy is applied")
+        self.assertLess(applied, verified, "the applied policy is verified after it")
+        written = [line.strip() for line in module[:capture].splitlines()
+                   if line.strip().startswith(("ufw ", "iptables "))]
+        self.assertEqual(written, [],
+                         "a rule is written before the baseline is captured")
 
     def test_both_rollbacks_restore_the_image(self):
         body = firewall_image.WORKER_INSTALLER.read_text(encoding="utf-8")
